@@ -177,6 +177,29 @@ fn detect(
                     line,
                     name: name.to_string(),
                 }),
+                "msg.expr" => {
+                    let mut walk = cap.node.walk();
+                    let keywords: Vec<tree_sitter::Node<'_>> = cap
+                        .node
+                        .children_by_field_name("method", &mut walk)
+                        .collect();
+                    let Some(first) = keywords.first() else {
+                        continue;
+                    };
+                    // A keyword message takes an argument after each keyword.
+                    let takes_args = first.next_sibling().is_some_and(|n| n.kind() == ":");
+                    let mut selector = String::new();
+                    for k in &keywords {
+                        selector.push_str(k.utf8_text(source).unwrap_or_default());
+                        if takes_args {
+                            selector.push(':');
+                        }
+                    }
+                    out.calls.push(LiveRef {
+                        line: first.start_position().row as u32 + 1,
+                        name: selector,
+                    });
+                }
                 "field.name" => out.fields.push(LiveRef {
                     line,
                     name: name.to_string(),
@@ -367,6 +390,7 @@ const GO_QUERY: &str = r#"
 /// no shape is needed. `method_invocation` covers both `helper()` and `o.m()`.
 const JAVA_QUERY: &str = r#"
 (method_invocation name: (identifier) @call.name)
+(object_creation_expression type: (type_identifier) @call.name)
 (field_access field: (identifier) @field.name)
 (superclass (type_identifier) @base.name)
 (superclass (generic_type (type_identifier) @base.name))
@@ -380,9 +404,21 @@ const JAVA_QUERY: &str = r#"
 /// interface distinction is not written in the source at all — both are valid
 /// `is-implementation` targets, so both are emitted and the target-kind gate in
 /// the daemon decides.
+///
+/// Calls need the same generic treatment the base list already got. Per the
+/// grammar's node-types, `invocation_expression.function` can be a `generic_name`
+/// directly and `member_access_expression.name` can be `identifier` OR
+/// `generic_name`, so a plain-`identifier`-only pattern silently never matches
+/// `Bar<T>()` or `x.Foo<T>()`. The generic arms below capture the `identifier`
+/// inside the `generic_name`, which is the bare method name the resolver wants;
+/// it sits two parents under the `member_access_expression`, within
+/// `MEMBER_LOOKUP_DEPTH`, so `x.Foo<T>()` still classifies as a call and not a
+/// field read.
 const CSHARP_QUERY: &str = r#"
 (invocation_expression function: (identifier) @call.name)
+(invocation_expression function: (generic_name (identifier) @call.name))
 (member_access_expression name: (identifier) @sel.name)
+(member_access_expression name: (generic_name (identifier) @sel.name))
 (base_list (identifier) @base.name)
 (base_list (generic_name (identifier) @base.name))
 (base_list (qualified_name name: (identifier) @base.name))
@@ -403,12 +439,12 @@ const C_QUERY: &str = r#"
 (field_expression field: (field_identifier) @sel.name)
 "#;
 
-/// A keyword message (`[o setX:1 y:2]`) yields one `method:` capture per keyword.
-/// Each resolves to the same selector's definition, so the extra targets produce
-/// a duplicate edge rather than a wrong one, and the daemon's upsert absorbs it.
+/// A keyword message (`[o setX:1 y:2]`) has one `method:` child per keyword; the
+/// whole message is captured so it names its full selector (`setX:y:`), which is
+/// how the method node is named. A keyword alone matches nothing.
 const OBJC_QUERY: &str = r#"
 (call_expression function: (identifier) @call.name)
-(message_expression method: (identifier) @call.name)
+(message_expression) @msg.expr
 (field_expression field: (field_identifier) @sel.name)
 (class_interface superclass: (identifier) @base.name)
 "#;
@@ -628,6 +664,19 @@ func (t *T) Foo() {}
     }
 
     #[test]
+    fn java_detects_a_constructor_call() {
+        // `new Zoo()` references the class, as PHP's `new Thing()` does.
+        let src = br#"class M {
+  void f() {
+    Zoo z = new Zoo();
+  }
+}
+"#;
+        let refs = detect_live_refs(Language::Java, src).unwrap();
+        assert_eq!(names(&refs.calls), vec![(3, "Zoo")]);
+    }
+
+    #[test]
     fn java_detects_an_interface_extends_clause() {
         let refs = detect_live_refs(Language::Java, b"interface I extends J, K {}").unwrap();
         assert_eq!(bases(&refs.inheritance), vec!["J", "K"]);
@@ -649,6 +698,21 @@ func (t *T) Foo() {}
         assert_eq!(names(&refs.calls), vec![(3, "Helper"), (4, "Submit")]);
         assert_eq!(names(&refs.fields), vec![(5, "Total")]);
         assert_eq!(bases(&refs.inheritance), vec!["Base", "IRunnable"]);
+    }
+
+    /// `x.Foo<int>()` and `Bar<T>()` are ordinary calls that the plain-identifier
+    /// patterns never saw, because the grammar wraps a generic callee in a
+    /// `generic_name` node. The on-save lane therefore never asked about them.
+    #[test]
+    fn csharp_detects_generic_calls() {
+        let refs = detect_live_refs(
+            Language::CSharp,
+            b"var a = s.Foo<int>(1); var b = Bar<T>(2);",
+        )
+        .unwrap();
+        assert_eq!(names(&refs.calls), vec![(1, "Foo"), (1, "Bar")]);
+        // A generic method call is a call, never a field read.
+        assert_eq!(names(&refs.fields), vec![]);
     }
 
     // ── C / C++ ──────────────────────────────────────────────────────────────
@@ -698,10 +762,22 @@ void f(Order* o, struct S s) {
   helper();
   [o submit:1];
   int n = s.total;
+  [d initWithName:@"Rex" volume:0.8f];
+  [d speak];
 }
 "#;
         let refs = detect_live_refs(Language::ObjectiveC, src).unwrap();
-        assert_eq!(names(&refs.calls), vec![(4, "helper"), (5, "submit")]);
+        // A message names its whole selector, as the method node does:
+        // `initWithName:volume:`, never its keywords one by one.
+        assert_eq!(
+            names(&refs.calls),
+            vec![
+                (4, "helper"),
+                (5, "submit:"),
+                (7, "initWithName:volume:"),
+                (8, "speak")
+            ]
+        );
         assert_eq!(names(&refs.fields), vec![(6, "total")]);
         assert_eq!(bases(&refs.inheritance), vec!["Base"]);
     }

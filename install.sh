@@ -175,7 +175,8 @@ download_and_verify() {
 
 # Copies the extracted, already-verified binary from $tmp into $dir via a
 # staging name plus atomic rename, so an in-place upgrade never leaves a
-# truncated binary on PATH. Escalates with sudo only for --system on a
+# truncated binary on PATH. travsr-lib (the bundled LSIF emitters) is replaced
+# first, so the binary that looks for it is never the newer of the two. Escalates with sudo only for --system on a
 # non-root user, and only after printing the exact commands being run.
 # The mode is set on the staging file rather than on the $tmp copy: cp without
 # -p applies the caller's umask to the destination, so a chmod in $tmp does not
@@ -187,15 +188,27 @@ install_binary() {
     command -v sudo >/dev/null 2>&1 || err "--system requires root or sudo, and sudo was not found on PATH"
     info "--system requested, elevating with sudo to run:"
     info "  sudo mkdir -p ${dir}"
+    if [ -d "$tmp/travsr-lib" ]; then
+      info "  sudo rm -rf ${dir}/travsr-lib"
+      info "  sudo cp -R ${tmp}/travsr-lib ${dir}/travsr-lib"
+    fi
     info "  sudo cp ${tmp}/travsr ${staging}"
     info "  sudo chmod 755 ${staging}"
     info "  sudo mv -f ${staging} ${dir}/travsr"
     sudo mkdir -p "$dir"
+    if [ -d "$tmp/travsr-lib" ]; then
+      sudo rm -rf "${dir}/travsr-lib"
+      sudo cp -R "$tmp/travsr-lib" "${dir}/travsr-lib"
+    fi
     sudo cp "$tmp/travsr" "$staging"
     sudo chmod 755 "$staging"
     sudo mv -f "$staging" "${dir}/travsr"
   else
     mkdir -p "$dir"
+    if [ -d "$tmp/travsr-lib" ]; then
+      rm -rf "${dir}/travsr-lib"
+      cp -R "$tmp/travsr-lib" "${dir}/travsr-lib"
+    fi
     cp "$tmp/travsr" "$staging"
     chmod 755 "$staging"
     mv -f "$staging" "${dir}/travsr"
@@ -266,14 +279,37 @@ main() {
 
   tar -xzf "$tmp/${tarball_name}" -C "$tmp" travsr
 
+  # travsr-lib holds the bundled TypeScript/JavaScript and Python LSIF emitters.
+  # Releases before it shipped the binary alone, so those languages found no
+  # emitter and produced structural edges only. Extracted separately and
+  # tolerantly: --version installs older tarballs that do not carry it, and a
+  # missing member is a hard tar error, not a warning.
+  tar -xzf "$tmp/${tarball_name}" -C "$tmp" travsr-lib 2>/dev/null || true
+
   install_binary
 
-  case ":${PATH}:" in
-    *":${dir}:"*) ;;
-    *) warn "${dir} is not on your PATH. Add this to your shell profile: export PATH=\"${dir}:\$PATH\"" ;;
-  esac
-
   info "installed travsr to ${dir}/travsr"
+
+  # The one next step, runnable as printed (plan G2: nobody edits PATH). When
+  # the install dir is not on PATH, the absolute path runs just the same, and
+  # `travsr init` writes absolute paths into the AI tool configs it sets up.
+  case ":${PATH}:" in
+    *":${dir}:"*) next="travsr init" ;;
+    *)
+      # Absolute, since it is run from the project folder, and single-quoted
+      # when it holds anything a shell would read, so it runs as printed.
+      case "$dir" in
+        /*) bin_path="${dir}/travsr" ;;
+        *) bin_path="$(pwd)/${dir}/travsr" ;;
+      esac
+      case "$bin_path" in
+        *[!A-Za-z0-9_./-]*)
+          next="'$(printf '%s' "$bin_path" | sed "s/'/'\\\\''/g")' init" ;;
+        *) next="${bin_path} init" ;;
+      esac
+      ;;
+  esac
+  printf 'Next: in your project folder, run %s\n' "$next"
 }
 
 main "$@"

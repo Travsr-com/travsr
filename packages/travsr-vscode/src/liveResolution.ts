@@ -53,18 +53,35 @@ import {
 } from "./daemonIpc";
 
 /**
- * Cap on provider queries for one save, across the saved file **and** every
- * dependent the interface-edit closure pulls in (RFC-027 section 8.7.5).
+ * Provider-query budgets for one save, **split** so the saved file and the
+ * interface-edit dependent closure cannot starve each other.
  *
- * Each is an IPC round trip into another extension host. The daemon keeps the
- * set surgical (only references its lexical lane could not settle), so a
- * hand-written file is far below this; the cap only bounds a pathological
- * generated file or a rename in a hot utility whose closure is large. It bounds
- * the *total*, not each file, so one save can never fan out into an unbounded
- * storm of queries (§10.1). Truncation degrades recall, which the commit-gated
- * path repairs.
+ * Each query is an IPC round trip into another extension host. A single shared
+ * cap meant a large edited function lost recall to a big closure sharing the
+ * same counter, and vice versa; that is the gap this split closes. The own-file
+ * budget is generous because a body edit's cost is proportional to that one file
+ * the developer just saved, and for the generic-detector languages (Go, Java,
+ * ...) with no lexical floor the editor lane is the *only* recovery path, so
+ * every reference in the edited function is a target. The closure budget stays
+ * tight because a rename in a hot utility is the real fan-out risk (§10.1).
+ *
+ * Both are still bounded, so no save fans out into an unbounded storm, and
+ * truncation beyond a budget degrades recall, which the commit-gated path
+ * repairs. Resolution runs off the render path (the save handler does not await
+ * it), and the own file is drained in batches with a yield between them
+ * ([`REPORT_BATCH_SIZE`]), so a large function neither bursts the language
+ * server nor loses everything already resolved if the buffer moves mid-drain.
  */
-const MAX_QUERIES_PER_SAVE = 200;
+const OWN_FILE_QUERY_BUDGET = 500;
+const CLOSURE_QUERY_BUDGET = 200;
+
+/**
+ * Report resolutions in batches of this size instead of once at the end, so a
+ * long drain lands progressively and a mid-flight buffer change keeps the
+ * batches already reported (each report is additive on the daemon). A function
+ * with fewer references than this reports exactly once, unchanged from before.
+ */
+const REPORT_BATCH_SIZE = 100;
 
 /**
  * Languages the daemon's live lane detects references for. A cheap pre-filter
@@ -196,16 +213,19 @@ export async function publishLiveResolutions(
   // would no longer describe this file.
   if (doc.version !== version) return 0;
 
-  const budget: Budget = { remaining: MAX_QUERIES_PER_SAVE };
   let total = 0;
 
-  // The saved file, resolved against its live buffer.
-  total += await resolveAndReport(repoRoot, doc, file, own, version, budget);
+  // The saved file, resolved against its live buffer, on its own budget so a
+  // large edited function is never starved by the closure below.
+  const ownBudget: Budget = { remaining: OWN_FILE_QUERY_BUDGET };
+  total += await resolveAndReport(repoRoot, doc, file, own, version, ownBudget);
 
-  // Each dependent, resolved against its own file (RFC-027 section 8.7.5).
+  // Each dependent, resolved against its own file (RFC-027 section 8.7.5), on a
+  // separate, tighter budget that bounds the rename fan-out.
+  const closureBudget: Budget = { remaining: CLOSURE_QUERY_BUDGET };
   for (const dep of dependents) {
-    if (budget.remaining <= 0) break;
-    total += await resolveDependent(repoRoot, dep, budget);
+    if (closureBudget.remaining <= 0) break;
+    total += await resolveDependent(repoRoot, dep, closureBudget);
   }
 
   return total;
@@ -244,10 +264,16 @@ async function resolveDependent(
 }
 
 /**
- * Resolve `targets` against `doc` under the shared `budget` and report the
- * answers for `file`. Returns the number reported. Drops the whole batch if the
- * buffer moves mid-flight (RFC-027 section 11) — answers against old text no
- * longer describe the file.
+ * Resolve `targets` against `doc` under `budget` and report the answers for
+ * `file`. Returns the number reported.
+ *
+ * Reports in batches of [`REPORT_BATCH_SIZE`] rather than once at the end, so a
+ * long drain lands progressively and a mid-flight buffer change keeps whatever
+ * was already reported instead of dropping everything (RFC-027 section 11): each
+ * report is additive on the daemon, and every batch was resolved and sent while
+ * the buffer still matched `version`. A yield between batches keeps a large
+ * function from bursting the language server or monopolising the event loop.
+ * A partially-filled final batch is dropped, unreported, if the buffer moved.
  */
 async function resolveAndReport(
   repoRoot: string,
@@ -258,18 +284,29 @@ async function resolveAndReport(
   budget: Budget
 ): Promise<number> {
   if (targets.length === 0) return 0;
-  const resolutions: LiveResolutionItem[] = [];
+  let total = 0;
+  let batch: LiveResolutionItem[] = [];
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0 || doc.version !== version) return;
+    await reportLiveResolution(repoRoot, file, batch);
+    total += batch.length;
+    batch = [];
+  };
   for (const target of targets) {
     if (budget.remaining <= 0) break;
-    if (doc.version !== version) return 0;
+    if (doc.version !== version) break;
     const item = await resolveTarget(repoRoot, doc, target, version);
     budget.remaining -= 1;
-    if (item) resolutions.push(item);
+    if (item) batch.push(item);
+    if (batch.length >= REPORT_BATCH_SIZE) {
+      await flush();
+      // Resolution is off the render path; yield so the next batch of provider
+      // queries does not arrive as one burst.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   }
-  if (resolutions.length === 0) return 0;
-  if (doc.version !== version) return 0;
-  await reportLiveResolution(repoRoot, file, resolutions);
-  return resolutions.length;
+  await flush();
+  return total;
 }
 
 /**
@@ -288,8 +325,13 @@ async function resolveTarget(
   const command = PROVIDER_COMMAND[target.provider];
   if (!command) return null;
 
-  const col = columnOf(doc, target.ref_line, target.name);
-  if (col === null) return null;
+  // RFC-027 #813 P1: prefer the column the daemon pinned against the file text,
+  // which resolves the reference at its exact position (including a target whose
+  // name is not literally on the line, e.g. `s.node.0`). Fall back to searching
+  // the line for `name` when the daemon sent no column (an older daemon, or a
+  // name it could not pin).
+  const col = target.ref_col ?? columnOf(doc, target.ref_line, target.name);
+  if (col === null || col === undefined) return null;
   const pos = new vscode.Position(target.ref_line - 1, col);
 
   let locations: unknown;
@@ -335,8 +377,16 @@ async function resolveTarget(
  * by URI plus start position, so a provider that repeats one location (or names
  * the same symbol through both a `Location` and a `LocationLink`) still counts
  * as one answer.
+ *
+ * Issue #816 defect 2: a `LocationLink`'s `targetRange` spans the whole item,
+ * INCLUDING leading doc comments and attributes, so its start line falls above
+ * the daemon's node span (which begins at the `fn`/`pub` declaration) and the
+ * daemon abstains. `targetSelectionRange` is the symbol name identifier, which
+ * sits on the declaration line, so it is preferred when the provider supplies
+ * it; a provider that omits it (or answers with a bare `Location`) still falls
+ * back to the full range, which the daemon's own backstop then tolerates.
  */
-function soleLocation(
+export function soleLocation(
   raw: unknown
 ): { uri: vscode.Uri; range: vscode.Range } | null {
   const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
@@ -347,8 +397,11 @@ function soleLocation(
     let one: { uri: vscode.Uri; range: vscode.Range } | null = null;
     if (e.uri && e.range) {
       one = { uri: e.uri, range: e.range as vscode.Range };
-    } else if (e.targetUri && e.targetRange) {
-      one = { uri: e.targetUri, range: e.targetRange };
+    } else if (e.targetUri && (e.targetSelectionRange || e.targetRange)) {
+      one = {
+        uri: e.targetUri,
+        range: (e.targetSelectionRange ?? e.targetRange) as vscode.Range,
+      };
     }
     if (!one) continue;
     const key = `${one.uri.toString()}:${one.range.start.line}:${one.range.start.character}`;

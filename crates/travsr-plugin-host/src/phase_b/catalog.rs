@@ -69,6 +69,11 @@ pub struct ScipBinarySpec {
     /// (0.12.x) and drives the build itself (`travsr-lang-java`). `None` elsewhere
     /// means the platform-independent tag resolution applies on every OS.
     pub windows_pin: Option<&'static str>,
+    /// Run this instead where `asset_fn` has no binary for the platform.
+    pub fallback_command: Option<&'static [&'static str]>,
+    /// The oldest Go (major, minor) that builds the fallback. An older Go
+    /// fails it, so the language needs a newer Go rather than a re-run.
+    pub fallback_min_go: Option<(u32, u32)>,
 }
 
 /// Specifies a zip archive on GitHub Releases that must be extracted rather than
@@ -154,6 +159,18 @@ pub fn scip_java_asset(tag: &str, _target: &str) -> Option<String> {
     Some(format!("scip-java-{tag}"))
 }
 
+/// scip-go ships darwin-arm64 and linux amd64/arm64 tarballs (no version in the
+/// asset name); other platforms use the `go install` fallback.
+pub fn scip_go_asset(_tag: &str, target: &str) -> Option<String> {
+    let platform = match target {
+        "aarch64-apple-darwin" => "darwin-arm64",
+        "x86_64-unknown-linux-gnu" => "linux-amd64",
+        "aarch64-unknown-linux-gnu" => "linux-arm64",
+        _ => return None,
+    };
+    Some(format!("scip-go-{platform}.tar.gz"))
+}
+
 /// scip-ruby ships arm64-darwin and x86_64-linux binaries (no version in asset name).
 pub fn scip_ruby_asset(_tag: &str, target: &str) -> Option<String> {
     match target {
@@ -224,7 +241,8 @@ pub fn rust_analyzer_asset(_tag: &str, target: &str) -> Option<String> {
 }
 
 /// Vendored sha256 of each rust-analyzer asset for the pinned release. Fetched
-/// over TLS on 2026-08-17 from rust-lang/rust-analyzer, which publishes no
+/// over TLS on 2026-08-17 and re-checked on 2026-09-29 against the plain weekly
+/// tag (same bytes as the deleted `.3` respin) from rust-lang/rust-analyzer, which publishes no
 /// `.sha256` sidecar — pinning + a vendored hash is the only fixity check
 /// available. A hash is only ever returned for the tag `version_fallback` points
 /// at; a different tag returns `None`, so the checksum can never be applied to
@@ -233,19 +251,19 @@ pub fn rust_analyzer_asset(_tag: &str, target: &str) -> Option<String> {
 /// than downloading unverified.
 pub fn rust_analyzer_sha256(tag: &str, target: &str) -> Option<&'static str> {
     match (tag, target) {
-        ("2026-08-17.3", "aarch64-apple-darwin") => {
+        ("2026-08-17", "aarch64-apple-darwin") => {
             Some("ece932daf2f077be87bf745d2eb0a62cbc550f4b1e2e31ca76dfafdd0cc599b3")
         }
-        ("2026-08-17.3", "x86_64-apple-darwin") => {
+        ("2026-08-17", "x86_64-apple-darwin") => {
             Some("134a7d305991de776864e43d1e6c291f60fa2888d4b9b7749864c562c5dc28b7")
         }
-        ("2026-08-17.3", "x86_64-unknown-linux-gnu") => {
+        ("2026-08-17", "x86_64-unknown-linux-gnu") => {
             Some("a559eaa29920e4c12718fba101f2055f1da0ad8bc458ef9dc1a670778cc66901")
         }
-        ("2026-08-17.3", "aarch64-unknown-linux-gnu") => {
+        ("2026-08-17", "aarch64-unknown-linux-gnu") => {
             Some("941ad31c4256eec3c8457257b0fcfb696d2b4f80c0e5a996f7375a92130c2447")
         }
-        ("2026-08-17.3", "x86_64-pc-windows-msvc") => {
+        ("2026-08-17", "x86_64-pc-windows-msvc") => {
             Some("3212cc9e7ab3f6b07f97be681c2a7200f73fb0463e6f8055c214ebe0b00901f2")
         }
         _ => None,
@@ -477,7 +495,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
                 repo: "rust-lang/rust-analyzer",
                 asset_fn: rust_analyzer_asset,
                 install_name: "rust-analyzer",
-                version_fallback: "2026-08-17.3",
+                version_fallback: "2026-08-17",
                 sha256_fn: rust_analyzer_sha256,
             },
         ),
@@ -497,21 +515,38 @@ pub static CATALOG: &[PhaseBEntry] = &[
         args: &["--output", "{output}", "{root}"],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
-        install_hint: "travsr lang install go  (or: go install github.com/scip-code/scip-go/cmd/scip-go@latest)",
-        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
+        install_hint: "travsr lang install go  (or: go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7)",
+        underlying_tool_hint: "go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7",
         provider_binary: Some("travsr-lang-go"),
         elevated_hosts: &[],
-        scip_install: ScipInstall::Command(&[
-            "go",
-            "install",
-            "github.com/scip-code/scip-go/cmd/scip-go@latest",
-        ]),
+        // scip-go's own release binary, latest tag, checked against its sha256
+        // sidecar. `go install @latest` needs the newest Go to build and made an
+        // older Go download a toolchain, so it is only the fallback where no
+        // prebuilt exists (macOS Intel, Windows).
+        scip_install: ScipInstall::GithubBinary(ScipBinarySpec {
+            repo: "scip-code/scip-go",
+            asset_fn: scip_go_asset,
+            install_name: "scip-go",
+            version_fallback: "v0.2.7",
+            verify_sha256: true,
+            sha256_fn: None,
+            windows_pin: None,
+            fallback_command: Some(&[
+                "go",
+                "install",
+                // The version whose Go floor `fallback_min_go` states, so the
+                // two cannot drift apart when scip-go needs a newer Go.
+                "github.com/scip-code/scip-go/cmd/scip-go@v0.2.7",
+            ]),
+            // scip-go v0.2.7's go.mod: `requires go >= 1.25.0`.
+            fallback_min_go: Some((1, 25)),
+        }),
         extensions: &[".go"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
-        runtime_driver: None,
+        runtime_driver: Some("go"),
         prerequisites: "Go toolchain",
     },
     PhaseBEntry {
@@ -571,9 +606,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             // the `index-semanticdb` subcommand; travsr-lang-java's Windows driver
             // needs 0.12.x. Pin it on Windows; mac/linux keep tracking latest.
             windows_pin: Some("v0.12.3"),
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".java"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -611,8 +648,10 @@ pub static CATALOG: &[PhaseBEntry] = &[
             version_fallback: "1.3.13",
             sha256_fn: Some(kls_sha256),
         }),
-        extensions: &[".kt", ".kts"],
-        wrapper_version_fallback: "v0.1.0",
+        // Not `.kts`: a repo's only Kotlin is often its Gradle build scripts,
+        // which hold no calls worth minutes of language server time.
+        extensions: &[".kt"],
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -643,7 +682,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         ],
         scip_install: ScipInstall::Manual,
         extensions: &[".scala", ".sbt"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -674,9 +713,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: false,
             sha256_fn: Some(scip_ruby_sha256),
             windows_pin: None,
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".rb"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -688,7 +729,14 @@ pub static CATALOG: &[PhaseBEntry] = &[
         windows_sandbox: WindowsSandbox::Supported,
         npm_package: Some("@travsr-plugin/php"),
         command: "scip-php",
-        args: &["{root}", "--output", "{output}"],
+        // scip-php takes no positional root and has no `--output`: it indexes its
+        // own working directory and hardcodes `./index.scip` (bin/scip-php:39,53,
+        // read by the travsr-lang-php sidecar, crates/php/src/main.rs:211). The
+        // sidecar therefore runs it in the repo and moves the artifact into
+        // scratch, which is what the `RepoWrite::File("index.scip")` grant in
+        // sandbox/toolchain.rs exists for. The form recorded here used to say
+        // otherwise, which read as if that grant were unnecessary.
+        args: &[],
         output_format: OutputFormat::Scip,
         sandbox: SandboxRequirement::Standard,
         install_hint: "travsr lang install php",
@@ -697,7 +745,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
         elevated_hosts: &[],
         scip_install: ScipInstall::Manual,
         extensions: &[".php"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -729,7 +777,7 @@ pub static CATALOG: &[PhaseBEntry] = &[
             "scip-dotnet",
         ]),
         extensions: &[".cs", ".csx"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -761,9 +809,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: false,
             sha256_fn: Some(scip_clang_sha256),
             windows_pin: None,
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".cpp", ".cc", ".cxx", ".hpp"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -795,9 +845,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: false,
             sha256_fn: Some(scip_clang_sha256),
             windows_pin: None,
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".c", ".h"],
-        wrapper_version_fallback: "v0.1.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -824,9 +876,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: true,
             sha256_fn: None,
             windows_pin: None,
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".swift"],
-        wrapper_version_fallback: "v0.3.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -853,9 +907,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: true,
             sha256_fn: None,
             windows_pin: None,
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".m", ".mm"],
-        wrapper_version_fallback: "v0.3.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -889,9 +945,11 @@ pub static CATALOG: &[PhaseBEntry] = &[
             verify_sha256: true,
             sha256_fn: None,
             windows_pin: None,
+            fallback_command: None,
+            fallback_min_go: None,
         }),
         extensions: &[".dart"],
-        wrapper_version_fallback: "v0.3.0",
+        wrapper_version_fallback: "v0.6.0",
         builtin: false,
         native_phase_b: false,
         has_share_assets: false,
@@ -903,6 +961,113 @@ pub static CATALOG: &[PhaseBEntry] = &[
 /// Look up a Phase B entry by canonical language string.
 pub fn lookup(language: &str) -> Option<&'static PhaseBEntry> {
     CATALOG.iter().find(|e| e.language == language)
+}
+
+/// Filenames that mark a directory as a workspace this language's analyzer can
+/// index (#724 Finding 5).
+///
+/// A build-system-driven analyzer autoindexes the directory it is handed:
+/// scip-java exits with "No build tool detected in workspace" when that
+/// directory holds no Maven or Gradle manifest, which is every repo whose
+/// project lives one level down. Phase B uses this list to hand the analyzer
+/// the nearest directory that does have a manifest instead.
+///
+/// Empty for analyzers that do not drive a build system; those keep being
+/// invoked at the repo root.
+pub fn build_manifests(language: &str) -> &'static [&'static str] {
+    match language {
+        "java" => &[
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ],
+        "scala" => &["build.sbt"],
+        "go" => &["go.mod"],
+        "rust" => &["Cargo.toml"],
+        "php" => &["composer.json"],
+        "c" | "cpp" => &["compile_commands.json"],
+        _ => &[],
+    }
+}
+
+/// The build files an analyzer cannot trace calls without, as file names or
+/// `*.ext`, and how to name them to a user. Empty for a language whose tracer
+/// reads the sources alone. Loose sources (test fixtures, a stray file) are no
+/// project: the analyzer finds no symbols in them, so without a build file
+/// there is nothing to download or run.
+pub fn required_build_files(language: &str) -> (&'static [&'static str], &'static str) {
+    const JVM: &[&str] = &[
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ];
+    match language {
+        "java" | "kotlin" => (JVM, "pom.xml or build.gradle"),
+        "scala" => (
+            &["build.sbt", "pom.xml", "build.gradle", "build.gradle.kts"],
+            "build.sbt",
+        ),
+        "csharp" => (&["*.csproj", "*.sln"], "a .csproj or .sln file"),
+        "php" => (&["composer.json"], "composer.json"),
+        "go" => (&["go.mod"], "go.mod"),
+        _ => (&[], ""),
+    }
+}
+
+/// How to name `language`'s missing build file when the repo has none of
+/// [`required_build_files`], or `None` when it has one or needs none. Asks git
+/// for tracked and unignored files, then for files inside submodules, then
+/// looks in the repo's top folder on disk, where tools such as Unity write
+/// gitignored `.sln` and `.csproj` files. When git cannot answer it says
+/// nothing, so a repo is never blocked on a failed probe.
+pub fn missing_build_file(language: &str, repo_root: &std::path::Path) -> Option<&'static str> {
+    let (files, needs) = required_build_files(language);
+    if files.is_empty() {
+        return None;
+    }
+    let git_lists = |mode: &[&str]| {
+        let mut git = std::process::Command::new("git");
+        git.arg("-C")
+            .arg(repo_root)
+            .arg("ls-files")
+            .args(mode)
+            .args(["-z", "--"]);
+        for f in files {
+            git.arg(format!(":(glob)**/{f}"));
+        }
+        let out = git.output().ok().filter(|o| o.status.success())?;
+        Some(listed_build_file(
+            &String::from_utf8_lossy(&out.stdout),
+            files,
+        ))
+    };
+    let top_folder = std::fs::read_dir(repo_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\0");
+    let found = git_lists(&["--cached", "--others", "--exclude-standard"])?
+        || git_lists(&["--cached", "--recurse-submodules"]) == Some(true)
+        || listed_build_file(&top_folder, files);
+    (!found).then_some(needs)
+}
+
+/// Whether a NUL-separated `git ls-files -z` listing holds one of `files`.
+fn listed_build_file(listing: &str, files: &[&str]) -> bool {
+    listing.split('\0').any(|path| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        !name.is_empty()
+            && files.iter().any(|f| match f.strip_prefix('*') {
+                Some(ext) => name.ends_with(ext),
+                None => name == *f,
+            })
+    })
 }
 
 // ── RFC-025 SidecarSpec impls ───────────────────────────────────────────────
@@ -1040,6 +1205,59 @@ mod vendored_hash_tests {
         }
     }
 
+    /// `go install scip-go@latest` needs the newest Go to build, so on an older
+    /// Go it downloaded a whole Go toolchain. scip-go's own prebuilt release
+    /// (latest tag, checked against its published sha256) runs with the user's
+    /// Go; only platforms without one fall back to `go install`.
+    #[test]
+    fn go_uses_the_prebuilt_scip_go_and_falls_back_to_go_install() {
+        let go = CATALOG.iter().find(|e| e.language == "go").unwrap();
+        let spec = binary_spec(go).expect("go downloads a release binary");
+        assert!(
+            spec.verify_sha256 && spec.sha256_fn.is_none(),
+            "latest, sidecar-checked"
+        );
+        assert_eq!(
+            (spec.asset_fn)("v0.2.7", "aarch64-apple-darwin").as_deref(),
+            Some("scip-go-darwin-arm64.tar.gz")
+        );
+        assert_eq!((spec.asset_fn)("v0.2.7", "x86_64-apple-darwin"), None);
+        assert_eq!(
+            spec.fallback_command,
+            Some(
+                &[
+                    "go",
+                    "install",
+                    "github.com/scip-code/scip-go/cmd/scip-go@v0.2.7"
+                ][..]
+            )
+        );
+        assert_eq!(go.runtime_driver, Some("go"), "scip-go runs `go list`");
+    }
+
+    /// rust-lang/rust-analyzer deletes superseded respins: the pinned
+    /// `2026-08-17.3` vanished once `.4` shipped, so the direct download 404'd
+    /// on every machine without rustup. The plain weekly tag carries the same
+    /// bytes and stays, so the pin must be one, with a hash for it.
+    #[test]
+    fn rust_analyzer_pin_is_a_weekly_tag_with_a_hash() {
+        let rust = CATALOG.iter().find(|e| e.language == "rust").unwrap();
+        let ScipInstall::CommandThenGithubGz(_, spec) = &rust.scip_install else {
+            panic!("rust downloads rust-analyzer as a fallback");
+        };
+        let tag = spec.version_fallback;
+        let weekly = tag.len() == 10
+            && tag.chars().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            });
+        assert!(weekly, "{tag} is not a plain YYYY-MM-DD tag");
+        assert!(super::rust_analyzer_sha256(tag, "aarch64-apple-darwin").is_some());
+    }
+
     /// #410 M2: a vendored hash is only meaningful against one exact asset, so
     /// every entry carrying one must be pinned rather than resolving
     /// `releases/latest`. `install_scip_github_binary` keys that decision off
@@ -1140,5 +1358,73 @@ mod vendored_hash_tests {
                 );
             }
         }
+    }
+
+    /// Every travsr-lang wrapper ships in one release, so the offline fallback
+    /// is one tag: a partial bump sends some languages to a years-old wrapper
+    /// whenever the GitHub API is unreachable or rate limited.
+    #[test]
+    fn wrapper_fallbacks_name_one_release() {
+        let tags: std::collections::BTreeSet<_> = CATALOG
+            .iter()
+            .filter(|e| e.provider_binary.is_some())
+            .map(|e| e.wrapper_version_fallback)
+            .collect();
+        assert_eq!(tags.len(), 1, "{tags:?}");
+    }
+}
+
+#[cfg(test)]
+mod build_file_tests {
+    use super::{listed_build_file, missing_build_file, required_build_files};
+
+    /// PR #940 review: three Java test fixtures with no build file cost a
+    /// scip-java download and then read "could not trace calls". A listing
+    /// with no build file anywhere is what says so first.
+    #[test]
+    fn a_build_file_anywhere_counts_and_a_lookalike_does_not() {
+        let (java, _) = required_build_files("java");
+        assert!(listed_build_file("svc/pom.xml\0", java));
+        assert!(listed_build_file("app/build.gradle.kts\0", java));
+        assert!(!listed_build_file("fixtures/Main.java\0notpom.xml\0", java));
+        assert!(!listed_build_file("", java));
+        let (cs, _) = required_build_files("csharp");
+        assert!(listed_build_file("src/App/App.csproj\0", cs));
+        assert!(!listed_build_file("src/App.cs\0", cs));
+        assert!(required_build_files("rust").0.is_empty());
+        assert!(required_build_files("ruby").0.is_empty());
+    }
+
+    /// The one check against real git: a fixture-only repo is missing its
+    /// build file, the same repo with one is not.
+    #[test]
+    fn git_sees_a_missing_and_a_present_build_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("fixtures")).expect("mkdir");
+        std::fs::write(root.join("fixtures/Main.java"), "class Main {}").expect("write");
+        assert_eq!(
+            missing_build_file("java", root),
+            Some("pom.xml or build.gradle")
+        );
+        std::fs::create_dir_all(root.join("svc")).expect("mkdir");
+        std::fs::write(root.join("svc/pom.xml"), "<project/>").expect("write");
+        assert_eq!(missing_build_file("java", root), None);
+        assert_eq!(missing_build_file("rust", root), None);
+
+        // Unity's .gitignore hides the .csproj it writes at the top folder;
+        // the file is on disk, so C# has its build file.
+        std::fs::write(root.join(".gitignore"), "*.csproj\n").expect("write");
+        std::fs::write(root.join("Game.csproj"), "<Project/>").expect("write");
+        assert_eq!(missing_build_file("csharp", root), None);
     }
 }

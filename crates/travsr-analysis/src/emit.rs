@@ -53,6 +53,27 @@ pub fn var_node(corpus: &str, path: &str, var_name: &str) -> Node {
     )
 }
 
+/// #674: a BDD test callback (`it("…")` / `test("…")`), named from its
+/// string-literal argument and qualified by its enclosing `describe` chain so
+/// two suites in one file may reuse a case name. The `test:` prefix is its own
+/// namespace, so a callback can never collide with a real `fn:`/`method:`
+/// definition of the same name.
+pub fn bdd_test_node(corpus: &str, path: &str, qualified_name: &str) -> Node {
+    Node::new(
+        ts_vname(corpus, path, &format!("test:{qualified_name}")),
+        "test",
+    )
+}
+
+/// #674: a BDD suite (`describe("…")`) — the container its test callbacks and
+/// in-suite helpers are parented to.
+pub fn bdd_suite_node(corpus: &str, path: &str, qualified_name: &str) -> Node {
+    Node::new(
+        ts_vname(corpus, path, &format!("suite:{qualified_name}")),
+        "suite",
+    )
+}
+
 pub fn import_node(corpus: &str, path: &str, module: &str) -> Node {
     Node::new(
         ts_vname(corpus, path, &format!("import:{module}")),
