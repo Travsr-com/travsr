@@ -323,6 +323,18 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
         payload.nodes, payload.edges, payload.schema, last_commit, phase_b_state, rerank_segment
     );
 
+    // #809: the daemon shed watch events because the indexer queue filled. A shed
+    // event is recovered by the head reconcile or next commit, so this is not an
+    // error, but a non-zero count is why the graph may read stale, and is the
+    // signal that tells "fell behind a flood" apart from any other staleness.
+    // Silent at zero, like the live-precision line below.
+    if payload.watch_shed > 0 {
+        println!(
+            "watch events shed: {} (indexer queue filled; recovered by reconcile / next commit)",
+            payload.watch_shed
+        );
+    }
+
     // RFC-027 section 12: the live lane's measured precision, so the per-language
     // shipping gate has a number a human can read rather than a log line that
     // scrolled away.
@@ -845,6 +857,7 @@ mod tests {
             live_refs_pending: 0,
             dart_deps_unresolved: None,
             scip_unification_miss_list: None,
+            watch_shed: 0,
         }
     }
 

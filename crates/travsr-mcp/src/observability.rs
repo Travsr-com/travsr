@@ -2428,25 +2428,16 @@ mod tests {
     /// missed. Every class listed here is one the daemon writes.
     #[test]
     fn phase_b_warning_classes_match_the_cli() {
-        // The per-language classes `travsr status` handles (status.rs).
+        // #760: iterate the single source rather than a third hand-maintained
+        // copy. A class added there that this decoder does not handle fails here
+        // instead of silently falling through to a terminal `done`.
         // `scip_unification_misses` is deliberately absent: it is a repo-wide
-        // rate, not a per-language state, and neither surface treats it as one.
-        for class in [
-            "crashed",
-            "version_mismatch",
-            "needs_approval",
-            "skipped_unregistered",
-            "skipped_no_analyzer",
-            "skipped_no_compdb",
-            "skipped_no_build_file",
-            "untrusted_corpus",
-            "no_references",
-            "zero_nodes",
-            "needs_consent",
-            // #878: the TypeScript LSIF pass skipped under a marker that advanced.
-            "emitter_missing",
-            "emitter_failed",
-        ] {
+        // rate, not a per-language state (see PHASE_B_REPO_WIDE_WARNING_CLASSES),
+        // and neither surface treats it as one.
+        for class in travsr_core::PHASE_B_PER_LANGUAGE_WARNING_CLASSES
+            .iter()
+            .copied()
+        {
             // `version_mismatch` carries `lang:expected:got`, the rest `lang`.
             let warning = if class == "version_mismatch" {
                 format!("{class}:go:2:1")

@@ -300,6 +300,16 @@ pub struct StatusPayload {
     /// them. Empty/None = no misses. Old daemons omit it (serde default None).
     #[serde(default)]
     pub scip_unification_miss_list: Option<String>,
+    /// #809: watch events the daemon shed because the bounded indexer queue was
+    /// full, cumulative since the daemon started. Deliberately lossy: a shed
+    /// event is a real edit that reaches the graph later via the head reconcile
+    /// or next post-commit hook, so the symptom is "stale minutes later", not an
+    /// error at the time. Non-zero distinguishes "fell behind a flood" from "the
+    /// graph is stale for some other reason" without log-diving. Only the warm
+    /// daemon knows the count; the cold CLI path and old daemons report 0 (serde
+    /// default).
+    #[serde(default)]
+    pub watch_shed: u64,
 }
 
 // ── status ────────────────────────────────────────────────────────────────────
@@ -403,6 +413,9 @@ pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
         live_refs_pending: pending_refs,
         dart_deps_unresolved: store.get_meta("dart_deps_unresolved")?,
         scip_unification_miss_list: store.get_meta("scip_unification_miss_list")?,
+        // Lives in the daemon process, not the store; the daemon fills it in on
+        // the status path (#809). The cold CLI path has no shed count to report.
+        watch_shed: 0,
     })
 }
 
