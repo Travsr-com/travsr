@@ -10270,7 +10270,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
         let ghosts = store.search_nodes_by_name("ghost").unwrap();
@@ -10327,7 +10326,6 @@ mod tests {
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let _ = init_repo(tmp.path()).unwrap();
         let _ = init_repo(tmp.path()).unwrap(); // re-run — all hashes match
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -10347,7 +10345,6 @@ mod tests {
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let _ = init_repo(tmp.path()).unwrap();
         let stats = init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         assert_eq!(stats.nodes_written, 0, "no new nodes on re-run");
         assert!(
@@ -10375,7 +10372,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -10415,7 +10411,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -10458,7 +10453,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
 
@@ -10522,7 +10516,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
 
@@ -10595,7 +10588,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
 
@@ -10674,7 +10666,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = travsr_store::SqliteStore::open(&db_path)
@@ -10817,7 +10808,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = travsr_store::SqliteStore::open(&db_path)
@@ -10958,7 +10948,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = travsr_store::SqliteStore::open(&db_path)
@@ -12072,7 +12061,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = travsr_store::SqliteStore::open(&db_path)
@@ -12140,7 +12128,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         assert_eq!(
@@ -12189,7 +12176,6 @@ mod tests {
         std::fs::write(&order, "export function placeOrder(): void {}\n").unwrap();
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         // Now add both the import and its target in one batch, importer first.
         let user = tmp.path().join("src/user.ts");
@@ -12318,7 +12304,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -12368,7 +12353,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -12425,7 +12409,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = {
@@ -12504,7 +12487,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         // Commit and ratify, so `run_service`'s references exist as committed
         // occurrences: the changed-definition enumeration a save stashes (#813
@@ -12609,7 +12591,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(&repo).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = repo.join(".travsr/graph.db");
         let store = std::sync::Mutex::new(travsr_store::SqliteStore::open(&db_path).unwrap());
@@ -12690,7 +12671,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = {
@@ -12745,7 +12725,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let corpus = {
@@ -12792,7 +12771,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         // Incremental path: delete svc.ts on disk, then run reindex_files.
         let svc_path = tmp.path().join("svc.ts");
@@ -12812,7 +12790,6 @@ mod tests {
         std::fs::remove_dir_all(tmp.path().join(".travsr")).unwrap();
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
         let (full_nodes, full_edges) = {
             let db_path = tmp.path().join(".travsr/graph.db");
             let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -12847,7 +12824,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         let stats = init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
         assert!(stats.files_indexed >= 1);
 
         let db_path = tmp.path().join(".travsr/graph.db");
@@ -12885,7 +12861,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         // Incremental path: edit the file on disk, then reindex just it.
         std::fs::write(
@@ -12908,7 +12883,6 @@ mod tests {
         std::fs::remove_dir_all(tmp.path().join(".travsr")).unwrap();
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
         let (full_nodes, full_edges) = {
             let db_path = tmp.path().join(".travsr/graph.db");
             let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -12940,7 +12914,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         std::fs::remove_file(&doc_path).unwrap();
         let db_path = tmp.path().join(".travsr/graph.db");
@@ -12986,7 +12959,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -13057,7 +13029,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -13128,7 +13099,6 @@ mod tests {
 
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         let mut store = travsr_store::SqliteStore::open(&db_path).unwrap();
@@ -13281,7 +13251,6 @@ mod tests {
         .unwrap();
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         // Write backend config after .travsr/ exists (created by init_repo)
@@ -14448,7 +14417,6 @@ mod tests {
         std::fs::write(tmp.path().join("b.ts"), "export class Beta { run() {} }").unwrap();
         std::env::set_var("TRAVSR_DISABLE_REGISTRY", "1");
         init_repo(tmp.path()).unwrap();
-        std::env::remove_var("TRAVSR_DISABLE_REGISTRY");
 
         let db_path = tmp.path().join(".travsr/graph.db");
         // The daemon's long-lived read connection (R5 #342).
