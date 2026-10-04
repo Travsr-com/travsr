@@ -160,8 +160,21 @@ suite("daemonIpc: reporting (#688)", function () {
 
   test("no daemon at all resolves false rather than throwing", async () => {
     const root = tempRepo();
-    const ok = await reportLspDiagnostics(root, REPORT);
-    assert.strictEqual(ok, false, "a missing daemon is a normal state, not an error");
+    // Discovery also scans the #592 runtime dirs, where any daemon running on
+    // this machine listens. Point them at an empty dir so only `root` counts.
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-ipc-empty-"));
+    const saved = { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, TMPDIR: process.env.TMPDIR };
+    process.env.XDG_RUNTIME_DIR = empty;
+    process.env.TMPDIR = empty;
+    try {
+      const ok = await reportLspDiagnostics(root, REPORT);
+      assert.strictEqual(ok, false, "a missing daemon is a normal state, not an error");
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 
   test("a socket that accepts but never replies does not hang the caller", async () => {
