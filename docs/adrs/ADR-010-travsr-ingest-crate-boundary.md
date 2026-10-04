@@ -1,5 +1,12 @@
 # ADR-010: `travsr-ingest` — A Separate Crate for Phase B Semantic Indexing
 
+> **Amended in part (2026-09-16):** `python_lsif.rs` no longer exists. It was an
+> adapter over `pyright --outputjson` that always returned an empty result, and
+> it has been deleted. Every migration step below that moves or imports that file
+> is the original plan and cannot be executed as written. See
+> [Amendment (2026-09-16): python_lsif.rs was deleted](#amendment-2026-09-16-python_lsifrs-was-deleted)
+> at the end of this document.
+
 **Date:** 2026-05-27
 **Status:** Proposed
 **Phase:** 4 (Sprint 12 — structural prerequisite for Sprints 13–16)
@@ -368,3 +375,27 @@ Rejected. Phase 4's planned additions (SCIP parser, bridge plugin system, per-in
 - ADR-006 — rust-analyzer Subprocess Trust Model (the trust precedent now scoped to `travsr-ingest`)
 - ADR-009 — SCIP vs LSIF Wire Format (the format work that lives in `travsr-ingest`)
 - `docs/repo-graph.svg` — workspace dependency graph (updated by S12 PR)
+
+---
+
+## Amendment (2026-09-16): `python_lsif.rs` was deleted
+
+`crates/travsr-indexer/src/python_lsif.rs` has been removed. It shelled out to
+`pyright --outputjson` and fed the result to an adapter that always returned an
+empty `ParseOutput`, because that payload carries only `version`, `time`,
+`generalDiagnostics` and `summary`, and a diagnostic is
+`{file, message, range, rule, severity}`. No symbols, so no nodes and no edges.
+Python's Phase B is `crates/travsr-analysis/src/phase_b_python.rs` (native,
+in-process) merged with the bundled `packages/travsr-lsif-py` emitter, neither
+of which is affected by this ADR's crate split.
+
+The plan body above is kept as written and not retro-edited. Matched by text
+rather than line number:
+
+| Stale text above | Correct today |
+|---|---|
+| `python_lsif.rs      <- Python LSIF specifics (Phase B)` in the target layout | no such file; nothing Python-specific moves to `travsr-ingest` |
+| The move-table row for `travsr-indexer/src/python_lsif.rs` and its cross-crate-import note | no import to break; `python.rs` does not consume it |
+| `git mv crates/travsr-indexer/src/python_lsif.rs crates/travsr-ingest/src/python_lsif.rs` in the migration script | delete this line; the source path does not exist |
+
+The crate-boundary decision itself is unaffected: one fewer file moves.

@@ -13,7 +13,7 @@ import path from 'node:path';
 import { Writable } from 'node:stream';
 import { assertPathsContained, isUnderRoot, resolveRoot } from '../security';
 import { Emitter } from '../emitter';
-import { walk } from '../walker';
+import { init, walk } from '../walker';
 
 // ── Unit tests for security.ts ────────────────────────────────────────────────
 
@@ -186,7 +186,8 @@ test('walk: rejects a file path passed as root (must be a directory)', () => {
   );
 });
 
-test('walk: clean fixture produces a metaData vertex (regression guard)', () => {
+test('walk: clean fixture produces a metaData vertex (regression guard)', async () => {
+  await init();
   const fixtureRoot = path.join(__dirname, '../../fixtures/simple');
   const lines: string[] = [];
   const sink = new Writable({
@@ -206,7 +207,8 @@ test('walk: clean fixture produces a metaData vertex (regression guard)', () => 
   assert.ok(hasMetaData, 'clean fixture must emit a metaData vertex');
 });
 
-test('walk: all emitted document URIs are under the project root', () => {
+test('walk: all emitted document URIs are under the project root', async () => {
+  await init();
   const fixtureRoot = path.join(__dirname, '../../fixtures/simple');
   const repoRoot = resolveRoot(fixtureRoot);
 

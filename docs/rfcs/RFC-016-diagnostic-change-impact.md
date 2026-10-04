@@ -1,5 +1,7 @@
 # RFC-016: Diagnostic Change-Impact System — `get_change_impact` MCP Tool
 
+> **Amended in part (2026-09-16):** Travsr's `pyright --outputjson` adapter was removed as dead code, so pyright is no longer wired into Travsr anywhere. This does **not** block this RFC: the deleted code was an edge-extraction adapter, and Tier 2 wants diagnostics, which is the one thing that payload does contain. Every mention below that treats pyright as Python's existing Phase B tool is stale. See [Amendment (2026-09-16): pyright is no longer the Python Phase B tool](#amendment-2026-09-16-pyright-is-no-longer-the-python-phase-b-tool) at the end of this document.
+
 **Status:** Draft  
 **Author:** Tech Lead / Abhishek  
 **Date:** 2026-06-15  
@@ -832,3 +834,45 @@ visible to agents rather than hiding it.
    `files: Vec<String>` (union of blast radii) or should agents call it once per
    changed file? The union approach is more powerful but the response size may
    exceed token budgets. To be resolved before Phase 1 ships.
+
+---
+
+## Amendment (2026-09-16): pyright is no longer the Python Phase B tool
+
+`crates/travsr-indexer/src/python_lsif.rs`, which shelled out to
+`pyright --outputjson` and tried to build `ParseOutput` nodes and edges from the
+result, has been deleted. It was dead: `pyright --outputjson` returns only
+`version`, `time`, `generalDiagnostics` and `summary`, with each diagnostic
+shaped `{file, message, range, rule, severity}`. That payload contains no
+symbols, so the adapter always returned an empty result and could never have
+done otherwise.
+
+The design body above is kept as the decision record and is not retro-edited.
+Matched by text rather than line number, since line numbers move:
+
+| Stale text above | Correct today |
+|---|---|
+| "Phase B tools (scip-typescript, scip-go, pyright, scip-clang) produce diagnostic ..." | pyright is not one of Travsr's Phase B tools and never produced anything for it |
+| "\| Python \| pyright \| Structured JSON - reliable \|" | the row still describes the right Tier 2 tool, but pyright is not already invoked by Phase B, so Tier 2 would be the first caller |
+| "`scip-go, scip-typescript, pyright, etc.`" in the Tier 2 diagram | pyright is a candidate Tier 2 provider, not an existing Phase B producer |
+| "`pyright.rs`" in the Tier 2 module sketch | still the right filename for a Tier 2 Python provider, but it would be new code, not a wrapper over an existing integration |
+
+**This removal does not block RFC-016.** The two things are not the same code
+path. What was deleted tried to read *symbols* out of a *diagnostic* payload,
+which was never going to work. Tier 2 of this RFC wants exactly the diagnostics
+that payload carries: `generalDiagnostics` is already a per-file list of
+`{message, range, rule, severity}`, which maps onto this RFC's `Diagnostic`
+struct almost directly. A Tier 2 Python provider invoking
+`pyright --outputjson` on blast-radius files remains the right design, and the
+`available()` and `invocation` contract in the Python provider table above still
+holds as written.
+
+**One assumption changes.** The RFC reads as though pyright is already spawned
+during Phase B and Tier 2 would piggyback on an existing integration. It is not
+and would not. Python Phase B is now
+`crates/travsr-analysis/src/phase_b_python.rs`, native in-process tree-sitter
+analysis that spawns nothing, plus the first-party bundled Node emitter
+`packages/travsr-lsif-py`. Neither runs a type checker. A Tier 2 Python provider
+therefore owns the whole pyright lifecycle itself: discovery on `PATH`, timeout,
+subprocess hardening and the sandbox decision. Budget for that when Tier 2 is
+scoped.

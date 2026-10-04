@@ -28,6 +28,8 @@ export const HOVER_SELECTOR: vscode.DocumentSelector = [
   { language: "scala" },
   { language: "cpp" },
   { language: "c" },
+  { language: "objective-c" },
+  { language: "objective-cpp" },
   { language: "csharp" },
   { language: "swift" },
   { language: "dart" },
