@@ -239,8 +239,17 @@ fn default_live_edge_kind() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LiveResolutionTarget {
     /// 1-based line of the reference in the dirty file. The editor searches this
-    /// line for `name` to recover the column the native extractor does not carry.
+    /// line for `name` to recover the column when `ref_col` is absent.
     pub ref_line: u32,
+    /// 0-based column of the reference, when the daemon could pin it against the
+    /// file text (RFC-027 #813 P1). Present, the editor resolves at exactly this
+    /// position and skips its own `name` search, which removes the miss class
+    /// where the target name is not literally on the line (e.g. a tuple-field
+    /// access like `s.node.0`). Absent (an older daemon, or a name the daemon
+    /// could not pin), the editor falls back to searching `ref_line` for `name`,
+    /// so the field is additive and safe to ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_col: Option<u32>,
     /// The referenced name, so the editor can pin the column and so the daemon
     /// can record an honest `pending` row if the editor's answer maps to nothing.
     pub name: String,
@@ -314,6 +323,13 @@ pub struct ControlResponse {
     /// request was a successful [`ControlMessage::Query`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// The daemon's build version (`travsr_daemon::build_version`), set on the
+    /// [`ControlMessage::Status`] reply so a client can detect that the running
+    /// daemon was built from a different binary than itself. `None` on every
+    /// other op, and on a reply from a daemon that predates this field — which
+    /// a client reads as "older than me", the case this exists to catch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl ControlResponse {
@@ -323,6 +339,7 @@ impl ControlResponse {
             message: message.into(),
             protocol: None,
             result: None,
+            daemon_version: None,
         }
     }
 
@@ -332,6 +349,7 @@ impl ControlResponse {
             message: Some(message.into()),
             protocol: None,
             result: None,
+            daemon_version: None,
         }
     }
 
@@ -342,6 +360,7 @@ impl ControlResponse {
             message: None,
             protocol: Some(QUERY_PROTOCOL_VERSION),
             result: Some(result),
+            daemon_version: None,
         }
     }
 }
@@ -367,6 +386,30 @@ mod tests {
             }
             other => panic!("expected Query, got {other:?}"),
         }
+    }
+
+    // A Status reply from a daemon built before `daemon_version` existed omits
+    // the field, and must deserialize to `None` — which the client reads as
+    // "older than me, restart it". A reply that carries it round-trips.
+    #[test]
+    fn control_response_daemon_version_is_backward_compatible() {
+        // Old daemon: no `daemon_version` key on the wire.
+        let old = r#"{"ok":true,"message":"nodes: 1 | edges: 0"}"#;
+        let parsed: ControlResponse =
+            serde_json::from_str(old).expect("a pre-field reply must still parse");
+        assert_eq!(parsed.daemon_version, None);
+
+        // Current daemon: the field is present and round-trips.
+        let mut resp = ControlResponse::ok(Some("nodes: 1 | edges: 0".to_string()));
+        resp.daemon_version = Some("1.2.3".to_string());
+        let line = serde_json::to_string(&resp).unwrap();
+        assert!(line.contains(r#""daemon_version":"1.2.3""#), "{line}");
+        let back: ControlResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.daemon_version.as_deref(), Some("1.2.3"));
+
+        // A non-Status reply never carries it, so it is not serialized.
+        let bare = serde_json::to_string(&ControlResponse::ok(None)).unwrap();
+        assert!(!bare.contains("daemon_version"), "{bare}");
     }
 
     // #688: the extension hand-builds this line in TypeScript
@@ -482,15 +525,29 @@ mod tests {
     fn a_resolution_target_serialises_to_the_shape_the_extension_reads() {
         let target = LiveResolutionTarget {
             ref_line: 19,
+            ref_col: Some(6),
             name: "save".to_string(),
             edge_kind: "ref/call".to_string(),
             provider: "definition".to_string(),
         };
         let v = serde_json::to_value(&target).expect("serialise");
         assert_eq!(v["ref_line"], 19);
+        assert_eq!(v["ref_col"], 6);
         assert_eq!(v["name"], "save");
         assert_eq!(v["edge_kind"], "ref/call");
         assert_eq!(v["provider"], "definition");
+
+        // `ref_col` is omitted (not null) when absent, so an older extension that
+        // never reads it sees exactly the pre-#813 shape.
+        let no_col = LiveResolutionTarget {
+            ref_col: None,
+            ..target
+        };
+        let v = serde_json::to_value(&no_col).expect("serialise");
+        assert!(
+            v.get("ref_col").is_none(),
+            "ref_col must be omitted when None"
+        );
     }
 
     // RFC-027 section 8.7.5: the target response carries the saved file's own
@@ -503,6 +560,7 @@ mod tests {
         let resp = LiveResolutionTargets {
             own: vec![LiveResolutionTarget {
                 ref_line: 12,
+                ref_col: None,
                 name: "run".to_string(),
                 edge_kind: "ref/call".to_string(),
                 provider: "definition".to_string(),
@@ -511,6 +569,7 @@ mod tests {
                 file: "src/main.go".to_string(),
                 targets: vec![LiveResolutionTarget {
                     ref_line: 4,
+                    ref_col: None,
                     name: "Start".to_string(),
                     edge_kind: "ref/call".to_string(),
                     provider: "definition".to_string(),

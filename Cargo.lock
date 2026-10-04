@@ -874,7 +874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1537,7 +1537,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2834,14 +2834,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -2863,9 +2863,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -3237,7 +3237,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3922,7 +3922,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-cli"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3934,6 +3934,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
+ "ignore",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -3998,6 +3999,7 @@ dependencies = [
  "ignore",
  "libc",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -4007,6 +4009,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "travsr-analysis",
+ "travsr-config",
  "travsr-core",
  "travsr-indexer",
  "travsr-ipc",
@@ -4063,7 +4066,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-mcp"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4186,6 +4189,7 @@ dependencies = [
  "fs2",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
  "travsr-core",

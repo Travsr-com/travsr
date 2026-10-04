@@ -166,7 +166,7 @@ pub fn render_line(h: &SidecarHealth) -> String {
 }
 
 /// Print the `sidecars:` block, or nothing when no sidecar is worth reporting.
-/// Shared by `travsr status`, `travsr embed status`, and `travsr lang list`.
+/// Shared by `travsr status --verbose` and `travsr embed status`.
 ///
 /// Tools with no declared floor whose version simply cannot be read (many Phase
 /// B wrappers and emitters do not answer `--version`) carry nothing actionable,

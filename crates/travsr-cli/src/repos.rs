@@ -15,7 +15,9 @@ struct Row {
 ///
 /// Default lists registered repos as a table. `--remove` drops one entry,
 /// `--prune` drops every entry whose graph.db is gone, `--json` emits machine
-/// -readable output for the VS Code extension.
+/// -readable output for the VS Code extension. #454: every row carries an
+/// `IndexStatus`, so a missing graph.db says whether it was never built or
+/// deleted.
 pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> {
     if let Some(name) = remove {
         // UX-018: the list shows the basename as Name, so `--remove` accepts the
@@ -55,7 +57,7 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
     // the registry. (It previously auto-pruned every stale entry, so `repos`
     // deleted hundreds of rows as a surprising side effect.) Stale entries are
     // shown with a marker below and a one-line hint points at `repos --prune`.
-    let repos = registry::all_repos()?;
+    let repos = registry::all_entries()?;
 
     // UX-018: strip the Windows `\\?\` verbatim prefix from any already-registered
     // entry (new registrations are normalized at write time) so the display is
@@ -65,15 +67,17 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
 
     if json {
         let arr: Vec<serde_json::Value> = {
-            let mut entries: Vec<(String, std::path::PathBuf)> = repos.into_iter().collect();
+            let mut entries: Vec<(String, registry::RepoEntry)> = repos.into_iter().collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             entries
                 .into_iter()
-                .map(|(name, db_path)| {
+                .map(|(name, entry)| {
+                    let status = entry.index_status();
                     serde_json::json!({
                         "name": registry::display_name(&name),
-                        "db_path": clean(&db_path.display().to_string()),
-                        "exists": db_path.exists(),
+                        "db_path": clean(&entry.db_path.display().to_string()),
+                        "exists": status == registry::IndexStatus::Indexed,
+                        "status": status.as_str(),
                     })
                 })
                 .collect()
@@ -87,16 +91,15 @@ pub fn run(prune: bool, remove: Option<&str>, json: bool) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let stale = repos.values().filter(|p| !p.exists()).count();
+    let stale = repos
+        .values()
+        .filter(|e| e.index_status() != registry::IndexStatus::Indexed)
+        .count();
     let mut rows: Vec<Row> = repos
         .into_iter()
-        .map(|(name, db_path)| Row {
-            exists: if db_path.exists() {
-                "yes".to_string()
-            } else {
-                "no (stale)".to_string()
-            },
-            db_path: clean(&db_path.display().to_string()),
+        .map(|(name, entry)| Row {
+            exists: entry.index_status().label().to_string(),
+            db_path: clean(&entry.db_path.display().to_string()),
             name: registry::display_name(&name),
         })
         .collect();

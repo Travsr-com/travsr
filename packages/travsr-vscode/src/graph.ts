@@ -8,7 +8,7 @@
  * Public surface (unchanged from VSCODE-245):
  *   GraphPanel.show()   — create or reveal the singleton panel
  *   panel.query()       — trigger a new graph query
- *   panel.renderPath()  — render a pre-built PCST path
+ *   panel.renderPath()  — render a pre-built execution path
  *   panel.dispose()     — destroy the panel
  *
  * WebviewMessage (webview → extension):
@@ -538,7 +538,7 @@ export class GraphPanel {
   }
 
   /**
-   * Render a pre-built graph (e.g. PCST execution path) directly,
+   * Render a pre-built graph (e.g. an execution path) directly,
    * bypassing get_graph_json. Root-flagged nodes are highlighted.
    */
   renderPath(data: GraphData, query: string): void {

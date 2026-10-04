@@ -8,20 +8,42 @@ name: Embed lifecycle E2E
 #
 # Downloads two real embedding backends and runs two real reindex passes, so
 # this does not run on every PR — manual dispatch or weekly cron only.
+#
+# ## Why the cache and the failure issue are load-bearing (#525 item 1)
+#
+# The test deliberately uses the real `~/.travsr` rather than a fake $HOME, on
+# the stated grounds that CI benefits from the same cache across runs. Hosted
+# runners are ephemeral, so only the restore step below makes that true; without
+# it every run re-downloads the sidecar plus roughly 600 MB of ONNX weights
+# anonymously, and one throttled download turns into a red run.
+#
+# A weekly job that fails into an unread Actions tab is worse than no job: it
+# buys confidence that the model-switch flow is covered when it is not. The
+# `if: failure()` step files (or updates) a single tracking issue so a red run
+# reaches a person. `crates/travsr-cli/tests/embed_lifecycle_e2e.rs` asserts
+# both of these on every PR, which is also the only thing here that runs before
+# this file reaches the default branch.
 
 on:
   schedule:
-    - cron: '30 3 * * 0'   # 03:30 UTC Sundays, after the docs-lane nightly
+    # 05:30 UTC Sundays. Deliberately not adjacent to docs-lane-nightly
+    # ('15 3 * * *', timeout 90), which on a Sunday would otherwise still be
+    # running when this started.
+    - cron: '30 5 * * 0'
   workflow_dispatch:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   embed-lifecycle-e2e:
     name: model-switch lifecycle (ignored E2E)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold build plus two model downloads and two real reindex passes. The
+    # model cache is evicted after 7 days unused and the cron is weekly, so the
+    # cold case is the normal case, not the exception.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,5 +54,36 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
+      - name: Cache the embed sidecar and model weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.travsr/bin
+            ~/.travsr/models
+          key: travsr-embed-models-${{ runner.os }}-${{ hashFiles('crates/travsr-plugin-host/src/embed_catalog.rs') }}
+          restore-keys: |
+            travsr-embed-models-${{ runner.os }}-
+
       - name: Run the model-switch lifecycle E2E test
+        env:
+          # Without a token, `fetch_latest_version_for_repo` is rate-limited
+          # into its version fallback, which would test a sidecar several
+          # releases old and report that as a pass.
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: cargo test -p travsr-cli --test embed_lifecycle_e2e -- --ignored --nocapture
+
+      - name: Report a failed run
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='Weekly embed lifecycle E2E is failing'
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          body="The weekly model-switch lifecycle E2E failed: $RUN_URL. It covers install model A, switch to model B, retrieval under B, then embed gc --apply, so a red run means that flow is currently unverified."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label qa --body "$body"
+          fi

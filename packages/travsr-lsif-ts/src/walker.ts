@@ -9,6 +9,7 @@
  * Pass 2  (references): re-walks every file and emits:
  *   - RefCall          — call expressions resolved to a project declaration
  *   - RefImports       — named import specifiers resolved to a project declaration
+ *   - RefJsx           — JSX element usages (<Foo/>) resolved to the component
  *   - IsImplementation — `implements` clauses resolved to a project interface
  *   - Overrides        — method declarations that shadow a base-class method
  *
@@ -55,7 +56,7 @@ interface RefCtx {
   emitter: Emitter;
 }
 
-export function walk(tsconfigPath: string, emitter: Emitter): void {
+export function walk(tsconfigPath: string, emitter: Emitter, rootDir?: string): void {
   const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
   if (configFile.error) {
     throw new Error(
@@ -63,13 +64,33 @@ export function walk(tsconfigPath: string, emitter: Emitter): void {
     );
   }
 
-  const basePath = path.dirname(tsconfigPath);
+  // basePath drives three things: how relative config paths resolve, how VName
+  // paths are computed (path.relative(basePath, file)), and the SEC-003
+  // containment root. Normally that is the tsconfig's own directory. When
+  // `rootDir` is supplied the tsconfig is a synthesized ephemeral file living
+  // outside the repo (#833) whose `files[]` are absolute paths into the repo;
+  // basePath must then be the real repo root so emitted paths stay
+  // repo-relative and match the tree-sitter node ids the Rust side computes.
+  const basePath = rootDir ? path.resolve(rootDir) : path.dirname(tsconfigPath);
 
   // SEC-003 — Check 1: reject plugins / escaping extends / escaping references
   // before handing the config to the TS compiler. Hard error, no fallback.
   sanitizeTsconfig(configFile.config, basePath);
 
-  const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, basePath);
+  // The config's own relative paths (`include`, `rootDir`) resolve against
+  // its own directory. `--root` only moves emitted paths and the containment
+  // root: read against the repo root, a project tsconfig one level down
+  // matched nothing and emitted no documents.
+  const parsed = ts.parseJsonConfigFileContent(
+    configFile.config,
+    ts.sys,
+    path.dirname(tsconfigPath)
+  );
+
+  // A plugin inherited through `extends` lands in parsed.options here even
+  // though sanitizeTsconfig only saw this file's own keys. createProgram
+  // ignores plugins, but drop them so the compiler input carries none.
+  parsed.options.plugins = undefined;
 
   // SEC-003 — Check 2: every resolved file must be inside the project root.
   // Uses realpathSync to follow symlinks. Catches malicious globs and files[].
@@ -173,8 +194,8 @@ function visitDef(node: ts.Node, ctx: DefCtx): void {
 // ── Pass-2 visitor (module-level — one function object, no per-file allocation) ──
 
 function visitRef(node: ts.Node, ctx: RefCtx): void {
-  // ── RefCall: call expressions ────────────────────────────────────────────
-  if (ts.isCallExpression(node)) {
+  // ── RefCall: call expressions, and `new` as a call to the class ──────────
+  if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
     const info = resolveRefTarget(node.expression, ctx.checker, ctx.symbolInfos);
     if (info) {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.expression);
@@ -196,6 +217,23 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     const info = resolveRefTarget(importedName, ctx.checker, ctx.symbolInfos);
     if (info) {
       const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
+      ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
+      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
+      ctx.refRangeIds.push(rangeId);
+    }
+  }
+
+  // ── RefJsx: <Foo/> and <Foo> usage resolves to the component declaration ──
+  // A JSX element is a usage of its tag. The TS AST models it as a
+  // JsxOpeningElement / JsxSelfClosingElement, not a CallExpression, so the
+  // RefCall arm above never sees it. Resolve the tag name the same way a callee
+  // is resolved; intrinsic lowercase tags (<div>) have no project symbol and
+  // fall out. isCall defaults to true so the rendering component is recorded as
+  // a caller, which is what get_callers and blast radius need.
+  if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+    const info = resolveRefTarget(node.tagName, ctx.checker, ctx.symbolInfos);
+    if (info) {
+      const rangeId = ctx.emitter.emitRange(ctx.sf, node.tagName);
       ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
       ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references');
       ctx.refRangeIds.push(rangeId);
@@ -252,7 +290,13 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
             const baseInfo = ctx.symbolInfos.get(resolved)!;
             const rangeId = ctx.emitter.emitRange(ctx.sf, member.name);
             ctx.emitter.emitEdge('next', rangeId, baseInfo.resultSetId);
-            ctx.emitter.emitItem(baseInfo.referenceResultId, [rangeId], ctx.docId, 'references');
+            ctx.emitter.emitItem(
+              baseInfo.referenceResultId,
+              [rangeId],
+              ctx.docId,
+              'references',
+              false
+            );
             ctx.refRangeIds.push(rangeId);
           }
         }
@@ -313,6 +357,13 @@ function computeTravsrVName(
   } else if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
     const className = findParentClassName(node) ?? '<anonymous>';
     signature = `method:${className}.${node.name.text}`;
+  } else if (
+    ts.isMethodSignature(node) &&
+    ts.isIdentifier(node.name) &&
+    ts.isInterfaceDeclaration(node.parent)
+  ) {
+    // An interface method: tree-sitter names it `method:Iface.name` too.
+    signature = `method:${node.parent.name.text}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
     // (lexical_declaration (variable_declarator)))`). A local has no node, so
@@ -386,7 +437,10 @@ function resolveDeclarationSymbol(
   if (ts.isFunctionDeclaration(node) && node.name) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
-  if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) {
+  if (
+    (ts.isMethodDeclaration(node) || ts.isMethodSignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
@@ -406,7 +460,14 @@ function resolveRefTarget(
 ): SymbolInfo | undefined {
   const raw = checker.getSymbolAtLocation(node);
   const resolved = resolveAlias(raw, checker);
-  return resolved ? symbolInfos.get(resolved) : undefined;
+  if (!resolved) return undefined;
+  const info = symbolInfos.get(resolved);
+  if (info) return info;
+  // A CommonJS export reaches its members through a transient copy of the
+  // symbol; the declaration's own name still holds the pass-1 symbol.
+  const name = resolved.valueDeclaration && ts.getNameOfDeclaration(resolved.valueDeclaration);
+  const declared = name && checker.getSymbolAtLocation(name);
+  return declared ? symbolInfos.get(declared) : undefined;
 }
 
 /** Follow alias chain; returns undefined if input is undefined. */

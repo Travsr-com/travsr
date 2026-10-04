@@ -3,7 +3,7 @@
 //!
 //! `travsr status` derives `semantic:` from three meta keys. `phase_b_commit ==
 //! last_commit` with `phase_b_dirty = 1` renders as
-//! `stale (run travsr init --semantic to refresh)`.
+//! `stale (run travsr init to refresh)`.
 //!
 //! The flag is set by `reindex_files`, because rewriting a file's Phase A nodes
 //! drops its `ref/call` edges (#583). Init's own indexing does not route through
@@ -18,9 +18,10 @@
 //! this a status-honesty bug rather than real staleness.
 //!
 //! Both halves are asserted, since fixing the flag by suppressing the reindex
-//! would be a regression in the other direction. Only `--semantic` clears it:
-//! plain `init` defers Phase B, so the edges really are missing there and the
-//! flag is honest, which is why the remedy names `--semantic`.
+//! would be a regression in the other direction. Only a Phase B run clears it:
+//! the daemon API's `semantic = false` path defers Phase B, so the edges really
+//! are missing there and the flag is honest. The `travsr init` command always
+//! runs Phase B, which is why the remedy names it.
 
 use std::path::Path;
 use std::process::Command as StdCommand;
@@ -43,7 +44,19 @@ fn git_init(dir: &Path) {
 
 fn commit_all(dir: &Path, message: &str) {
     git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-q", "-m", message]);
+    // init installs hooks pinned to its own executable, which here is this
+    // test binary; the commit would run it as `hook-run --from-hook`.
+    git(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
 }
 
 fn meta(db: &Path, key: &str) -> Option<String> {
@@ -259,19 +272,28 @@ fn plain_init_leaves_the_flag_set_because_it_does_not_run_phase_b() {
 
 /// The remediation string must name a command that can actually clear the state
 /// it appears in. Pinned as a string because the message is the whole product
-/// surface for this bug: #741 was a dead-end loop precisely because the text
-/// named `travsr init`, which cannot clear the flag on an already-committed repo.
+/// surface for this bug: #741 was a dead-end loop because the text named a
+/// command that could not clear the flag.
+///
+/// Plain `travsr init` clears it now: the CLI always passes `semantic = true`
+/// (one-command setup), and the daemon's done-guard re-runs Phase B when the
+/// flag is set. Both halves are pinned, so the message cannot outlive the
+/// behaviour that makes it true.
 #[test]
 fn the_remediation_names_a_command_that_works() {
     let status_rs = include_str!("../../travsr-cli/src/status.rs");
     assert!(
-        status_rs.contains("stale (run travsr init --semantic to refresh)"),
-        "the stale message must name `travsr init --semantic`"
+        status_rs.contains("stale (run travsr init to refresh)"),
+        "the stale message must name `travsr init`"
     );
     assert!(
-        !status_rs.contains("stale (run travsr init to refresh)"),
-        "the old message named plain `travsr init`, which defers Phase B and so \
-         cannot clear the flag: running it returns the user to the same message"
+        !status_rs.contains("init --semantic to refresh"),
+        "the flag is internal; the remedy is the one command, plan 3.0"
+    );
+    let init_rs = include_str!("../../travsr-cli/src/init.rs");
+    assert!(
+        init_rs.contains("init_repo_with_progress(&repo_root, jobs, true, force"),
+        "`travsr init` must run Phase B inline, or the message above is a dead end"
     );
 }
 
@@ -350,4 +372,119 @@ fn read_dirty_seq(store: &mut travsr_store::SqliteStore) -> u64 {
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
+}
+
+/// An `init` interrupted during Phase B must leave `last_commit` at HEAD and
+/// `phase_b_commit` behind it: that gap is what arms the daemon's Phase B, so
+/// the work handed off on Ctrl-C actually gets done.
+#[test]
+fn last_commit_is_stamped_before_phase_b_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::write(root.join("m.py"), "def add():\n    return 1\n").unwrap();
+    commit_all(root, "c1");
+    disable_registry();
+    let db = root.join(".travsr/graph.db");
+    let at_phase_b_start = std::sync::Mutex::new(None);
+    travsr_daemon::init_repo_with_progress(root, None, true, false, &mut |ev| {
+        let mut seen = at_phase_b_start.lock().unwrap();
+        if matches!(ev, travsr_daemon::InitProgress::Finalizing) && seen.is_none() {
+            *seen = Some((meta(&db, "last_commit"), meta(&db, "phase_b_commit")));
+        }
+    })
+    .unwrap();
+    let (last, phase_b) = at_phase_b_start
+        .into_inner()
+        .unwrap()
+        .expect("Phase B started");
+    assert!(last.is_some(), "last_commit stamped before Phase B");
+    assert_eq!(last, meta(&db, "last_commit"), "and it is HEAD");
+    assert_eq!(phase_b, None, "Phase B not yet stamped");
+}
+
+fn set_meta(db: &Path, key: &str, value: &str) {
+    let mut store = travsr_store::SqliteStore::open(db).expect("open graph.db");
+    store.set_meta(key, value).expect("set meta");
+}
+
+fn head(dir: &Path) -> String {
+    let out = StdCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A Python pair committed, indexed, and marked as traced at HEAD, the state a
+/// completed Phase B leaves. Plain `init_repo` defers Phase B, so this needs
+/// no call tracer on the machine.
+fn traced_repo(root: &Path) -> std::path::PathBuf {
+    git_init(root);
+    std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
+    std::fs::write(
+        root.join("a.py"),
+        "from b import helper\n\n\ndef main():\n    return helper()\n",
+    )
+    .unwrap();
+    commit_all(root, "seed");
+    disable_registry();
+    travsr_daemon::init_repo(root).expect("init_repo");
+    let db = root.join(".travsr/graph.db");
+    set_meta(&db, "phase_b_commit", &head(root));
+    set_meta(&db, "phase_b_dirty", "0");
+    db
+}
+
+/// Re-reading an edited file drops its traced calls, so init must mark them
+/// stale rather than trust `phase_b_commit == HEAD`; `init --semantic` then
+/// runs Phase B again on that flag.
+#[test]
+fn init_marks_calls_stale_when_it_re_reads_a_traced_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let db = traced_repo(root);
+
+    std::fs::write(
+        root.join("a.py"),
+        "# edited\nfrom b import helper\n\n\ndef main():\n    return helper()\n",
+    )
+    .unwrap();
+    travsr_daemon::init_repo(root).expect("init_repo");
+    assert!(reads_as_dirty(&db));
+}
+
+/// A first index has no traced calls to drop, so it must not read as stale.
+#[test]
+fn a_first_index_does_not_mark_calls_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    git_init(root);
+    std::fs::write(root.join("b.py"), "def helper():\n    return 1\n").unwrap();
+    commit_all(root, "seed");
+    disable_registry();
+    travsr_daemon::init_repo(root).expect("init_repo");
+    assert!(!reads_as_dirty(&root.join(".travsr/graph.db")));
+}
+
+/// A new git remote changes every node id and purges the graph, traced calls
+/// included, so the Phase B marker must not survive it.
+#[test]
+fn a_repository_identity_change_clears_the_phase_b_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let db = traced_repo(root);
+
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/x/retrace.git",
+        ],
+    );
+    travsr_daemon::init_repo(root).expect("init_repo");
+    assert_eq!(meta(&db, "phase_b_commit"), None);
 }
