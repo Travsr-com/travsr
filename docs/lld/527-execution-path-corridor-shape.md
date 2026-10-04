@@ -145,9 +145,10 @@ and D3 against current master and agrees with them.
 ### What #654 does not yet cover
 
 1. **The RFC number is already taken.** `docs/rfcs/RFC-025-sidecar-version-contract.md`
-   is on master (merged in #702), and #654 adds a second `RFC-025-*`. Next free
-   number is RFC-028 (RFC-027 landed in #795). Purely clerical, but two RFC-025s
-   is exactly the kind of drift #527 exists to punish.
+   is on master (merged in #702), and #654 adds a second `RFC-025-*`. RFC-025
+   through RFC-030 are all on master now, so the next free number is RFC-031.
+   Purely clerical, but two RFC-025s is exactly the kind of drift #527 exists to
+   punish.
 2. **Gate 2 contradicts the RFC's own corpus note.** Acceptance Criteria states
    that one corpus is "enough to disqualify an arm, not enough to generalise a
    win", then gate 2 ships C2 into production on the travsr self-graph alone.
