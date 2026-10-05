@@ -44,7 +44,7 @@ travsr-plugin-host     = { path = "crates/travsr-plugin-host" }
 # tract 0.22 declares rust_version 1.85. That is below this workspace's 1.88
 # MSRV, which is set by `time` itself (0.3.46+ all require 1.88), so tract is
 # not the binding constraint. 0.23+ would drop `time` entirely but needs 1.91.
-tract-onnx = "0.22.2"
+tract-onnx = "0.23.8"
 # tract's SimplePlan does not itself parallelize across the batch dimension
 # (measured: K=1 ~34ms, K=30 ~983ms — perfectly linear, zero batching
 # speedup); rayon splits the reranker's candidate batch across threads
