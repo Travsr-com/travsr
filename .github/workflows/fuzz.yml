@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
           # ignore rather than error when the directory doesn't exist — this
