@@ -198,17 +198,12 @@ const RESTART_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 ///
 /// #974: the package version alone made every build of one version compare
 /// equal, so a rebuilt binary never restarted the daemon still running the old
-/// image. The executable's byte length is appended as semver build metadata:
-/// it changes with the code, and two copies of one binary (an npm install and
-/// an editor's bundled copy) still agree, which a modification time would not.
-/// An unreadable executable yields `+0` on both sides, i.e. the version-only
-/// comparison this replaced.
-pub(crate) fn our_build_version() -> String {
-    let len = std::env::current_exe()
-        .and_then(std::fs::metadata)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    format!("{}+{len}", env!("CARGO_PKG_VERSION"))
+/// image. A digest of the workspace sources (`build.rs`) is appended as semver
+/// build metadata: it changes with any change to the code, and two copies of
+/// one binary (an npm install and an editor's bundled copy) still agree, which
+/// a modification time would not.
+pub(crate) fn our_build_version() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("TRAVSR_BUILD_ID"))
 }
 
 /// Whether a daemon advertising `daemon_version` (as read from a Status reply,
@@ -256,7 +251,7 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
         return; // transiently unreachable (starting, busy pipe) — leave it be
     };
-    if !version_is_skewed(resp.daemon_version.as_deref(), &our_build_version()) {
+    if !version_is_skewed(resp.daemon_version.as_deref(), our_build_version()) {
         return;
     }
     // Single-flight: only the lock holder performs the swap, so two concurrent
@@ -268,7 +263,7 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     // Re-check under the lock: another client may have already restarted it in
     // the window between our Status read above and taking this lock.
     if let Ok(r) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) {
-        if !version_is_skewed(r.daemon_version.as_deref(), &our_build_version()) {
+        if !version_is_skewed(r.daemon_version.as_deref(), our_build_version()) {
             return;
         }
     }
@@ -461,7 +456,7 @@ mod lock_tests {
         assert!(version_is_skewed(Some("1.3.0"), "1.2.3"), "newer daemon");
         assert!(version_is_skewed(None, "1.2.3"), "pre-field daemon");
         assert!(
-            version_is_skewed(Some("1.2.3+100"), "1.2.3+200"),
+            version_is_skewed(Some("1.2.3+0a1b"), "1.2.3+9f8e"),
             "same version, rebuilt binary"
         );
     }
@@ -469,11 +464,12 @@ mod lock_tests {
     /// #974: two builds of one version must not compare equal, or a rebuilt
     /// binary never restarts the daemon still running the old image.
     #[test]
-    fn build_version_carries_the_executable_length() {
+    fn build_version_carries_a_digest_of_the_sources() {
         let v = our_build_version();
-        let (version, len) = v.split_once('+').expect("version+length");
+        let (version, digest) = v.split_once('+').expect("version+digest");
         assert_eq!(version, env!("CARGO_PKG_VERSION"));
-        assert!(len.parse::<u64>().expect("a byte count") > 0, "{v}");
+        assert_eq!(digest.len(), 16, "{v}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{v}");
     }
 
     /// Single-flight: while one process holds the restart lock, a second cannot,
