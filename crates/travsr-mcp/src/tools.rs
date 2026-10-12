@@ -679,7 +679,8 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     // #974: an empty raw body is two different answers, and an empty envelope
     // told the reader neither: the symbol is not in the graph, or it is and
     // nothing points at it. Worded here, not in the raw function, whose empty
-    // string the multi-repo aggregator keys on.
+    // string the multi-repo aggregator keys on. As a `[note: …]` line: clients
+    // count every other line as a caller row.
     let raw = get_callers_raw(store, symbol, path);
     let raw = if !raw.is_empty() {
         raw
@@ -688,9 +689,9 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
         .map(|n| n.is_empty())
         .unwrap_or(true)
     {
-        format!("No symbols matching '{symbol}' found in the graph.")
+        format!("[note: No symbols matching '{symbol}' found in the graph.]")
     } else {
-        format!("'{symbol}' is in the graph but nothing calls or defines it.")
+        format!("[note: '{symbol}' is in the graph but nothing calls or defines it.]")
     };
     with_phase_b_note(
         store,
@@ -1875,9 +1876,10 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
     // #974: the raw body is empty only when the symbol resolved to nothing (a
     // resolved symbol with zero sites renders its own caveat). Say so here, not
     // in the raw function, whose empty string the multi-repo aggregator keys on.
+    // As a `[note: …]` line: clients count every other line as a result row.
     let raw = find_references_raw(store, symbol, path);
     let raw = if raw.is_empty() {
-        format!("No symbols matching '{symbol}' found in the graph.")
+        format!("[note: No symbols matching '{symbol}' found in the graph.]")
     } else {
         raw
     };
@@ -2505,8 +2507,9 @@ pub fn find_pattern(
 
 /// #974: what [`find_pattern_body`] answers when the search ran and matched
 /// nothing. Cannot collide with a match list, whose every line is
-/// `path:line:col:`-prefixed.
-const NO_MATCHES: &str = "no matches";
+/// `path:line:col:`-prefixed. A `[note: …]` line, which clients do not count
+/// as a match row.
+const NO_MATCHES: &str = "[note: no matches]";
 
 /// Raw (unsanitized) body for `find_pattern`, shared by the global aggregator
 /// and the CLI. Callers that hand the result to a model must wrap it in the
@@ -19370,7 +19373,7 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let out = find_references(&store, "NonExistentSymbol", None);
         assert!(
-            out.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
+            out.contains("[note: No symbols matching 'NonExistentSymbol' found in the graph.]"),
             "an unresolved symbol must not read as an empty answer: {out}"
         );
     }
@@ -19380,7 +19383,7 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let out = get_callers(&store, "NonExistentSymbol", None);
         assert!(
-            out.contains("No symbols matching 'NonExistentSymbol' found in the graph."),
+            out.contains("[note: No symbols matching 'NonExistentSymbol' found in the graph.]"),
             "an unresolved symbol must not read as an empty answer: {out}"
         );
     }
@@ -19400,7 +19403,9 @@ mod snippet_tests {
             .unwrap();
         let out = get_callers(&store, "lonely_helper", None);
         assert!(
-            out.contains("'lonely_helper' is in the graph but nothing calls or defines it."),
+            out.contains(
+                "[note: 'lonely_helper' is in the graph but nothing calls or defines it.]"
+            ),
             "a known symbol with no incoming edges must say so: {out}"
         );
         assert!(!out.contains("No symbols matching"), "{out}");
@@ -19414,7 +19419,7 @@ mod snippet_tests {
             return;
         }
         let out = find_pattern(&store, "zzz_no_such_text_qqq", None, true);
-        assert_eq!(out, "<travsr-data>\nno matches\n</travsr-data>");
+        assert_eq!(out, "<travsr-data>\n[note: no matches]\n</travsr-data>");
         // The raw body keeps the empty-string contract the multi-repo
         // aggregator and the CLI key on.
         assert_eq!(

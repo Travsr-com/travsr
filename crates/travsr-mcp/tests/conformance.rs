@@ -212,12 +212,13 @@ fn mcp_empty_result_is_not_an_error() {
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or("non-empty");
-    // SEC-001: empty results are now wrapped in the sanitized envelope.
-    // The envelope is the minimum non-empty response; the LLM sees it as
-    // "no data found" rather than an error.
+    // SEC-001: the answer is wrapped in the sanitized envelope. #974: it says
+    // the symbol is not in the graph, as a `[note: …]` line and never as a
+    // result row, so a reader cannot take it for "nothing calls this".
     assert_eq!(
-        text, "<travsr-data></travsr-data>",
-        "content text must be the empty envelope for no-match query"
+        text,
+        "<travsr-data>\n[note: No symbols matching 'zzz_nonexistent' found in the graph.]\n</travsr-data>",
+        "an unresolved symbol must be reported as a note inside the envelope"
     );
 }
 
