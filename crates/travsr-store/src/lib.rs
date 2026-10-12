@@ -5756,6 +5756,18 @@ LIMIT ?4",
             std::collections::HashMap::with_capacity(unique_paths.len());
         for path in unique_paths {
             span_cache.insert(path, fetch_all_fn_spans(&tx, corpus, path)?);
+            // #974: this batch is authoritative for every file it carries
+            // occurrences for, so retract that file's owned rows before
+            // re-recording them. `line` is in the `edge_sites` key, so the
+            // upsert below can never overwrite a row left on another line; it
+            // survived every later run and `find_references` served it as fact.
+            // Owned rows only, the same rule as [`Self::reindex_replace`].
+            tx.execute(
+                "DELETE FROM edge_sites \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("write_scip_attributed_batch: purging owned edge_sites")?;
         }
 
         // #650: count `src == dst` refs dropped by the guard below, so the
@@ -17704,6 +17716,72 @@ mod tests {
             "non-call reference must record a find_references occurrence"
         );
         assert_eq!(sites[0].line, 5);
+    }
+
+    /// #974: a Phase B batch is authoritative for the files it carries
+    /// occurrences for. `line` is part of the `edge_sites` key, so a row an
+    /// earlier run left on another line is a different row and was never
+    /// overwritten: `find_references` kept serving it as fact until the owning
+    /// file was next re-parsed. Rows owned by a file this batch does not carry
+    /// are that file's to retract and must survive.
+    #[test]
+    fn attributed_batch_retracts_a_files_earlier_occurrence_lines() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let user = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "fn:user"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let other = Node::new(
+            VName::new(corpus, "", "c.rs", "rust", "fn:other"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let target = Node::new(
+            VName::new(corpus, "", "b.rs", "rust", "fn:target"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(3);
+        store
+            .write_scip_attributed_batch(
+                corpus,
+                &[user.clone(), other.clone(), target.clone()],
+                &[],
+            )
+            .unwrap();
+        let call = |path: &str, line: u32| travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: line,
+            callee_id: target.id,
+            is_call: true,
+            caller_col: None,
+        };
+
+        // First run: `user` calls `target` on line 5, `other` on line 4.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call("a.rs", 5), call("c.rs", 4)])
+            .unwrap();
+        // Second run carries a.rs only, with the call now on line 8.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call("a.rs", 8)])
+            .unwrap();
+
+        let mut sites: Vec<(String, u32)> = store
+            .reference_sites(target.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.path, s.line))
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![("a.rs".to_string(), 8), ("c.rs".to_string(), 4)],
+            "a.rs keeps only the line this run produced; c.rs, absent from this run, is untouched"
+        );
     }
 
     /// Reproduces issue #650's exact producer path: the rust-analyzer LSIF
