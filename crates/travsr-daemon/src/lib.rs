@@ -2162,6 +2162,12 @@ pub fn init_repo_with_progress(
                 resolved_cross_crate_edges = resolved.len(),
                 "semantic analysis cross-reference resolution complete"
             );
+            // #974: the occurrence writers below only upsert, so retract the
+            // rows of every file this pass re-records. Before the attributed
+            // batch, whose own rows for those files must survive.
+            if let Err(e) = store.retract_owned_edge_sites(resolved_sites.iter().map(|s| s.0)) {
+                tracing::warn!("retracting stale edge_sites: {e:#}");
+            }
             let (report, alias_map, dropped) = write_phase_b_results(
                 &mut store,
                 &corpus,
@@ -5552,6 +5558,12 @@ fn run_background_phase_b_inner(
         "semantic analysis cross-reference resolution complete"
     );
 
+    // #974: the occurrence writers below only upsert, so retract the rows of
+    // every file this pass re-records. Before the attributed batch, whose own
+    // rows for those files must survive.
+    if let Err(e) = s.retract_owned_edge_sites(resolved_sites.iter().map(|r| r.0)) {
+        tracing::warn!("retracting stale edge_sites: {e:#}");
+    }
     let (report, alias_map, dropped) = write_phase_b_results(
         &mut s,
         &corpus,
