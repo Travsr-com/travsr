@@ -3573,7 +3573,8 @@ pub(crate) fn abstain_message(seed_set: &SeedSet, query: &str) -> String {
 
     if max_guesses > 0 && !seed_set.seeds.is_empty() {
         msg.push_str(&format!(
-            "\n[The core of your query isn't in this repo. \
+            "\n[No symbol name in this repo matched the core of your query. \
+             That is a name-match miss, not proof the behaviour is absent. \
              Showing closest {} guess(es) only, treat these as speculative.]\n",
             seed_set.seeds.len().min(max_guesses)
         ));
@@ -3587,6 +3588,36 @@ pub(crate) fn abstain_message(seed_set: &SeedSet, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #974: the pipeline established that no symbol name matched, not that
+    /// the behaviour is absent. The old wording ("isn't in this repo") stated
+    /// the second, and a reader took a vocabulary miss for a missing feature.
+    #[test]
+    fn abstain_message_reports_a_name_miss_not_an_absent_behaviour() {
+        let seed_set = SeedSet {
+            intent: QueryIntent::Conceptual,
+            seeds: vec![Seed {
+                node: NodeId(1),
+                weight: 1.0,
+                source: SeedSource::Lexical,
+                score: 0.1,
+                rerank_score: None,
+            }],
+            terms: Vec::new(),
+            coverage: 0.0,
+            n_resolved_gated: 0,
+            confidence: Confidence::None,
+            exact_anchor_present: false,
+            coverage_ok: false,
+            max_rerank_score: None,
+            anchor_rescued: false,
+            top_bm25: 0.0,
+        };
+        let msg = abstain_message(&seed_set, "how does the daemon refresh the graph");
+        assert!(msg.contains("no grounded match"), "{msg}");
+        assert!(msg.contains("name-match miss"), "{msg}");
+        assert!(!msg.contains("isn't in this repo"), "{msg}");
+    }
 
     // ── #463 logic-bearing exact-anchor ordering ─────────────────────────────
 
