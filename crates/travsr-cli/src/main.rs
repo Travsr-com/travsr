@@ -629,7 +629,9 @@ async fn async_main() {
     // UX-019: publish the product version so the daemon's session-start log
     // reports the same string as `travsr --version` instead of its own workspace
     // crate version (0.7.0). The background daemon is a re-exec of this same
-    // binary, so it runs this too.
+    // binary, so it runs this too. #974: the string also carries this
+    // executable's length as build metadata (`1.2.1+<bytes>`), which is what
+    // lets the skew check tell two builds of one version apart.
     //
     // `TRAVSR_BUILD_VERSION_OVERRIDE` lets a test spawn a daemon that reports a
     // different version than this binary, so the version-skew auto-restart can be
@@ -637,7 +639,7 @@ async fn async_main() {
     // production (the daemon is a re-exec that does not carry it forward).
     match std::env::var("TRAVSR_BUILD_VERSION_OVERRIDE") {
         Ok(v) if !v.is_empty() => travsr_daemon::set_build_version(&v),
-        _ => travsr_daemon::set_build_version(env!("CARGO_PKG_VERSION")),
+        _ => travsr_daemon::set_build_version(&daemon_client::our_build_version()),
     }
 
     // Parse CLI args BEFORE initialising any subsystems.
