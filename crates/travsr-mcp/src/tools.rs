@@ -3442,8 +3442,18 @@ pub fn find_pattern_global(
     }
     // Aggregate raw per-repo bodies (not the wrapped form) so there is a single
     // envelope + one large-limit sanitize over the whole result.
+    // #974: whether any repo's search ran and matched nothing. A repo that
+    // rejected the input answers the empty string instead, and "no matches"
+    // would be a claim about a search that never ran.
+    let mut searched = false;
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern_raw(store, pattern, scope, fixed);
+        let result = find_pattern_body(store, pattern, scope, fixed);
+        let result = if result == NO_MATCHES {
+            searched = true;
+            String::new()
+        } else {
+            result
+        };
         if result.is_empty() || single {
             result
         } else {
@@ -3454,7 +3464,7 @@ pub fn find_pattern_global(
                 .join("\n")
         }
     });
-    let raw = if raw.is_empty() {
+    let raw = if raw.is_empty() && searched {
         global_empty_note(repos, repo, NO_MATCHES.to_string())
     } else {
         raw
@@ -19636,6 +19646,18 @@ mod snippet_tests {
             find_pattern_raw(&store, "zzz_no_such_text_qqq", None, true),
             ""
         );
+    }
+
+    /// A pattern every repo rejects was never searched for, so the multi-repo
+    /// tool keeps the empty envelope the single-repo one answers.
+    #[test]
+    fn find_pattern_global_rejected_input_is_not_reported_as_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        drop(travsr_store::SqliteStore::open(&db).unwrap());
+        let repos: HashMap<String, PathBuf> = [("/r".to_string(), db)].into_iter().collect();
+        let out = find_pattern_global(&repos, "a\nb", None, None, false);
+        assert_eq!(out, "<travsr-data></travsr-data>");
     }
 
     // ── #448: the search set must equal the graph's file set ─────────────────
