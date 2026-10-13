@@ -5671,6 +5671,25 @@ LIMIT ?4",
         nodes: &[travsr_core::Node],
         refs: &[travsr_core::ScipRef],
     ) -> anyhow::Result<()> {
+        self.write_scip_attributed_batch_keeping(corpus, nodes, refs, &[])
+    }
+
+    /// [`Self::write_scip_attributed_batch`], except that a file whose language
+    /// is in `keep_languages` is not retracted first (#974).
+    ///
+    /// The retraction is right only when this batch holds everything the file
+    /// has. A language whose analyzer crashed or was skipped this run still
+    /// carries its files here (the native pass ran), with a fraction of their
+    /// references: retracting would replace the last complete run with that
+    /// fraction. Such a file keeps its rows and gains this run's on top, which
+    /// is what every file did before the retraction existed.
+    pub fn write_scip_attributed_batch_keeping(
+        &mut self,
+        corpus: &str,
+        nodes: &[travsr_core::Node],
+        refs: &[travsr_core::ScipRef],
+        keep_languages: &[String],
+    ) -> anyhow::Result<()> {
         if nodes.is_empty() && refs.is_empty() {
             return Ok(());
         }
@@ -5756,6 +5775,37 @@ LIMIT ?4",
             std::collections::HashMap::with_capacity(unique_paths.len());
         for path in unique_paths {
             span_cache.insert(path, fetch_all_fn_spans(&tx, corpus, path)?);
+            if file_language_is_kept(&tx, corpus, path, keep_languages)? {
+                continue;
+            }
+            // #974: this batch is authoritative for every file it carries
+            // occurrences for, so retract that file's owned rows before
+            // re-recording them. `line` is in the `edge_sites` key, so the
+            // upsert below can never overwrite a row left on another line; it
+            // survived every later run and `find_references` served it as fact.
+            // Owned rows only, the same rule as [`Self::reindex_replace`].
+            tx.execute(
+                "DELETE FROM edge_sites \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("write_scip_attributed_batch: purging owned edge_sites")?;
+            // The edges those rows stood behind have the same problem: the
+            // upsert below keys on `(src, dst, kind)`, so an edge an earlier
+            // run attributed to the wrong enclosing function was never
+            // overwritten either, and `get_callers` kept listing a caller that
+            // does not call. Only edges labeled 'scip' (ref/call and ref/field):
+            // every one the file still has is re-derived below. That label is
+            // also on an edge Phase A wrote first and this writer's upsert then
+            // relabeled, so such an edge goes too when this run no longer
+            // reports it.
+            tx.execute(
+                "DELETE FROM edges \
+                 WHERE provenance = 'scip' AND kind IN ('ref/call', 'ref/field') \
+                   AND src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("write_scip_attributed_batch: purging owned scip edges")?;
         }
 
         // #650: count `src == dst` refs dropped by the guard below, so the
@@ -6345,6 +6395,74 @@ LIMIT ?4",
             )
             .context("querying language_has_edge_sites")?;
         Ok(present != 0)
+    }
+
+    /// #974: re-record the native resolver's occurrence rows, retracting first
+    /// the rows owned by every file that holds one of `srcs`.
+    ///
+    /// [`Self::record_edge_sites`] and [`Self::record_field_sites`] only upsert,
+    /// and `line` is in the `edge_sites` key, so a row an earlier pass left on
+    /// another line was never overwritten. Same ownership rule as
+    /// [`Self::write_scip_attributed_batch`], which does this for the files it
+    /// carries; this covers the files only the native resolver writes.
+    ///
+    /// Call it after that batch. `carried` are the paths the batch held
+    /// occurrences for: it has already retracted and re-recorded them, so they
+    /// are not retracted again here. A file whose language is in
+    /// `keep_languages` is not retracted either, for the reason given on
+    /// [`Self::write_scip_attributed_batch_keeping`]. One transaction, so a
+    /// failed write leaves the earlier rows in place.
+    pub fn replace_owned_edge_sites(
+        &mut self,
+        srcs: impl IntoIterator<Item = NodeId>,
+        carried: &std::collections::HashSet<String>,
+        keep_languages: &[String],
+        call_sites: &[(NodeId, NodeId, u32, Option<u32>)],
+        field_sites: &[(NodeId, NodeId, u32, Option<u32>)],
+    ) -> anyhow::Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .context("replace_owned_edge_sites: begin")?;
+        let mut files: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for src in srcs {
+            let file: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT corpus, path FROM nodes WHERE id = ?1",
+                    params![node_id_to_i64(src)],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .context("replace_owned_edge_sites: locating src")?;
+            files.extend(file);
+        }
+        for (corpus, path) in &files {
+            if carried.contains(path) || file_language_is_kept(&tx, corpus, path, keep_languages)? {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM edge_sites \
+                 WHERE src IN (SELECT id FROM nodes WHERE corpus=?1 AND path=?2)",
+                params![corpus, path],
+            )
+            .context("replace_owned_edge_sites: purging")?;
+        }
+        for (kind, sites) in [("ref/call", call_sites), ("ref/field", field_sites)] {
+            for &(src, dst, line, col) in sites {
+                // The rows [`Self::record_edge_sites`] skips.
+                if line == 0 || src == dst {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO edge_sites(src, dst, kind, line, col) VALUES(?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(src, dst, kind, line) DO UPDATE SET col = COALESCE(edge_sites.col, excluded.col)",
+                    params![node_id_to_i64(src), node_id_to_i64(dst), kind, line as i64, col.map(|c| c as i64)],
+                )
+                .context("replace_owned_edge_sites: insert")?;
+            }
+        }
+        tx.commit().context("replace_owned_edge_sites: commit")
     }
 
     /// Record `ref/call` occurrence lines directly (issue #299 WS-4).
@@ -10737,6 +10855,31 @@ struct FnSpan {
     id: i64,
     line: i64,
     end_line: i64,
+}
+
+/// #974: whether `path` holds a node of a language in `keep_languages`, i.e. a
+/// file a Phase B pass must not retract because its analyzer did not complete.
+fn file_language_is_kept(
+    tx: &rusqlite::Transaction<'_>,
+    corpus: &str,
+    path: &str,
+    keep_languages: &[String],
+) -> anyhow::Result<bool> {
+    if keep_languages.is_empty() {
+        return Ok(false);
+    }
+    let mut stmt = tx
+        .prepare_cached("SELECT DISTINCT language FROM nodes WHERE corpus=?1 AND path=?2")
+        .context("file_language_is_kept: prepare")?;
+    let langs = stmt
+        .query_map(params![corpus, path], |row| row.get::<_, String>(0))
+        .context("file_language_is_kept: query")?;
+    for lang in langs {
+        if keep_languages.contains(&lang.context("file_language_is_kept: row")?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Fetch all function/method spans for a single `path` in one query.
@@ -17704,6 +17847,311 @@ mod tests {
             "non-call reference must record a find_references occurrence"
         );
         assert_eq!(sites[0].line, 5);
+    }
+
+    /// #974: a Phase B batch is authoritative for the files it carries
+    /// occurrences for. `line` is part of the `edge_sites` key, so a row an
+    /// earlier run left on another line is a different row and was never
+    /// overwritten: `find_references` kept serving it as fact until the owning
+    /// file was next re-parsed. Rows owned by a file this batch does not carry
+    /// are that file's to retract and must survive.
+    #[test]
+    fn attributed_batch_retracts_a_files_earlier_occurrence_lines() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let user = Node::new(
+            VName::new(corpus, "", "a.rs", "rust", "fn:user"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let other = Node::new(
+            VName::new(corpus, "", "c.rs", "rust", "fn:other"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(10);
+        let target = Node::new(
+            VName::new(corpus, "", "b.rs", "rust", "fn:target"),
+            "function",
+        )
+        .with_line(1)
+        .with_end_line(3);
+        store
+            .write_scip_attributed_batch(
+                corpus,
+                &[user.clone(), other.clone(), target.clone()],
+                &[],
+            )
+            .unwrap();
+        let call = |path: &str, line: u32| travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: line,
+            callee_id: target.id,
+            is_call: true,
+            caller_col: None,
+        };
+
+        // First run: `user` calls `target` on line 5, `other` on line 4.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call("a.rs", 5), call("c.rs", 4)])
+            .unwrap();
+        // Second run carries a.rs only, with the call now on line 8.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call("a.rs", 8)])
+            .unwrap();
+
+        let mut sites: Vec<(String, u32)> = store
+            .reference_sites(target.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.path, s.line))
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![("a.rs".to_string(), 8), ("c.rs".to_string(), 4)],
+            "a.rs keeps only the line this run produced; c.rs, absent from this run, is untouched"
+        );
+    }
+
+    /// #974: the edge behind a retracted occurrence is retracted with it. An
+    /// earlier run attributed a call to the wrong enclosing function (its line
+    /// fell inside the next function's span); `(src, dst, kind)` is the `edges`
+    /// key, so the correct attribution is a different row and never replaced
+    /// it, and `get_callers` kept listing a caller that does not call. Edges
+    /// another writer owns, and edges of a file the batch does not carry, stay.
+    #[test]
+    fn attributed_batch_retracts_a_files_stale_caller_edges() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let func = |path: &str, sig: &str, line: u32, end: u32| {
+            Node::new(VName::new(corpus, "", path, "rust", sig), "function")
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let user = func("a.rs", "fn:user", 1, 10);
+        let next = func("a.rs", "fn:next", 11, 20);
+        let other = func("c.rs", "fn:other", 1, 10);
+        let target = func("b.rs", "fn:target", 1, 3);
+        let helper = func("b.rs", "fn:helper", 5, 7);
+        store
+            .write_scip_attributed_batch(
+                corpus,
+                &[
+                    user.clone(),
+                    next.clone(),
+                    other.clone(),
+                    target.clone(),
+                    helper.clone(),
+                ],
+                &[],
+            )
+            .unwrap();
+        let call = |path: &str, line: u32| travsr_core::ScipRef {
+            caller_path: path.to_string(),
+            caller_line: line,
+            callee_id: target.id,
+            is_call: true,
+            caller_col: None,
+        };
+        // A name-matched edge from the same file, owned by the native resolver.
+        store
+            .write_phase_b_batch(
+                &[],
+                &[Edge::new(next.id, helper.id, EdgeKind::RefCall)],
+                "tree-sitter",
+            )
+            .unwrap();
+
+        // First run saw the call on line 12, inside `next`; `other` calls too.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call("a.rs", 12), call("c.rs", 4)])
+            .unwrap();
+        // Second run carries a.rs only: the call is on line 5, inside `user`.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call("a.rs", 5)])
+            .unwrap();
+
+        let mut callers: Vec<NodeId> = store
+            .iter_edges_to(target.id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.src)
+            .collect();
+        callers.sort_by_key(|id| node_id_to_i64(*id));
+        let mut want = vec![user.id, other.id];
+        want.sort_by_key(|id| node_id_to_i64(*id));
+        assert_eq!(callers, want, "`next` no longer calls `target`");
+        assert_eq!(
+            store.iter_edges_to(helper.id).unwrap().len(),
+            1,
+            "a tree-sitter edge is not this writer's to retract"
+        );
+    }
+
+    /// #974: the native resolver's occurrence rows are upsert-only too. A row
+    /// left on an old line must go when the pass re-records that file, while a
+    /// file the pass does not touch keeps its rows.
+    #[test]
+    fn replace_owned_edge_sites_clears_only_the_files_of_the_given_srcs() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let func = |path: &str, sig: &str| {
+            Node::new(VName::new(corpus, "", path, "python", sig), "function")
+        };
+        let run = func("main.py", "fn:run");
+        let also = func("main.py", "fn:also");
+        let other = func("other.py", "fn:other");
+        let helper = func("util.py", "fn:helper");
+        for n in [&run, &also, &other, &helper] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .record_edge_sites(&[
+                (run.id, helper.id, 9, None),
+                (also.id, helper.id, 14, None),
+                (other.id, helper.id, 3, None),
+            ])
+            .unwrap();
+
+        let none = std::collections::HashSet::new();
+        store
+            .replace_owned_edge_sites([run.id], &none, &[], &[(run.id, helper.id, 5, None)], &[])
+            .unwrap();
+
+        let mut sites: Vec<(String, u32)> = store
+            .reference_sites(helper.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.path, s.line))
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![("main.py".to_string(), 5), ("other.py".to_string(), 3)],
+            "every row main.py owned is retracted, other.py is untouched"
+        );
+    }
+
+    /// #974: a language whose analyzer did not complete still carries its files
+    /// in the batch, with a fraction of their references. Retracting them would
+    /// replace the last complete run with that fraction, so the earlier rows
+    /// and edges stay and this run's land on top.
+    #[test]
+    fn a_kept_language_is_not_retracted_by_either_writer() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let func = |path: &str, sig: &str, line: u32, end: u32| {
+            Node::new(VName::new(corpus, "", path, "rust", sig), "function")
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let user = func("a.rs", "fn:user", 1, 10);
+        let next = func("a.rs", "fn:next", 11, 20);
+        let lone = func("d.rs", "fn:lone", 1, 10);
+        let target = func("b.rs", "fn:target", 1, 3);
+        store
+            .write_scip_attributed_batch(
+                corpus,
+                &[user.clone(), next.clone(), lone.clone(), target.clone()],
+                &[],
+            )
+            .unwrap();
+        let call = |line: u32| travsr_core::ScipRef {
+            caller_path: "a.rs".to_string(),
+            caller_line: line,
+            callee_id: target.id,
+            is_call: true,
+            caller_col: None,
+        };
+        // A complete run: `user` and `next` both call `target`, and the native
+        // resolver records a call from d.rs.
+        store
+            .write_scip_attributed_batch(corpus, &[], &[call(5), call(12)])
+            .unwrap();
+        store
+            .record_edge_sites(&[(lone.id, target.id, 4, None)])
+            .unwrap();
+
+        // The analyzer failed: the batch carries a.rs with one call only, and
+        // the native resolver re-records d.rs on another line.
+        let keep = ["rust".to_string()];
+        store
+            .write_scip_attributed_batch_keeping(corpus, &[], &[call(5)], &keep)
+            .unwrap();
+        let carried: std::collections::HashSet<String> = ["a.rs".to_string()].into();
+        store
+            .replace_owned_edge_sites(
+                [lone.id],
+                &carried,
+                &keep,
+                &[(lone.id, target.id, 6, None)],
+                &[],
+            )
+            .unwrap();
+
+        let mut sites: Vec<(String, u32)> = store
+            .reference_sites(target.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.path, s.line))
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![
+                ("a.rs".to_string(), 5),
+                ("a.rs".to_string(), 12),
+                ("d.rs".to_string(), 4),
+                ("d.rs".to_string(), 6),
+            ],
+            "nothing the complete run recorded is retracted"
+        );
+        assert_eq!(
+            store.iter_edges_to(target.id).unwrap().len(),
+            2,
+            "`next` still calls `target`"
+        );
+    }
+
+    /// #974: a file the attributed batch carried has already been retracted and
+    /// re-recorded by it. The native re-record runs after, and must not retract
+    /// that file a second time.
+    #[test]
+    fn replace_owned_edge_sites_leaves_a_carried_file_to_the_batch() {
+        let corpus = "c";
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let func = |path: &str, sig: &str| {
+            Node::new(VName::new(corpus, "", path, "python", sig), "function")
+        };
+        let run = func("main.py", "fn:run");
+        let helper = func("util.py", "fn:helper");
+        store.put_node(&run).unwrap();
+        store.put_node(&helper).unwrap();
+        store
+            .record_edge_sites(&[(run.id, helper.id, 9, None)])
+            .unwrap();
+
+        let carried: std::collections::HashSet<String> = ["main.py".to_string()].into();
+        store
+            .replace_owned_edge_sites(
+                [run.id],
+                &carried,
+                &[],
+                &[(run.id, helper.id, 5, None)],
+                &[],
+            )
+            .unwrap();
+
+        let mut lines: Vec<u32> = store
+            .reference_sites(helper.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.line)
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![5, 9]);
     }
 
     /// Reproduces issue #650's exact producer path: the rust-analyzer LSIF

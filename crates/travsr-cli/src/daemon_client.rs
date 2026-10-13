@@ -195,8 +195,15 @@ const RESTART_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 
 /// This binary's build version — the one a daemon it spawns will report via
 /// [`travsr_daemon::build_version`] on a Status reply.
-fn our_build_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+///
+/// #974: the package version alone made every build of one version compare
+/// equal, so a rebuilt binary never restarted the daemon still running the old
+/// image. A digest of the workspace sources (`build.rs`) is appended as semver
+/// build metadata: it changes with any change to the code, and two copies of
+/// one binary (an npm install and an editor's bundled copy) still agree, which
+/// a modification time would not.
+pub(crate) fn our_build_version() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("TRAVSR_BUILD_ID"))
 }
 
 /// Whether a daemon advertising `daemon_version` (as read from a Status reply,
@@ -448,6 +455,21 @@ mod lock_tests {
         assert!(version_is_skewed(Some("1.2.2"), "1.2.3"), "older daemon");
         assert!(version_is_skewed(Some("1.3.0"), "1.2.3"), "newer daemon");
         assert!(version_is_skewed(None, "1.2.3"), "pre-field daemon");
+        assert!(
+            version_is_skewed(Some("1.2.3+0a1b"), "1.2.3+9f8e"),
+            "same version, rebuilt binary"
+        );
+    }
+
+    /// #974: two builds of one version must not compare equal, or a rebuilt
+    /// binary never restarts the daemon still running the old image.
+    #[test]
+    fn build_version_carries_a_digest_of_the_sources() {
+        let v = our_build_version();
+        let (version, digest) = v.split_once('+').expect("version+digest");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(digest.len(), 16, "{v}");
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{v}");
     }
 
     /// Single-flight: while one process holds the restart lock, a second cannot,
