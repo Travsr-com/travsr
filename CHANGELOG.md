@@ -4,6 +4,56 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.3.0 - 2026-10-13
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.2.1`.
+> Ships alongside VS Code extension 0.12.1, which offers this release when no
+> `travsr` binary resolves.
+
+### Upgrading from 1.2.1
+
+The index format is unchanged. In a TypeScript or Python repository, run
+`travsr init --force` once after upgrading to pick up the Next.js tsconfig,
+path-alias, JSX reference and Python attribute-type fixes below; any
+repository that uses inheritance picks up the new inherited-method call edges
+the same way. If Kotlin is already installed, rerun
+`travsr lang install kotlin` to replace its launcher with an executable one.
+
+### Added
+
+- **`travsr init` now sets up everything in one command (#940).** It detects the repo's languages, installs their language tools, indexes, traces calls, connects Claude Code and Cursor, and keeps the index fresh in the background afterward. Every surface that reports a language's readiness (`init`, `status`, `lang list`, MCP notes, the VS Code extension) now shares one predicate (`ready`, `needs_toolchain`, `unsupported_os`, `setting_up`, `failed`) instead of three that could disagree, and every line a user or agent reads carries one concrete next step.
+- **The daemon restarts itself after a binary upgrade instead of silently running old code (#942).** Upgrading the `travsr` binary (npm, `travsr install`) used to leave the already-running daemon serving queries and reindexing with the old build until someone ran `travsr daemon restart`, with nothing detecting or warning about it. The client now compares the daemon's reported version against its own on every terminal query, `mcp` lazy-start and `init`, and restarts the daemon on a mismatch, treating an older daemon that reports no version at all as skewed too. A lock file single-flights it, so two callers upgrading at the same time cannot race each other's restart.
+
+### Fixed
+
+- **A Next.js `tsconfig.json` with `compilerOptions.plugins` failed TypeScript analysis outright (#944).** Stock `create-next-app` ships that field, which tsserver-only plugins never used for LSIF emission anyway, so every Next.js repo got `semantic: partial` with zero cross-file edges. The field, including one pulled in through `extends`, is now stripped before the config reaches the compiler instead of tripping the SEC-003 guard.
+- **`@/*` and other `tsconfig.json` path aliases never resolved to files (#944).** Import linking only followed relative specifiers, so an aliased import dead-ended `get_dependencies` and blast radius at the first hop. Aliases are now rewritten against `compilerOptions.paths` and `baseUrl` before resolution.
+- **JSX element usage (`<Foo/>`) was not recorded as a reference (#944).** `find_references` on a component only ever found its import, and `get_callers` reported nothing rendering it. A render site now resolves the tag name as a callee and emits a reference, so the rendering component shows up as a caller.
+- **Python did not resolve a call made through a type-annotated instance attribute (#943).** `self.app.add_url_rule(...)` with `app: App` produced no edge in either the committed Phase B pass or the native live resolver, even though the type was explicit; on flask this dropped real edges such as `BlueprintSetupState.add_url_rule -> App.add_url_rule`. Both resolvers now read the annotation, whether from a constructor parameter, an inline `self.attr: App`, or a class-body field, including names imported only under `TYPE_CHECKING`, and resolve through it.
+- **A method inherited from a base class produced no call edge (#850, closes #836).** `self.method()`, where `method` is defined on `Bar` in `class Foo(Bar)`, was invisible to `get_callers` and `find_references`, because the resolver modelled a class's own methods but never consulted the inheritance edges Phase B already emits. It now walks the same-file inheritance chain breadth-first and resolves only an exact base method, so it stays fail-closed the same way every other resolution tier already does.
+- **`get_execution_path` guessed between ambiguous endpoints instead of saying so (#799, closes #779).** A bare name with several definitions silently took the first match, so two genuinely connected symbols could be reported as having no path between the wrong pair. It now goes through the same tiered resolver `graph` and `search_symbol` already use, and an ambiguous endpoint returns the candidate list, each one a directly re-runnable exact signature, and says which side is ambiguous, rather than reporting "no path found."
+- **A repository with its index deleted could not be told apart from one never indexed (#854, closes #454).** The registry recorded only a path, so both cases read as the same boolean. It now stamps a completion time on a successful index, and `travsr repos`, `repos_list` over MCP, and the VS Code repos panel all report `indexed`, `index deleted` or `never indexed` instead of a single `exists` flag. A row written by an older binary with no stamp reports `unknown` rather than guessing, and self-heals on the next `init`.
+- **A bundled tool lost its execute bit when `travsr lang install` unpacked it from a zip (#852).** The kotlin-language-server launcher extracted at `0644`, so running it failed with `EACCES` and Kotlin reported "produced no symbols" with no hint about permissions. Zip extraction now restores each entry's mode, masked to `0o755` so no archive can plant a setuid, setgid, sticky, group-write or world-write bit, matching what the tar path already preserved.
+- **A plugin built on the SDK kept serving requests after a protocol version mismatch (#856, closes #415).** The host already refused a skewed sidecar, but `travsr-plugin-sdk`, the surface third-party plugin authors build against, only logged the mismatch and kept going; because frame fields are serde-lenient, a skewed frame does not fail to parse, it silently decodes into wrong values. The SDK's own runner now compares versions on the handshake and refuses with a named error before serving any work frame.
+- **The warm `ask` answer cache could return a stale result after the embedding sidecar respawned (#855, closes #510).** The cache key was built entirely from on-disk state (`graph.db`/`embed.db` versions and commit markers), but the semantic half of an answer comes from the sidecar's in-memory HNSW index, which can swap in place without touching any of those. The key now also carries the sidecar's serving generation.
+- **The docs retrieval lane did not enforce the caller's RBAC scope (#858, item 2 of #525).** Code results already dropped anything an `EdgeFilter` denies; the docs lane entered through the doc-space KNN index instead of an edge traversal, so it was never wired to the same check and could return a denied document's path and heading. Both docs call sites now drop a denied candidate immediately after the KNN lookup, before rerank or budgeting, so a denied node's text is never read.
+- **Stale install hints, command names and counts across the CLI, MCP and VS Code extension (#938),** found while auditing the docs site against v1.2.1. npm error messages said `npm install -g travsr` instead of `@travsr.com/travsr`. A Windows `needs_consent` language's suggested remedy named the wrong command. The extension's hover, code lens, rename warning and blast-before-edit over-counted results whenever the index was behind, because the envelope-stripping parser kept the legend row and any trailing server note as results. Show Blast Radius and Show Callers from the command palette could open a panel for `undefined`. Show Execution Path drew the corridor text and envelope tags as graph nodes instead of only the route, and its edges were never drawn because they carried a kind the graph view's filter drops. Objective-C `.m`/`.mm` files now get code lens and hover.
+- **Five small Phase B and diagnostics follow-ups (#945):** a CI script locating a target-map literal's closing brace could latch onto an unrelated line and point at the wrong file (#690); `has_embed_db` treated a zero-byte `embed.db` left by an interrupted `embed init` as configured (#908); `rerank_status` reported `ready` with an open circuit breaker, so queries silently fell back to the lexical gate with no visible sign (#868); the Phase B warning classes were hand-restated in three places that could drift apart (#760); and a daemon falling behind during a flood of watch events shed them with no visible count, making "graph stale minutes later" undiagnosable (#809).
+
+### Security
+
+- **`embed gc` could be made to delete a file outside `.travsr/` (#861, item 3 of #525).** A `model_id` read from `embed.db` was formatted directly into a deletion path with no check that it stayed a plain filename, so an id containing `..` escaped the index directory. It is now rejected unless it names a file in that directory.
+- **A symlink at `.travsr/embed.lock.info` could redirect a daemon's lock-status write to an arbitrary target (#861, item 4 of #525).** The lock file is repo-local and a clone can ship anything in it; the write now unlinks the path and reopens it exclusively, so a reappearing symlink loses the race instead of being written through.
+- **The share tarball installer downloaded and extracted with no integrity check (#857, closes #410).** It predated this repo's consolidated, hash-verified fetch path and built its own unverified HTTP client. It now goes through the same sha256-sidecar verification every other downloaded artifact uses, before a single entry is extracted.
+- **`brace-expansion` bumped to 2.1.7** in the VS Code extension's dev dependency tree (GHSA-q2hr-2g5m-vwhr), pulled in transitively through mocha. Build-time only; it does not ship in the published extension.
+
+**Full changelog:** https://github.com/Travsr-com/travsr/compare/v1.2.1...v1.3.0
+
+---
+
 ## v1.2.1 - 2026-09-27
 
 > Install with `npm i -g @travsr.com/travsr` or
