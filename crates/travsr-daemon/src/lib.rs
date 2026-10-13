@@ -2162,12 +2162,13 @@ pub fn init_repo_with_progress(
                 resolved_cross_crate_edges = resolved.len(),
                 "semantic analysis cross-reference resolution complete"
             );
-            // #974: the occurrence writers below only upsert, so retract the
-            // rows of every file this pass re-records. Before the attributed
-            // batch, whose own rows for those files must survive.
-            if let Err(e) = store.retract_owned_edge_sites(resolved_sites.iter().map(|s| s.0)) {
-                tracing::warn!("retracting stale edge_sites: {e:#}");
-            }
+            // #974: what the native re-record below needs, taken before
+            // `write_phase_b_results` consumes its inputs.
+            let native_srcs: Vec<travsr_core::NodeId> =
+                resolved_sites.iter().map(|s| s.0).collect();
+            let carried: std::collections::HashSet<String> =
+                pb_refs.iter().map(|r| r.caller_path.clone()).collect();
+            let keep_languages = unratified_languages(&pb_outcome);
             let (report, alias_map, dropped) = write_phase_b_results(
                 &mut store,
                 &corpus,
@@ -2194,11 +2195,16 @@ pub fn init_repo_with_progress(
             let (call_sites, field_sites) = split_field_sites(&resolved, resolved_sites);
             let call_sites = remap_resolved_sites(call_sites, &alias_map, &dropped);
             let field_sites = remap_resolved_sites(field_sites, &alias_map, &dropped);
-            if let Err(e) = store.record_edge_sites(&call_sites) {
+            // #974: both writers only upsert, so the rows of every file this
+            // pass re-records are retracted with them, in one transaction.
+            if let Err(e) = store.replace_owned_edge_sites(
+                native_srcs,
+                &carried,
+                &keep_languages,
+                &call_sites,
+                &field_sites,
+            ) {
                 tracing::warn!("recording cross-crate edge_sites: {e:#}");
-            }
-            if let Err(e) = store.record_field_sites(&field_sites) {
-                tracing::warn!("recording field-access edge_sites: {e:#}");
             }
             // E1: label-only reconcile of edge languages to their endpoints
             // (the schema default 'typescript' otherwise mislabels every edge).
@@ -3677,7 +3683,12 @@ fn write_phase_b_results(
             .collect();
 
         // G2 path: span-attributed ref/call edges.
-        if let Err(e) = store.write_scip_attributed_batch(corpus, &pb_nodes, &pb_refs) {
+        if let Err(e) = store.write_scip_attributed_batch_keeping(
+            corpus,
+            &pb_nodes,
+            &pb_refs,
+            &unratified_languages(&pb_outcome),
+        ) {
             write_failures += 1;
             tracing::warn!("semantic analysis attributed write error: {e:#}");
         }
@@ -5461,6 +5472,33 @@ fn ratified_languages(report: &PhaseBReport) -> Vec<String> {
     langs
 }
 
+/// #974: the languages whose files this run must not retract, as
+/// `nodes.language` labels them: the analyzer crashed, or its cross-file pass
+/// was skipped or failed.
+///
+/// The native pass still ran for such a language, so its files are in this
+/// run's output with a fraction of their references. Same rule as
+/// [`ratified_languages`], from the other side: what was never re-derived is
+/// not discarded. An analyzer that is simply not installed is not here; it is
+/// not a failure (see `LSIF_ANALYZER_FAILURES`) and no earlier run of it exists
+/// to protect unless it was removed since.
+fn unratified_languages(outcome: &travsr_plugin_host::PhaseBOutcome) -> Vec<String> {
+    let mut langs: Vec<String> = outcome.crashed.clone();
+    langs.extend(collect_lsif_skips().into_iter().map(|s| s.language));
+    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
+        langs.push("rust".to_string());
+    }
+    // JavaScript nodes are labeled `typescript`; see `ratified_languages`.
+    for lang in &mut langs {
+        if lang == "javascript" {
+            *lang = "typescript".to_string();
+        }
+    }
+    langs.sort_unstable();
+    langs.dedup();
+    langs
+}
+
 /// Whether a `travsr init` holds this repo's `init.lock`.
 pub fn init_running(repo_root: &Path) -> bool {
     std::fs::File::open(repo_root.join(".travsr").join("init.lock"))
@@ -5558,12 +5596,12 @@ fn run_background_phase_b_inner(
         "semantic analysis cross-reference resolution complete"
     );
 
-    // #974: the occurrence writers below only upsert, so retract the rows of
-    // every file this pass re-records. Before the attributed batch, whose own
-    // rows for those files must survive.
-    if let Err(e) = s.retract_owned_edge_sites(resolved_sites.iter().map(|r| r.0)) {
-        tracing::warn!("retracting stale edge_sites: {e:#}");
-    }
+    // #974: what the native re-record below needs, taken before
+    // `write_phase_b_results` consumes its inputs.
+    let native_srcs: Vec<travsr_core::NodeId> = resolved_sites.iter().map(|r| r.0).collect();
+    let carried: std::collections::HashSet<String> =
+        pb_refs.iter().map(|r| r.caller_path.clone()).collect();
+    let keep_languages = unratified_languages(&pb_outcome);
     let (report, alias_map, dropped) = write_phase_b_results(
         &mut s,
         &corpus,
@@ -5587,11 +5625,16 @@ fn run_background_phase_b_inner(
     let (call_sites, field_sites) = split_field_sites(&resolved, resolved_sites);
     let call_sites = remap_resolved_sites(call_sites, &alias_map, &dropped);
     let field_sites = remap_resolved_sites(field_sites, &alias_map, &dropped);
-    if let Err(e) = s.record_edge_sites(&call_sites) {
+    // #974: both writers only upsert, so the rows of every file this pass
+    // re-records are retracted with them, in one transaction.
+    if let Err(e) = s.replace_owned_edge_sites(
+        native_srcs,
+        &carried,
+        &keep_languages,
+        &call_sites,
+        &field_sites,
+    ) {
         tracing::warn!("recording cross-crate edge_sites: {e:#}");
-    }
-    if let Err(e) = s.record_field_sites(&field_sites) {
-        tracing::warn!("recording field-access edge_sites: {e:#}");
     }
     // E1: reconcile edge languages to their endpoints (label-only).
     if let Err(e) = s.reconcile_edge_languages() {
@@ -6643,6 +6686,20 @@ mod tests {
             MAX_OCCURRENCES_PER_STASHED_FILE as u32,
             "the cap keeps the lowest lines, contiguously"
         );
+    }
+
+    /// #974: a crashed language's files are not retracted, and JavaScript is
+    /// named the way its nodes are labeled.
+    #[test]
+    fn unratified_languages_names_crashed_languages_by_node_label() {
+        let outcome = travsr_plugin_host::PhaseBOutcome {
+            crashed: vec!["javascript".to_string(), "go".to_string()],
+            ..Default::default()
+        };
+        let langs = unratified_languages(&outcome);
+        assert!(langs.contains(&"typescript".to_string()), "{langs:?}");
+        assert!(langs.contains(&"go".to_string()), "{langs:?}");
+        assert!(!langs.contains(&"javascript".to_string()), "{langs:?}");
     }
 
     #[test]
