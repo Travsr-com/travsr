@@ -58,7 +58,7 @@ starts with `Ready.`; any language that needs something installed first is
 listed after it with the one thing to do.
 
 The shell installer supports `--version <tag>` to install a specific release
-instead of latest stable (e.g. `sh -s -- --version v1.2.1`), `--system`
+instead of latest stable (e.g. `sh -s -- --version v1.3.0`), `--system`
 (installs to `/usr/local/bin`, e.g.
 `curl -fsSL https://travsr.com/install.sh | sh -s -- --system`, since a piped
 script can only take flags via `sh -s --`), and `TRAVSR_INSTALL_DIR` to
@@ -113,7 +113,7 @@ The channels move independently, so `beta` can be newer than `rc` in content
 while sorting below it under semver. `v1.0.0-beta.2` was a fresh build cut
 after `v1.0.0-rc.1` rather than a promotion of it, and `v1.0.0` was promoted
 from that beta rather than from rc.1, so the stable bits are the ones the beta
-channel tested. `travsr --version` reports the bare version, for example `1.2.1`.
+channel tested. `travsr --version` reports the bare version, for example `1.3.0`.
 
 ---
 
