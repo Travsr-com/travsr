@@ -19,8 +19,19 @@ fn main() {
     if !git_sources(&crates, &mut files) {
         collect(&crates, &mut files);
     }
+    // A crate's `tests/` and `benches/` are never compiled into the binary, so
+    // an edit there must not change the id (and with it relink this crate and
+    // restart the daemon).
+    files.retain(|file| {
+        let mut parts = file.strip_prefix(&crates).unwrap_or(file).components();
+        let in_crate = parts.nth(1).and_then(|c| c.as_os_str().to_str());
+        !matches!(in_crate, Some("tests" | "benches"))
+    });
     files.sort();
 
+    // `DefaultHasher` is stable for one toolchain, not across Rust releases.
+    // The id only has to tell apart builds on one machine, where that holds; a
+    // toolchain change in between costs one extra daemon restart.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for file in &files {
         // Relative, so where the tree is checked out does not change the id.
