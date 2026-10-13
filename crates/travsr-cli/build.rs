@@ -15,8 +15,10 @@ fn main() {
     let crates = Path::new(&manifest_dir).join("..");
     let lock = crates.join("../Cargo.lock");
 
-    let mut files = vec![lock.clone()];
-    collect(&crates, &mut files);
+    let mut files = vec![lock];
+    if !git_sources(&crates, &mut files) {
+        collect(&crates, &mut files);
+    }
     files.sort();
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -24,13 +26,44 @@ fn main() {
         // Relative, so where the tree is checked out does not change the id.
         file.strip_prefix(&crates).unwrap_or(file).hash(&mut hasher);
         std::fs::read(file).unwrap_or_default().hash(&mut hasher);
+        // Per file, not the directory: a re-run recompiles this crate even
+        // when the id comes out the same, and watching the directory re-ran on
+        // any file dropped under it (a release relink of about 3 minutes).
+        println!("cargo:rerun-if-changed={}", file.display());
     }
     println!("cargo:rustc-env=TRAVSR_BUILD_ID={:016x}", hasher.finish());
-    println!("cargo:rerun-if-changed={}", crates.display());
-    println!("cargo:rerun-if-changed={}", lock.display());
 }
 
-/// Every file under `dir`. Dotfiles are skipped: a `.DS_Store` the Finder
+/// The files git knows under `dir`: tracked, plus untracked ones it does not
+/// ignore (a module not yet added is still code). Ignored local files, such as
+/// scratch examples, are not part of the build. False outside a git checkout,
+/// where the caller walks the directory instead.
+fn git_sources(dir: &Path, out: &mut Vec<PathBuf>) -> bool {
+    let listed = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(dir)
+        .output();
+    let Ok(listed) = listed else { return false };
+    if !listed.status.success() || listed.stdout.is_empty() {
+        return false;
+    }
+    for name in String::from_utf8_lossy(&listed.stdout).split_terminator('\0') {
+        let path = dir.join(name);
+        // A tracked file deleted from the working tree is still listed.
+        if path.is_file() {
+            out.push(path);
+        }
+    }
+    true
+}
+
+/// Every file under `dir`, for a build outside git. Dotfiles are skipped: a `.DS_Store` the Finder
 /// drops into a crate is not a change to the code.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
