@@ -76,10 +76,21 @@ jobs:
         # pins "stable", which overrides the nightly toolchain installed above.
         # cargo-fuzz passes -Zsanitizer=address which requires nightly. Setting
         # RUSTUP_TOOLCHAIN takes precedence over rust-toolchain.toml.
+        #
+        # -rss_limit_mb=4096: libFuzzer's default 2048MB cap. fuzz_kotlin_parser
+        # has filed a same-shaped "[fuzz] found a panic" issue almost every day
+        # since #947 (2026-10-05) with no panic in the artifact, only a gradual
+        # RSS climb to ~2050-2090MB over the run (see stat::peak_rss_mb in each
+        # issue's log), which is ASan's own per-allocation bookkeeping on a
+        # long-lived process, not a single crafted input. Doubling the cap gives
+        # headroom over the observed peak without raising max_total_time, so a
+        # target with an actual unbounded-allocation bug still gets caught, just
+        # at a higher ceiling. Does not touch the real indexer, which has no
+        # equivalent limit and is a separate question.
         run: |
           cargo fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} \
-            -- -max_total_time=300 -print_final_stats=1
+            -- -max_total_time=300 -rss_limit_mb=4096 -print_final_stats=1
         env:
           RUST_BACKTRACE: 1
           RUSTUP_TOOLCHAIN: nightly
