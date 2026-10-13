@@ -238,7 +238,7 @@ jobs:
         run: cross build --release -p travsr-cli --target ${{ matrix.target }}
 
       - name: Set up Node (LSIF emitters)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
 
