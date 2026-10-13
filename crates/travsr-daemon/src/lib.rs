@@ -2168,7 +2168,7 @@ pub fn init_repo_with_progress(
                 resolved_sites.iter().map(|s| s.0).collect();
             let carried: std::collections::HashSet<String> =
                 pb_refs.iter().map(|r| r.caller_path.clone()).collect();
-            let keep_languages = unratified_languages(&pb_outcome);
+            let keep_languages = unratified_languages(&pb_outcome, &collect_lsif_skips());
             let (report, alias_map, dropped) = write_phase_b_results(
                 &mut store,
                 &corpus,
@@ -3687,7 +3687,7 @@ fn write_phase_b_results(
             corpus,
             &pb_nodes,
             &pb_refs,
-            &unratified_languages(&pb_outcome),
+            &unratified_languages(&pb_outcome, &collect_lsif_skips()),
         ) {
             write_failures += 1;
             tracing::warn!("semantic analysis attributed write error: {e:#}");
@@ -5474,20 +5474,28 @@ fn ratified_languages(report: &PhaseBReport) -> Vec<String> {
 
 /// #974: the languages whose files this run must not retract, as
 /// `nodes.language` labels them: the analyzer crashed, or its cross-file pass
-/// was skipped or failed.
+/// ran and failed.
 ///
 /// The native pass still ran for such a language, so its files are in this
 /// run's output with a fraction of their references. Same rule as
 /// [`ratified_languages`], from the other side: what was never re-derived is
-/// not discarded. An analyzer that is simply not installed is not here; it is
-/// not a failure (see `LSIF_ANALYZER_FAILURES`) and no earlier run of it exists
-/// to protect unless it was removed since.
-fn unratified_languages(outcome: &travsr_plugin_host::PhaseBOutcome) -> Vec<String> {
+/// not discarded.
+///
+/// An analyzer that cannot run here at all (not installed, or rust-analyzer
+/// with no sandbox and no grant) is not in the list. That is a standing state,
+/// not a failed run: keeping its language would mean never retracting it, and
+/// the rows left on a stale line would stay for good.
+fn unratified_languages(
+    outcome: &travsr_plugin_host::PhaseBOutcome,
+    lsif_skips: &[LsifSkip],
+) -> Vec<String> {
     let mut langs: Vec<String> = outcome.crashed.clone();
-    langs.extend(collect_lsif_skips().into_iter().map(|s| s.language));
-    if travsr_indexer::sandbox::ra_lsif_sandbox_was_skipped() {
-        langs.push("rust".to_string());
-    }
+    langs.extend(
+        lsif_skips
+            .iter()
+            .filter(|s| s.reason == LsifSkipReason::EmitterFailed)
+            .map(|s| s.language.clone()),
+    );
     // JavaScript nodes are labeled `typescript`; see `ratified_languages`.
     for lang in &mut langs {
         if lang == "javascript" {
@@ -5601,7 +5609,7 @@ fn run_background_phase_b_inner(
     let native_srcs: Vec<travsr_core::NodeId> = resolved_sites.iter().map(|r| r.0).collect();
     let carried: std::collections::HashSet<String> =
         pb_refs.iter().map(|r| r.caller_path.clone()).collect();
-    let keep_languages = unratified_languages(&pb_outcome);
+    let keep_languages = unratified_languages(&pb_outcome, &collect_lsif_skips());
     let (report, alias_map, dropped) = write_phase_b_results(
         &mut s,
         &corpus,
@@ -6696,10 +6704,29 @@ mod tests {
             crashed: vec!["javascript".to_string(), "go".to_string()],
             ..Default::default()
         };
-        let langs = unratified_languages(&outcome);
+        let langs = unratified_languages(&outcome, &[]);
         assert!(langs.contains(&"typescript".to_string()), "{langs:?}");
         assert!(langs.contains(&"go".to_string()), "{langs:?}");
         assert!(!langs.contains(&"javascript".to_string()), "{langs:?}");
+    }
+
+    /// #974: an analyzer that is not installed is a standing state. Keeping
+    /// its language would switch the retraction off for it on every run.
+    #[test]
+    fn unratified_languages_leaves_out_an_analyzer_that_is_not_installed() {
+        let skip = |language: &str, reason| LsifSkip {
+            language: language.to_string(),
+            reason,
+            detail: String::new(),
+        };
+        let langs = unratified_languages(
+            &travsr_plugin_host::PhaseBOutcome::default(),
+            &[
+                skip("typescript", LsifSkipReason::EmitterMissing),
+                skip("python", LsifSkipReason::EmitterFailed),
+            ],
+        );
+        assert_eq!(langs, vec!["python".to_string()]);
     }
 
     #[test]
