@@ -217,7 +217,7 @@ fn mcp_empty_result_is_not_an_error() {
     // result row, so a reader cannot take it for "nothing calls this".
     assert_eq!(
         text,
-        "<travsr-data>\n[note: No symbols matching 'zzz_nonexistent' found in the graph.]\n</travsr-data>",
+        "<travsr-data>\n[note: No symbol named or containing 'zzz_nonexistent' in the graph. search_symbol matches by word and may find another spelling.]\n</travsr-data>",
         "an unresolved symbol must be reported as a note inside the envelope"
     );
 }

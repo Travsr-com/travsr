@@ -691,9 +691,15 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
             .map(|n| n.is_empty())
             .unwrap_or(true)
     {
-        format!("[note: No symbols matching '{shown}' found in the graph.]")
+        // Not `search_symbol`'s "No symbols matching": that tool matches by
+        // word, so it lists `method:T.m` for a `T::m` this one cannot resolve,
+        // and the borrowed sentence denied it.
+        format!(
+            "[note: No symbol named or containing '{shown}' in the graph. \
+             search_symbol matches by word and may find another spelling.]"
+        )
     } else {
-        format!("[note: '{shown}' is in the graph but nothing calls or defines it.]")
+        format!("[note: '{shown}' is in the graph but nothing calls or contains it.]")
     };
     with_phase_b_note(
         store,
@@ -1326,6 +1332,7 @@ pub fn get_callers_global(
             return String::new();
         }
     }
+    let mut answered = false;
     let raw = collect_global(repos, repo, |store, repo_name, single| {
         // #617 + #645: per-repo notes — each store carries its own Phase B
         // freshness, and the HEAD note reads *this* repo's own checkout (not the
@@ -1334,6 +1341,7 @@ pub fn get_callers_global(
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
         let raw = get_callers_raw(store, symbol, path);
+        answered |= !raw.is_empty();
         let result = append_read_notes(store, raw, head.as_deref());
         if result.is_empty() || single {
             result
@@ -1346,9 +1354,13 @@ pub fn get_callers_global(
         }
     });
     // #974: the single-repo tool's two empties cannot be told apart from here
-    // (each repo's raw body is just empty), so name both.
-    let raw = if raw.is_empty() {
-        global_empty_note(
+    // (each repo's raw body is just empty), so name both. Keyed on whether any
+    // repo answered, not on an empty aggregate: a repo still tracing calls
+    // contributes its freshness note, which says nothing about the symbol.
+    let raw = if answered {
+        raw
+    } else {
+        let miss = global_empty_note(
             repos,
             repo,
             format!(
@@ -1356,9 +1368,12 @@ pub fn get_callers_global(
                  no symbol by that name, or nothing calls it.]",
                 note_arg(symbol)
             ),
-        )
-    } else {
-        raw
+        );
+        [raw, miss]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     // SEC-001: sanitize the fully-aggregated string once.
     sanitize_for_mcp(&raw)
@@ -19454,9 +19469,27 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let out = get_callers(&store, "NonExistentSymbol", None);
         assert!(
-            out.contains("[note: No symbols matching 'NonExistentSymbol' found in the graph.]"),
+            out.contains("[note: No symbol named or containing 'NonExistentSymbol' in the graph."),
             "an unresolved symbol must not read as an empty answer: {out}"
         );
+    }
+
+    /// `get_callers` does not resolve a `Type::method` spelling. Answering it
+    /// with `search_symbol`'s "No symbols matching" denied a method that tool
+    /// lists first for the same string.
+    #[test]
+    fn get_callers_unresolved_spelling_points_at_search_symbol() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("c", "", "svc.rs", "rust", "method:Svc.charge"),
+                "method",
+            ))
+            .unwrap();
+        let out = get_callers(&store, "Svc::charge", None);
+        assert!(!out.contains("No symbols matching"), "{out}");
+        assert!(out.contains("search_symbol"), "{out}");
     }
 
     /// The other empty: the symbol is there and nothing points at it. Wording
@@ -19475,7 +19508,7 @@ mod snippet_tests {
         let out = get_callers(&store, "lonely_helper", None);
         assert!(
             out.contains(
-                "[note: 'lonely_helper' is in the graph but nothing calls or defines it.]"
+                "[note: 'lonely_helper' is in the graph but nothing calls or contains it.]"
             ),
             "a known symbol with no incoming edges must say so: {out}"
         );
@@ -19573,6 +19606,19 @@ mod snippet_tests {
         );
         let out = find_references_global(&repos, "NonExistentSymbol", None, Some("/nope"));
         assert_eq!(out, "<travsr-data></travsr-data>", "an unsearched repo");
+
+        // A repo still tracing calls contributes its freshness note. That note
+        // alone is not an answer about the symbol.
+        let mut store = travsr_store::SqliteStore::open(&repos["/r"]).unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "old9999").unwrap();
+        drop(store);
+        let out = get_callers_global(&repos, "NonExistentSymbol", None, None);
+        assert!(out.contains("calls are still being traced"), "{out}");
+        assert!(
+            out.contains("[note: No callers of 'NonExistentSymbol'"),
+            "{out}"
+        );
     }
 
     #[test]
