@@ -231,4 +231,35 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn fuzz_regression_984_oom_input_is_bounded() {
+        // #984: this exact 1004-byte input made tree_sitter_kotlin_ng's error
+        // recovery consume gigabytes of RAM under fuzzing, OOMing past both a
+        // 2048MB and (after raising the cap once, to rule out a fixed near-
+        // threshold wobble) a 4096MB libFuzzer limit, each time in under two
+        // minutes. parse_with_config now bounds every parse to a few seconds
+        // regardless of grammar (generic.rs PARSE_TIMEOUT); this pins that
+        // bound against the one input known to need it, so a regression here
+        // is a hang/OOM, not a changed node count.
+        let data: &[u8] =
+            include_bytes!("../tests/fixtures/kotlin/fuzz-regressions/issue-984-oom.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("issue-984-oom.kt");
+        std::fs::write(&path, data).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = parse("corp", &path, "issue-984-oom.kt");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "parse took {elapsed:?}; expected it to abort near the internal timeout, \
+             not run unbounded"
+        );
+        assert!(
+            result.is_err(),
+            "expected the bounded parse to report a timeout, got {result:?}"
+        );
+    }
 }

@@ -10,16 +10,34 @@
 //! file. Direct callers (e.g. per-language `parse()` wrappers) may compile
 //! fresh; query compilation is fast (< 1 µs) and acceptable per-file.
 
+use std::ops::ControlFlow;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use streaming_iterator::StreamingIterator as _;
 use travsr_core::{Edge, EdgeKind, Language, Node, VName};
-use tree_sitter::{Parser, Query, QueryCursor};
+use tree_sitter::{ParseOptions, Parser, Query, QueryCursor};
 
 use crate::ParseOutput;
 
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+
+// #984: fuzz_kotlin_parser OOM'd at both libFuzzer's default 2048MB cap and,
+// after raising it, at 4096MB, each time in under two minutes of actual
+// parsing. That shape (ceiling moves, time to hit it does not grow) is
+// unbounded growth, not a fixed amount of harmless bookkeeping on a long
+// corpus run, and tree_sitter_kotlin_ng's error recovery is the only grammar
+// among this function's callers where it has been observed. A few hundred
+// bytes of malformed Kotlin should never cost gigabytes of RSS regardless of
+// which grammar is doing the recovering, so the cutoff lives here, once, for
+// every language `parse_with_config` serves.
+//
+// tree-sitter 0.26 dropped the old `set_timeout_micros`/cancellation-flag
+// API in favor of a progress callback passed through `parse_with_options`;
+// this closes over a deadline and asks tree-sitter to stop rather than
+// polling a timer from outside the parse.
+const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A complete Phase A language definition expressed as static data.
 /// All fields are `'static` so configs can be declared as `const`.
@@ -174,7 +192,22 @@ pub fn parse_with_config(
 
     let mut parser = Parser::new();
     parser.set_language(grammar).context("set language")?;
-    let tree = parser.parse(&source, None).context("parse timeout")?;
+
+    let deadline = Instant::now() + PARSE_TIMEOUT;
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if Instant::now() >= deadline {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let tree = parser
+        .parse_with_options(
+            &mut |i, _| source.get(i..).unwrap_or_default(),
+            None,
+            Some(ParseOptions::new().progress_callback(&mut progress)),
+        )
+        .context("parse timeout")?;
 
     // Compile fresh or use the caller-supplied pre-compiled query.
     let owned_query;
