@@ -3611,6 +3611,10 @@ pub enum AnalysisMode {
 /// `get_lang_status` return path so the shape never drifts between them.
 const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":"","prerequisites":""}"#;
 
+/// Files listed by `get_blast_radius` when `max_files` is not given, the same
+/// cap as `MAX_CALLER_ROWS` and `MAX_PATTERN_MATCHES`.
+const DEFAULT_BLAST_RADIUS_FILES: usize = 500;
+
 /// Return the set of files transitively affected if the given file changes.
 ///
 /// Uses reverse BFS over `DefinesBinding` and `RefCall` edges: starting from
@@ -3621,8 +3625,8 @@ const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","sta
 ///   `src/service.ts`
 ///   `src/controller.ts`
 ///
-/// Every affected file is returned. `max_files` truncates the list only when
-/// the caller asks for it.
+/// At most `max_files` files are listed (default [`DEFAULT_BLAST_RADIUS_FILES`]);
+/// a cut list ends with a note giving the total.
 pub fn get_blast_radius(
     store: &SqliteStore,
     file: &str,
@@ -3651,8 +3655,8 @@ fn get_blast_radius_raw(
     use travsr_core::EdgeKind;
 
     // Hard ceiling: prevents OOM on utility files imported by thousands of callers.
-    // Same guard policy as PPR (MAX_SUBGRAPH_NODES = 250_000); tighter here because
-    // blast-radius is a UI tool whose output must fit in an MCP response.
+    // Same guard policy as PPR (MAX_SUBGRAPH_NODES = 250_000); tighter here
+    // because the traversal backs an interactive tool call.
     const MAX_BLAST_RADIUS_NODES: usize = 50_000;
 
     // Seed from every node at the exact path (#1004: the name search caps at
@@ -3919,12 +3923,16 @@ fn get_blast_radius_raw(
     let total = affected_files.len();
     let shown: Vec<String> = affected_files
         .into_iter()
-        .take(max_files.unwrap_or(usize::MAX))
+        .take(
+            max_files
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_BLAST_RADIUS_FILES),
+        )
         .collect();
     let mut body = shown.join("\n");
     if shown.len() < total {
         body.push_str(&format!(
-            "\n[note: showing {} of {total} files; omit max_files for the full list]",
+            "\n[note: showing {} of {total} files; raise max_files for more]",
             shown.len()
         ));
     }
@@ -12212,11 +12220,11 @@ mod tests {
         assert!(result.contains("src/caller.ts"), "got: {result}");
     }
 
-    /// The radius is not cut at the generic 4 KB output cap: every file and the
-    /// child-module note come back. `max_files` truncates only when given, and
-    /// says so, still keeping the child-module note.
+    /// The radius is not cut at the generic 4 KB output cap: every file under
+    /// the default cap and the child-module note come back. A `max_files` cut
+    /// says so and still keeps the child-module note.
     #[test]
-    fn blast_radius_returns_everything_unless_max_files_is_given() {
+    fn blast_radius_lists_up_to_max_files_and_says_when_cut() {
         use travsr_core::{EdgeKind, Node, VName};
         let target = make_node("src/lib.rs", "fn:shared");
         let filemod = Node::new(
@@ -12249,6 +12257,10 @@ mod tests {
             "got: {capped}"
         );
         assert!(capped.contains("child module(s)") && capped.contains("src/child.rs"));
+
+        // 0 is not a cap: it falls back to the default.
+        let zero = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, Some(0));
+        assert!(zero.contains("src/dependents/user_199.rs"), "got: {zero}");
     }
 
     /// #1005: a Rust `mod x;` is stored only parent -> child, so the parent's

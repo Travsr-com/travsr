@@ -437,13 +437,13 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_blast_radius",
-                "description": "Return the set of files transitively affected if the given file changes.",
+                "description": "Return the set of files transitively affected if the given file changes. File- or package-level, so it is a completeness check, not a reading list; for one function's use sites call get_callers or find_references.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
                         "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
-                        "max_files": { "type": "integer", "description": "Optional cap on the number of files listed. Omit to get every affected file." }
+                        "max_files": { "type": "integer", "minimum": 1, "description": "Most files to list (default 500). A cut list ends with a note giving the total." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -1112,13 +1112,13 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_blast_radius",
-                "description": "Return the set of files transitively affected if the given file changes. Supply `repo` to scope results; omit only if the symbol may exist in multiple repos.",
+                "description": "Return the set of files transitively affected if the given file changes. File- or package-level, so it is a completeness check, not a reading list; for one function's use sites call get_callers or find_references. Supply `repo` to scope results; omit only if the symbol may exist in multiple repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
                         "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
-                        "max_files": { "type": "integer", "description": "Optional cap on the number of files listed. Omit to get every affected file." },
+                        "max_files": { "type": "integer", "minimum": 1, "description": "Most files to list per repo (default 500). A cut list ends with a note giving the total." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],
