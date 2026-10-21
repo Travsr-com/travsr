@@ -111,6 +111,99 @@ fn handle_request(store: &mut SqliteStore, req: RpcRequest) -> Option<String> {
     Some(resp)
 }
 
+/// Check a `tools/call` against the `inputSchema` the tool advertises in
+/// `tools` (#1009). Dispatch reads arguments as `as_str().unwrap_or("")`, so
+/// without this a wrong-typed, missing or misspelled argument ran the tool on
+/// `""`, which resolves to an arbitrary node.
+///
+/// Rejects unknown argument names (under `additionalProperties: false`),
+/// missing or empty required arguments, and type mismatches. An `integer` may
+/// also arrive as a numeric string: the VS Code client sends every argument as
+/// a string. A tool not in the list (a hidden diagnostic) is not checked.
+pub(crate) fn check_tool_args(
+    tools: &serde_json::Value,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(schema) = tools["tools"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["name"].as_str() == Some(tool_name)))
+        .map(|t| &t["inputSchema"])
+    else {
+        return Ok(());
+    };
+    let empty = serde_json::Map::new();
+    let given = match args {
+        serde_json::Value::Null => &empty,
+        serde_json::Value::Object(m) => m,
+        _ => return Err(format!("{tool_name}: arguments must be an object")),
+    };
+    let props = schema["properties"].as_object().unwrap_or(&empty);
+    if schema["additionalProperties"] == false {
+        if let Some(k) = given.keys().find(|k| !props.contains_key(*k)) {
+            let mut known: Vec<&str> = props.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            return Err(format!(
+                "{tool_name}: unknown argument `{k}`; expected one of: {}",
+                known.join(", ")
+            ));
+        }
+    }
+    for r in schema["required"].as_array().into_iter().flatten() {
+        let Some(r) = r.as_str() else { continue };
+        match given.get(r) {
+            None | Some(serde_json::Value::Null) => {
+                return Err(format!("{tool_name}: missing required argument `{r}`"))
+            }
+            Some(serde_json::Value::String(v)) if v.trim().is_empty() => {
+                return Err(format!("{tool_name}: `{r}` must not be empty"))
+            }
+            _ => {}
+        }
+    }
+    for (k, v) in given {
+        let want = props.get(k).and_then(|p| p["type"].as_str()).unwrap_or("");
+        let ok = match want {
+            _ if v.is_null() => true,
+            "string" => v.is_string(),
+            "integer" => {
+                v.is_i64() || v.is_u64() || v.as_str().is_some_and(|s| s.parse::<i64>().is_ok())
+            }
+            "boolean" => v.is_boolean(),
+            "object" => v.is_object(),
+            _ => true,
+        };
+        if !ok {
+            return Err(format!(
+                "{tool_name}: `{k}` must be a {want}, got {}",
+                json_kind(v)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The answer to a call [`check_tool_args`] rejects: a tool error the model
+/// reads and can correct, not a protocol error (MCP reports input validation
+/// failures as tool results with `isError`).
+pub(crate) fn invalid_args_result(msg: &str) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": crate::sanitize::sanitize_for_mcp(msg) }],
+        "isError": true
+    })
+}
+
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 fn handle_tool_call(
     store: &mut SqliteStore,
     id: serde_json::Value,
@@ -121,6 +214,9 @@ fn handle_tool_call(
         None => return error_response(id, INVALID_PARAMS, "missing tool name".into()),
     };
     let args = &params["arguments"];
+    if let Err(msg) = check_tool_args(&tools_list(), tool_name, args) {
+        return ok_response(id, invalid_args_result(&msg));
+    }
 
     // The JSON-RPC id is already unique per in-flight request, so it is the
     // correlation id — no separate one to generate, and it is the same value
@@ -848,6 +944,9 @@ fn handle_tool_call_global(
         None => return error_response(id, INVALID_PARAMS, "missing tool name".into()),
     };
     let args = &params["arguments"];
+    if let Err(msg) = check_tool_args(&tools_list_global(), tool_name, args) {
+        return ok_response(id, invalid_args_result(&msg));
+    }
     let repo_arg = args["repo"].as_str();
 
     // `repo` is what makes a shared global log readable: one process serves
@@ -1751,6 +1850,89 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// #1009: a wrong-typed, missing, empty or misspelled argument is a tool
+    /// error naming the argument, not a tool run on `""`.
+    #[test]
+    fn tool_call_rejects_args_that_break_the_schema() {
+        let call = |args: serde_json::Value| {
+            let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/call".into(),
+                params: Some(serde_json::json!({ "name": "get_callers", "arguments": args })),
+            };
+            let resp = handle_request(&mut store, req).expect("tools/call answers");
+            serde_json::from_str::<serde_json::Value>(&resp).unwrap()
+        };
+        for (args, want) in [
+            (
+                serde_json::json!({ "symbol": ["run"] }),
+                "`symbol` must be a string, got an array",
+            ),
+            (
+                serde_json::json!({ "symbl": "run" }),
+                "unknown argument `symbl`",
+            ),
+            (serde_json::json!({}), "missing required argument `symbol`"),
+            (
+                serde_json::json!({ "symbol": " " }),
+                "`symbol` must not be empty",
+            ),
+        ] {
+            let v = call(args.clone());
+            assert_eq!(v["result"]["isError"], true, "{args}: {v}");
+            let msg = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+            assert!(msg.contains(want), "{args}: {msg}");
+        }
+        let ok = call(serde_json::json!({ "symbol": "run" }));
+        assert!(ok["result"]["isError"].is_null(), "{ok}");
+    }
+
+    /// The VS Code client sends every argument as a string, numbers included;
+    /// those calls must still pass. Hidden diagnostics are not in the list and
+    /// are not checked.
+    #[test]
+    fn check_tool_args_accepts_string_integers_and_hidden_tools() {
+        let list = tools_list();
+        for (tool, args) in [
+            (
+                "get_context",
+                serde_json::json!({ "query": "q", "token_budget": "6000" }),
+            ),
+            (
+                "get_graph_json",
+                serde_json::json!({ "query": "q", "direction": "both", "depth": "1", "kind_filter": "" }),
+            ),
+            (
+                "get_snippets",
+                serde_json::json!({ "symbols": "a,b", "token_budget": 900 }),
+            ),
+            ("get_graph_stats", serde_json::Value::Null),
+            ("seed_trace", serde_json::json!({ "anything": 1 })),
+        ] {
+            assert_eq!(check_tool_args(&list, tool, &args), Ok(()), "{tool} {args}");
+        }
+        assert!(check_tool_args(
+            &list,
+            "get_context",
+            &serde_json::json!({ "query": "q", "token_budget": "lots" })
+        )
+        .is_err());
+        assert!(check_tool_args(
+            &list,
+            "get_dependencies",
+            &serde_json::json!({ "file": "a.rs", "transitive": "true" })
+        )
+        .is_err());
+        assert!(check_tool_args(
+            &tools_list_global(),
+            "get_snippets",
+            &serde_json::json!({ "symbols": ["a"] })
+        )
+        .is_err());
     }
 
     #[test]
