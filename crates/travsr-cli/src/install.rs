@@ -1604,9 +1604,12 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &std::path::Path) -> Result<()> {
         // `enclosed_name` is the crate's own traversal guard; `safe_entry_path`
         // is applied as well so the rule this repo enforces is stated here and
         // covered by its own tests, rather than resting on an upstream default.
-        let declared = file
-            .enclosed_name()
-            .ok_or_else(|| anyhow::anyhow!("zip entry has an unsafe name: {}", file.name()))?;
+        let declared = file.enclosed_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "zip entry has an unsafe name: {}",
+                file.name().unwrap_or_default()
+            )
+        })?;
         let target = safe_entry_path(dest, &declared)?;
         if file.is_dir() {
             std::fs::create_dir_all(&target)
