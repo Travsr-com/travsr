@@ -158,7 +158,8 @@ fn handle_tool_call(
                 "semantic" => tools::AnalysisMode::Semantic,
                 _ => tools::AnalysisMode::TreeSitter,
             };
-            tools::get_blast_radius(store, file, mode)
+            let max_files = args["max_files"].as_u64().map(|n| n as usize);
+            tools::get_blast_radius(store, file, mode, max_files)
         }
         "get_architecture_brief" => {
             let provenance = args["provenance"].as_str().unwrap_or("ratified");
@@ -441,7 +442,8 @@ pub fn tools_list() -> serde_json::Value {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
-                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." }
+                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
+                        "max_files": { "type": "integer", "description": "Optional cap on the number of files listed. Omit to get every affected file." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -893,6 +895,7 @@ fn handle_tool_call_global(
                 args["file"].as_str().unwrap_or(""),
                 repo_arg,
                 mode,
+                args["max_files"].as_u64().map(|n| n as usize),
             )
         }
         "get_lang_status" => {
@@ -1115,6 +1118,7 @@ pub fn tools_list_global() -> serde_json::Value {
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
                         "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
+                        "max_files": { "type": "integer", "description": "Optional cap on the number of files listed. Omit to get every affected file." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],
