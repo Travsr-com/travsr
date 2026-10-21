@@ -3637,10 +3637,7 @@ pub fn get_blast_radius(
     // trusted as the complete impact set.
     with_phase_b_note(
         store,
-        wrap_envelope(&sanitize_mcp_body_with_limit(
-            &get_blast_radius_raw(store, file, mode, max_files),
-            usize::MAX,
-        )),
+        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode, max_files)),
     )
 }
 
@@ -4028,7 +4025,7 @@ pub fn get_blast_radius_global(
                 .join("\n")
         }
     });
-    wrap_envelope(&sanitize_mcp_body_with_limit(&raw, usize::MAX))
+    sanitize_for_mcp(&raw)
 }
 
 /// How many rows a brief lists before it stops and says how many it skipped.
