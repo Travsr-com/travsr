@@ -4314,6 +4314,7 @@ impl SqliteStore {
   (
     CASE
       WHEN signature = ?1 THEN 0
+      WHEN kind = 'file' AND path = ?1 THEN 0
       WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
@@ -4462,6 +4463,31 @@ FROM nodes";
         let _span =
             tracing::debug_span!("store.search_nodes_by_name_exact", query = name).entered();
         self.run_name_search(Self::NAME_MATCH_BOUNDARY, name, None)
+    }
+
+    /// Every node whose path is exactly `path`, uncapped (#1004). The name
+    /// search caps at [`NODE_NAME_SEARCH_LIMIT`], which drops most of a large
+    /// file's nodes; callers that must see all of them (blast-radius seeding)
+    /// use this instead.
+    pub fn nodes_at_path(&self, path: &str) -> Result<Vec<Node>, StoreError> {
+        (|| -> AnyResult<Vec<Node>> {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, corpus, root, path, language, signature, kind, package, line, \
+                     end_line, test_role FROM nodes WHERE path = ?1 AND kind != 'doc-chunk'",
+                )
+                .context("preparing nodes_at_path")?;
+            let rows = stmt
+                .query_map(params![path], Self::map_search_row)
+                .context("executing nodes_at_path")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding nodes_at_path row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
     }
 
     /// Exact-signature lookup with optional path-suffix pin.
@@ -15525,6 +15551,41 @@ mod tests {
             "local/b", "local/c", "local/d", "local/e", "local/f", "local/g",
         ] {
             assert_eq!(order(corpus), first, "{corpus}");
+        }
+    }
+
+    /// #1004: an exact path must return that path's `file` node even when the
+    /// file holds more functions than the search cap, in every language; and
+    /// `nodes_at_path` must return all of the file's nodes, uncapped.
+    #[test]
+    fn exact_path_search_keeps_file_node_past_the_cap_in_every_language() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let files = [
+            ("rust", "src/big.rs"),
+            ("go", "pkg/big.go"),
+            ("python", "pkg/big.py"),
+            ("typescript", "src/big.ts"),
+            ("java", "src/Big.java"),
+        ];
+        let fns = NODE_NAME_SEARCH_LIMIT + 50;
+        for (lang, path) in files {
+            store
+                .put_node(&Node::new(VName::new("c", "", path, lang, "file"), "file"))
+                .unwrap();
+            for i in 0..fns {
+                store
+                    .put_node(&Node::new(
+                        VName::new("c", "", path, lang, format!("fn:f{i}")),
+                        "function",
+                    ))
+                    .unwrap();
+            }
+        }
+        for (lang, path) in files {
+            let hits = store.search_nodes_by_name(path).unwrap();
+            assert_eq!(hits[0].kind, "file", "{lang}: file node must rank first");
+            assert_eq!(hits[0].vname.path, path, "{lang}");
+            assert_eq!(store.nodes_at_path(path).unwrap().len(), fns + 1, "{lang}");
         }
     }
 
