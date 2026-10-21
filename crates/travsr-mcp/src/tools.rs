@@ -133,6 +133,16 @@ fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) 
             }
         }
     }
+    // Same cap as `MAX_CALLER_ROWS`; rows are in BFS order, so the nearest
+    // hops are the ones kept.
+    const MAX_TRANSITIVE_DEP_ROWS: usize = 500;
+    let total = lines.len();
+    if total > MAX_TRANSITIVE_DEP_ROWS {
+        lines.truncate(MAX_TRANSITIVE_DEP_ROWS);
+        lines.push(format!(
+            "[showing {MAX_TRANSITIVE_DEP_ROWS} of {total}; lower depth for a shorter tree]"
+        ));
+    }
     lines.join("\n")
 }
 
@@ -3626,7 +3636,8 @@ const DEFAULT_BLAST_RADIUS_FILES: usize = 500;
 ///   `src/controller.ts`
 ///
 /// At most `max_files` files are listed (default [`DEFAULT_BLAST_RADIUS_FILES`]);
-/// a cut list ends with a note giving the total.
+/// a cut list keeps the files nearest the change and ends with a note saying
+/// more are affected.
 pub fn get_blast_radius(
     store: &SqliteStore,
     file: &str,
@@ -3680,17 +3691,27 @@ fn get_blast_radius_raw(
         return String::new();
     }
 
+    let cap = max_files
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BLAST_RADIUS_FILES);
+    // Stop the traversal at the first file past the cap: the rest would only
+    // be cut from the answer, and on a hub file it costs most of the time.
+    let limit = cap.saturating_add(1).min(MAX_BLAST_RADIUS_NODES);
+
     let mut visited: HashSet<travsr_core::NodeId> = HashSet::new();
     let mut queue: VecDeque<travsr_core::NodeId> = VecDeque::new();
-    let mut affected_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Files in the order the traversal reaches them, so a cut list keeps the
+    // files nearest the change rather than the first ones alphabetically.
+    let mut affected_files: HashSet<String> = HashSet::new();
+    let mut affected_order: Vec<String> = Vec::new();
 
     for node in &seed_nodes {
         if visited.insert(node.id) {
             queue.push_back(node.id);
         }
         // The file itself counts as affected.
-        if !node.vname.path.is_empty() {
-            affected_files.insert(node.vname.path.clone());
+        if !node.vname.path.is_empty() && affected_files.insert(node.vname.path.clone()) {
+            affected_order.push(node.vname.path.clone());
         }
     }
 
@@ -3801,15 +3822,13 @@ fn get_blast_radius_raw(
                 .collect();
             for id in &new_srcs {
                 if let Some(src_node) = node_map.get(id) {
-                    if !src_node.vname.path.is_empty() {
-                        affected_files.insert(src_node.vname.path.clone());
-                        // Hard ceiling on the result set (see the Phase-2 note).
-                        if affected_files.len() >= MAX_BLAST_RADIUS_NODES {
-                            tracing::warn!(
-                                "get_blast_radius hit ceiling \
-                                 ({MAX_BLAST_RADIUS_NODES} nodes) for file '{file}'; \
-                                 result may be incomplete"
-                            );
+                    if !src_node.vname.path.is_empty()
+                        && affected_files.insert(src_node.vname.path.clone())
+                    {
+                        affected_order.push(src_node.vname.path.clone());
+                        // Cap or hard ceiling on the result set (see the
+                        // Phase-2 note).
+                        if affected_order.len() >= limit {
                             break 'fixpoint;
                         }
                     }
@@ -3837,7 +3856,7 @@ fn get_blast_radius_raw(
         // discovered importer files land here on the next pass, giving
         // transitivity. TS/JS/Rust files map to NoopResolver, so re-processing
         // them is a cheap no-op.
-        let todo: Vec<String> = affected_files
+        let todo: Vec<String> = affected_order
             .iter()
             .filter(|f| !phase2_done.contains(*f))
             .cloned()
@@ -3897,18 +3916,16 @@ fn get_blast_radius_raw(
                                 queue.push_back(*id);
                             }
                             if let Some(src_node) = node_map.get(id) {
-                                if !src_node.vname.path.is_empty() {
-                                    affected_files.insert(src_node.vname.path.clone());
-                                    // Hard ceiling: abort the whole fixpoint the
-                                    // instant the result reaches the cap, so a
-                                    // hub file imported by tens of thousands
-                                    // cannot overshoot within a single pass.
-                                    if affected_files.len() >= MAX_BLAST_RADIUS_NODES {
-                                        tracing::warn!(
-                                            "get_blast_radius hit ceiling \
-                                             ({MAX_BLAST_RADIUS_NODES} nodes) for file \
-                                             '{file}'; result may be incomplete"
-                                        );
+                                if !src_node.vname.path.is_empty()
+                                    && affected_files.insert(src_node.vname.path.clone())
+                                {
+                                    affected_order.push(src_node.vname.path.clone());
+                                    // Abort the whole fixpoint the instant the
+                                    // result reaches the cap or the hard
+                                    // ceiling, so a hub file imported by tens
+                                    // of thousands cannot overshoot within a
+                                    // single pass.
+                                    if affected_order.len() >= limit {
                                         break 'fixpoint;
                                     }
                                 }
@@ -3920,20 +3937,20 @@ fn get_blast_radius_raw(
         }
     }
 
-    let total = affected_files.len();
-    let shown: Vec<String> = affected_files
-        .into_iter()
-        .take(
-            max_files
-                .filter(|&n| n > 0)
-                .unwrap_or(DEFAULT_BLAST_RADIUS_FILES),
-        )
-        .collect();
+    if affected_order.len() >= MAX_BLAST_RADIUS_NODES {
+        tracing::warn!(
+            "get_blast_radius hit ceiling ({MAX_BLAST_RADIUS_NODES} nodes) for file \
+             '{file}'; result may be incomplete"
+        );
+    }
+    let cut = affected_order.len() > cap;
+    let mut shown: Vec<String> = affected_order.into_iter().take(cap).collect();
+    shown.sort();
     let mut body = shown.join("\n");
-    if shown.len() < total {
+    if cut {
         body.push_str(&format!(
-            "\n[note: showing {} of {total} files; raise max_files for more]",
-            shown.len()
+            "\n[note: showing the {cap} files nearest the change; more are affected, \
+             raise max_files for more]"
         ));
     }
 
@@ -12249,18 +12266,45 @@ mod tests {
 
         let capped = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, Some(10));
         assert!(
-            capped.contains("[note: showing 10 of 201 files"),
+            capped.contains("[note: showing the 10 files nearest the change"),
             "got: {capped}"
         );
-        assert!(
-            !capped.contains("src/dependents/user_199.rs"),
+        assert_eq!(
+            capped.matches("src/dependents/").count(),
+            9,
             "got: {capped}"
         );
+        assert!(capped.contains("src/lib.rs\n"), "got: {capped}");
         assert!(capped.contains("child module(s)") && capped.contains("src/child.rs"));
 
         // 0 is not a cap: it falls back to the default.
         let zero = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, Some(0));
         assert!(zero.contains("src/dependents/user_199.rs"), "got: {zero}");
+    }
+
+    /// A cut list keeps the files nearest the change, not the first ones
+    /// alphabetically: the direct caller `z_direct.ts` must survive a cap of 2
+    /// over twenty `a_far_*` files that only reach the target through it.
+    #[test]
+    fn blast_radius_cut_keeps_the_nearest_files() {
+        use travsr_core::EdgeKind;
+        let target = make_node("src/target.ts", "fn:target");
+        let direct = make_node("src/z_direct.ts", "fn:direct");
+        let mut nodes = vec![target.clone(), direct.clone()];
+        let mut edges = vec![(direct.id, target.id, EdgeKind::RefCall)];
+        for i in 0..20 {
+            let far = make_node(&format!("src/a_far_{i:02}.ts"), "fn:far");
+            edges.push((far.id, direct.id, EdgeKind::RefCall));
+            nodes.push(far);
+        }
+        let store = make_store(&nodes, &edges);
+        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::TreeSitter, Some(2));
+        assert!(
+            result.contains("src/target.ts") && result.contains("src/z_direct.ts"),
+            "got: {result}"
+        );
+        assert!(!result.contains("a_far_"), "got: {result}");
+        assert!(result.contains("more are affected"), "got: {result}");
     }
 
     /// #1005: a Rust `mod x;` is stored only parent -> child, so the parent's
@@ -12946,6 +12990,28 @@ mod tests {
         let trans = get_dependencies(&store, "a.ts", true, 3);
         assert!(trans.contains("b.ts"), "b.ts missing: {trans}");
         assert!(trans.contains("c.ts"), "transitive c.ts missing: {trans}");
+    }
+
+    /// A transitive tree is capped at 500 rows in BFS order and says so: the
+    /// direct dependency stays, the 600-file second hop is cut.
+    #[test]
+    fn get_dependencies_transitive_caps_rows_and_says_so() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let mk = |path: &str| Node::new(VName::new("", "", path, "typescript", path), "file");
+        let a = mk("a.ts");
+        let b = mk("b.ts");
+        let mut nodes = vec![a.clone(), b.clone()];
+        let mut edges = vec![(a.id, b.id, EdgeKind::Depends)];
+        for i in 0..600 {
+            let leaf = mk(&format!("leaf_{i:03}.ts"));
+            edges.push((b.id, leaf.id, EdgeKind::Depends));
+            nodes.push(leaf);
+        }
+        let store = make_store(&nodes, &edges);
+        let trans = get_dependencies(&store, "a.ts", true, 3);
+        assert!(trans.contains("b.ts\n"), "direct dep b.ts missing: {trans}");
+        assert!(trans.contains("[showing 500 of 601;"), "got: {trans}");
+        assert_eq!(trans.matches("leaf_").count(), 499, "got: {trans}");
     }
 
     // ── get_dependencies top-k cap tests ─────────────────────────────────────
