@@ -3573,10 +3573,17 @@ pub fn classify_phase_b_calls(
 }
 
 /// Document paths with one of these prefixes lie outside the repository.
-const OUTSIDE_REPO_PREFIXES: [&str; 2] = ["../", "/"];
+const OUTSIDE_REPO_PREFIXES: [&str; 4] = ["../", "/", "..\\", "\\"];
 
+/// A document outside the repo: a parent-relative or absolute path, including
+/// a Windows drive path (`C:/...`, `C:\...`).
 fn is_outside_repo(path: &str) -> bool {
+    let b = path.as_bytes();
     OUTSIDE_REPO_PREFIXES.iter().any(|p| path.starts_with(p))
+        || (b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'/' | b'\\'))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9167,6 +9174,23 @@ mod tests {
         assert!(store.get_node(outside.id).unwrap().is_none());
         assert!(store.iter_edges_to(outside.id).unwrap().is_empty());
         assert!(store.get_node(absolute.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn is_outside_repo_covers_windows_paths() {
+        for p in [
+            "../x.go",
+            "/tmp/x.go",
+            "..\\x.go",
+            "\\\\srv\\x.go",
+            "C:/x.go",
+            "c:\\x.go",
+        ] {
+            assert!(is_outside_repo(p), "{p}");
+        }
+        for p in ["main.go", "pkg/a.go", "..a/b.go", "a:b"] {
+            assert!(!is_outside_repo(p), "{p}");
+        }
     }
 
     // Rust tests run in parallel; TRAVSR_DISABLE_REGISTRY and HOME are
