@@ -1475,10 +1475,12 @@ pub fn init_repo_with_progress(
         }
     }
     // Nodes outside the repo written before `write_phase_b_results` dropped them.
-    match store.delete_nodes_for_path_prefix(OUTSIDE_REPO_PREFIX) {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(purged = n, "purged nodes outside the repo"),
-        Err(e) => tracing::warn!(err = %e, "outside-repo purge failed (non-fatal)"),
+    for prefix in OUTSIDE_REPO_PREFIXES {
+        match store.delete_nodes_for_path_prefix(prefix) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(purged = n, prefix, "purged nodes outside the repo"),
+            Err(e) => tracing::warn!(prefix, err = %e, "outside-repo purge failed (non-fatal)"),
+        }
     }
 
     // SC-H1: cap node_tombstones before indexing. Full init rebuilds embeddings
@@ -3570,10 +3572,14 @@ pub fn classify_phase_b_calls(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Repo-relative paths with this prefix lie outside the repository.
-const OUTSIDE_REPO_PREFIX: &str = "../";
+/// Document paths with one of these prefixes lie outside the repository.
+const OUTSIDE_REPO_PREFIXES: [&str; 2] = ["../", "/"];
 
+fn is_outside_repo(path: &str) -> bool {
+    OUTSIDE_REPO_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_phase_b_results(
     store: &mut SqliteStore,
     corpus: &str,
@@ -3596,7 +3602,7 @@ fn write_phase_b_results(
     // They are not this repo's source: drop them and everything touching them.
     let outside: std::collections::HashSet<travsr_core::NodeId> = pb_nodes
         .iter()
-        .filter(|n| n.vname.path.starts_with(OUTSIDE_REPO_PREFIX))
+        .filter(|n| is_outside_repo(&n.vname.path))
         .map(|n| n.id)
         .collect();
     let pb_nodes: Vec<travsr_core::Node> = pb_nodes
@@ -3609,9 +3615,7 @@ fn write_phase_b_results(
         .collect();
     let pb_refs: Vec<travsr_core::ScipRef> = pb_refs
         .into_iter()
-        .filter(|r| {
-            !r.caller_path.starts_with(OUTSIDE_REPO_PREFIX) && !outside.contains(&r.callee_id)
-        })
+        .filter(|r| !is_outside_repo(&r.caller_path) && !outside.contains(&r.callee_id))
         .collect();
     let pb_node_count = pb_nodes.len();
     let pb_edge_count = pb_edges.len();
@@ -9108,7 +9112,8 @@ mod tests {
 
     /// scip-go reports the test mains it generates in the Go build cache as
     /// documents at `../../../Library/Caches/go-build/...`. None of them, nor
-    /// any reference from or to them, may reach the graph.
+    /// any reference from or to them, nor an absolute-path document, may
+    /// reach the graph.
     #[test]
     fn phase_b_drops_documents_outside_the_repo() {
         use travsr_core::{Node, ScipRef, VName};
@@ -9121,6 +9126,11 @@ mod tests {
         .with_line(3);
         let outside = Node::new(
             VName::new("c", "", outside_path, "go", "scip:../x:main()."),
+            "function",
+        )
+        .with_line(1);
+        let absolute = Node::new(
+            VName::new("c", "", "/tmp/gen/main.go", "go", "scip:/tmp:main()."),
             "function",
         )
         .with_line(1);
@@ -9143,7 +9153,7 @@ mod tests {
         write_phase_b_results(
             &mut store,
             "c",
-            vec![inside, outside.clone()],
+            vec![inside, outside.clone(), absolute.clone()],
             vec![travsr_core::Edge::new(
                 outside.id,
                 outside.id,
@@ -9156,6 +9166,7 @@ mod tests {
         assert!(store.nodes_at_path(outside_path).unwrap().is_empty());
         assert!(store.get_node(outside.id).unwrap().is_none());
         assert!(store.iter_edges_to(outside.id).unwrap().is_empty());
+        assert!(store.get_node(absolute.id).unwrap().is_none());
     }
 
     // Rust tests run in parallel; TRAVSR_DISABLE_REGISTRY and HOME are
