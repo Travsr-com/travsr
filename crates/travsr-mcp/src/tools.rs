@@ -3642,8 +3642,16 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
     // blast-radius is a UI tool whose output must fit in an MCP response.
     const MAX_BLAST_RADIUS_NODES: usize = 50_000;
 
-    // Find all nodes whose VName path matches the given file.
-    let seed_nodes = match store.search_nodes_by_name(file) {
+    // Seed from every node at the exact path (#1004: the name search caps at
+    // 100 and drops most of a large file); fall back to the name search for a
+    // path that is not stored verbatim.
+    let seed_nodes = match store.nodes_at_path(file).and_then(|n| {
+        if n.is_empty() {
+            store.search_nodes_by_name(file)
+        } else {
+            Ok(n)
+        }
+    }) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("get_blast_radius search error: {e}");
@@ -3895,7 +3903,32 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         }
     }
 
-    affected_files.into_iter().collect::<Vec<_>>().join("\n")
+    let body = affected_files.into_iter().collect::<Vec<_>>().join("\n");
+
+    // #1005: a Rust `mod x;` is only stored parent -> child, so the reverse
+    // BFS never reaches the child's dependents. Name those child files so a
+    // caller editing the `mod` line knows to query them too.
+    let mut children: Vec<String> = seed_nodes
+        .iter()
+        .filter(|n| n.kind == "file-module")
+        .filter_map(|n| store.iter_edges_from_kind(n.id, EdgeKind::ResolvesTo).ok())
+        .flatten()
+        .filter_map(|e| store.get_node(e.dst).ok().flatten())
+        .map(|n| n.vname.path)
+        .filter(|p| !p.is_empty() && p != file)
+        .collect();
+    children.sort();
+    children.dedup();
+    if children.is_empty() {
+        return body;
+    }
+    format!(
+        "{body}\n[note: dependents of the {} child module(s) this file declares are not included \
+         (only removing or renaming a `mod` line breaks them); query those files for their own \
+         radius: {}]",
+        children.len(),
+        children.join(", ")
+    )
 }
 
 /// Blast-radius Phase-2 search hints for a file: the parent directory's last
@@ -12134,6 +12167,71 @@ mod tests {
         assert!(
             result.contains("src/importer.ts"),
             "importer reached via the Depends→import→ResolvesTo chain must appear, got: {result}"
+        );
+    }
+
+    /// #1004: seeding must cover every node at the path, not the first 100 the
+    /// name search returns. The only dependent calls a function ranked past it.
+    #[test]
+    fn blast_radius_seeds_every_node_of_a_large_file() {
+        use travsr_core::EdgeKind;
+        let mut nodes: Vec<_> = (0..150)
+            .map(|i| make_node("src/big.ts", &format!("fn:f{i:03}")))
+            .collect();
+        let last = nodes[149].id;
+        let caller = make_node("src/caller.ts", "fn:caller");
+        nodes.push(caller.clone());
+        let store = make_store(&nodes, &[(caller.id, last, EdgeKind::RefCall)]);
+        let result = get_blast_radius(&store, "src/big.ts", AnalysisMode::TreeSitter);
+        assert!(result.contains("src/caller.ts"), "got: {result}");
+    }
+
+    /// #1005: a Rust `mod x;` is stored only parent -> child, so the parent's
+    /// radius leaves out the child's dependents. The answer must say so and
+    /// name the child file, without adding the child's dependents.
+    #[test]
+    fn blast_radius_notes_rust_child_modules() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let filemod = Node::new(
+            VName::new("", "", "src/lib.rs", "rust", "filemod:registry"),
+            "file-module",
+        );
+        let child = Node::new(
+            VName::new("", "", "src/registry.rs", "rust", "file"),
+            "file",
+        );
+        let child_fn = Node::new(
+            VName::new("", "", "src/registry.rs", "rust", "fn:all_repos"),
+            "function",
+        );
+        let user = Node::new(
+            VName::new("", "", "src/repo.rs", "rust", "fn:run"),
+            "function",
+        );
+        let store = make_store(
+            &[
+                filemod.clone(),
+                child.clone(),
+                child_fn.clone(),
+                user.clone(),
+            ],
+            &[
+                (filemod.id, child.id, EdgeKind::ResolvesTo),
+                (user.id, child_fn.id, EdgeKind::RefCall),
+            ],
+        );
+        let result = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter);
+        assert!(!result.contains("src/repo.rs"), "got: {result}");
+        assert!(
+            result.contains("child module(s)") && result.contains("src/registry.rs"),
+            "got: {result}"
+        );
+        // The child's own radius is unchanged: it reaches the parent and its user.
+        let child_result = get_blast_radius(&store, "src/registry.rs", AnalysisMode::TreeSitter);
+        assert!(child_result.contains("src/lib.rs") && child_result.contains("src/repo.rs"));
+        assert!(
+            !child_result.contains("child module(s)"),
+            "got: {child_result}"
         );
     }
 
