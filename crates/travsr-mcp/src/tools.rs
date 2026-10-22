@@ -9857,6 +9857,7 @@ fn get_graph_json_raw(
     // node would exceed the budget, stop adding nodes (mirrors the node cap).
     let mut tokens_used = 0usize;
     let mut truncated_by_budget = false;
+    let mut truncated = false;
     // Tracks JSON ids already in nodes_out. Two different DB rows can share the
     // same signature (Phase B stores the same symbol once per referencing file).
     // Deduplicate here so Cytoscape never sees two nodes with the same id.
@@ -9895,6 +9896,12 @@ fn get_graph_json_raw(
         if token_budget > 0 && !nodes_out.is_empty() && tokens_used + node_tokens > token_budget {
             truncated_by_budget = true;
             continue;
+        }
+        // #1013: the cap bounds the answer, not only the expansion; nodes
+        // queued before it was reached used to be emitted anyway.
+        if nodes_out.len() >= MAX_GRAPH_JSON_NODES {
+            truncated = true;
+            break;
         }
 
         let json_id = node_json_id(&node);
@@ -10125,6 +10132,41 @@ fn get_graph_json_raw(
         node_ids_out.contains(src) && node_ids_out.contains(tgt)
     });
 
+    // #1013: the BFS charges `token_cost`, a fraction of a node's JSON, and
+    // nothing for edges, which are most of the bytes. Charge what is returned:
+    // each node's JSON plus every edge whose later endpoint it is (an edge
+    // survives a prefix cut exactly when that endpoint does), then keep the
+    // longest BFS prefix that fits. The seed always survives.
+    if token_budget > 0 && !nodes_out.is_empty() {
+        let index: HashMap<&str, usize> = nodes_out
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
+            .collect();
+        let at = |e: &serde_json::Value, end: &str| {
+            index
+                .get(e[end].as_str().unwrap_or(""))
+                .copied()
+                .unwrap_or(0)
+        };
+        let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
+        for e in &edges_out {
+            cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
+        }
+        let budget_bytes = token_budget.saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN);
+        let mut used = cost[0];
+        let mut keep = 1;
+        while keep < cost.len() && used + cost[keep] <= budget_bytes {
+            used += cost[keep];
+            keep += 1;
+        }
+        if keep < nodes_out.len() {
+            truncated_by_budget = true;
+            edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
+            nodes_out.truncate(keep);
+        }
+    }
+
     // #565 / RFC-002 consistency: surface the SAME ambiguity signal the CLI /
     // daemon `graph_query` path emits, computed via the SAME resolver, so an
     // agent calling get_graph_json can tell a query resolved to multiple distinct
@@ -10166,6 +10208,10 @@ fn get_graph_json_raw(
     if token_budget > 0 {
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    if truncated {
+        out["truncated"] = serde_json::json!(true);
+        out["max_nodes"] = serde_json::json!(MAX_GRAPH_JSON_NODES);
     }
     // #617 + #661 WS-D: degraded-state signals — additive envelope field; first-
     // party consumers read only `nodes`/`edges` and ignore extra keys. Phase-B
@@ -13316,6 +13362,68 @@ mod tests {
             "seed must survive any budget: {capped}"
         );
         assert!(capped.len() < unbounded.len());
+    }
+
+    /// #1013: a hub seed with more neighbours than the node cap. The cap must
+    /// bound the answer (it used to stop expansion only, and every queued node
+    /// was still emitted), and `token_budget` must bound the JSON actually
+    /// returned, edges included.
+    #[test]
+    fn get_graph_json_bounds_nodes_and_honours_the_token_budget() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        use travsr_store::Store;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed = Node::new(
+            VName::new("test", "", "src/seed.ts", "typescript", "fn:seed"),
+            "function",
+        );
+        store.put_node(&seed).unwrap();
+        for i in 0..300 {
+            let n = Node::new(
+                VName::new(
+                    "test",
+                    "",
+                    format!("src/dep{i}.ts"),
+                    "typescript",
+                    format!("fn:dep{i}"),
+                ),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+            store
+                .put_edge(&Edge::new(seed.id, n.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let call = |token_budget: usize| -> serde_json::Value {
+            let raw = get_graph_json(
+                &store,
+                &GraphJsonParams {
+                    query: "fn:seed",
+                    direction: "deps",
+                    depth: 1,
+                    token_budget,
+                    ..Default::default()
+                },
+            );
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        let all = call(0);
+        assert_eq!(all["nodes"].as_array().unwrap().len(), MAX_GRAPH_JSON_NODES);
+        assert_eq!(all["truncated"], true, "{}", all["truncated"]);
+        assert_eq!(all["max_nodes"], MAX_GRAPH_JSON_NODES);
+
+        let budget = 1000;
+        let capped = call(budget);
+        let body = capped["nodes"].to_string().len() + capped["edges"].to_string().len();
+        assert!(
+            body / travsr_retrieval::TOKEN_CHARS_PER_TOKEN <= budget,
+            "{body} bytes for a {budget} token budget"
+        );
+        assert_eq!(capped["truncated_by_budget"], true);
+        assert_eq!(capped["nodes"][0]["id"], all["nodes"][0]["id"]);
+        let kept = capped["nodes"].as_array().unwrap().len();
+        assert_eq!(capped["edges"].as_array().unwrap().len(), kept - 1);
     }
 
     // ── P3 overview / LOD tests ────────────────────────────────────────────────
