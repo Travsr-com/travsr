@@ -3971,12 +3971,22 @@ fn get_blast_radius_raw(
     if children.is_empty() {
         return body;
     }
+    // Name at most 10: on a binary crate root the full list (28 on
+    // travsr-cli's main.rs) outgrew the radius it annotates.
+    const MAX_NAMED_CHILDREN: usize = 10;
+    let total = children.len();
+    let mut named = children
+        .into_iter()
+        .take(MAX_NAMED_CHILDREN)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > MAX_NAMED_CHILDREN {
+        named.push_str(&format!(" and {} more", total - MAX_NAMED_CHILDREN));
+    }
     format!(
-        "{body}\n[note: dependents of the {} child module(s) this file declares are not included \
-         (only removing or renaming a `mod` line breaks them); query those files for their own \
-         radius: {}]",
-        children.len(),
-        children.join(", ")
+        "{body}\n[note: dependents of the {total} child module(s) this file declares are not \
+         included (only removing or renaming a `mod` line breaks them); query those files for \
+         their own radius: {named}]"
     )
 }
 
@@ -12305,6 +12315,33 @@ mod tests {
         );
         assert!(!result.contains("a_far_"), "got: {result}");
         assert!(result.contains("more are affected"), "got: {result}");
+    }
+
+    /// The child-module note names at most 10 files and counts the rest, so on
+    /// a crate root with many modules it stays shorter than the radius.
+    #[test]
+    fn blast_radius_child_module_note_names_at_most_ten() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..12 {
+            let filemod = Node::new(
+                VName::new("", "", "src/main.rs", "rust", format!("filemod:m{i:02}")),
+                "file-module",
+            );
+            let child = Node::new(
+                VName::new("", "", format!("src/m{i:02}.rs"), "rust", "file"),
+                "file",
+            );
+            edges.push((filemod.id, child.id, EdgeKind::ResolvesTo));
+            nodes.push(filemod);
+            nodes.push(child);
+        }
+        let store = make_store(&nodes, &edges);
+        let result = get_blast_radius(&store, "src/main.rs", AnalysisMode::TreeSitter, None);
+        assert!(result.contains("the 12 child module(s)"), "got: {result}");
+        assert!(result.contains("src/m09.rs and 2 more]"), "got: {result}");
+        assert!(!result.contains("src/m10.rs"), "got: {result}");
     }
 
     /// #1005: a Rust `mod x;` is stored only parent -> child, so the parent's
