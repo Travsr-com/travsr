@@ -7,7 +7,7 @@ import {
 import { CallersHoverProvider } from "../../hover";
 import { showWelcome, welcomeToolLines } from "../../welcome";
 import { StdioMcpClient } from "../../mcp";
-import { parseEnvelope } from "../../extension";
+import { blastCountLabel, parseEnvelope } from "../../extension";
 
 suite("parseEnvelope returns result rows only", () => {
   test("drops the name-match legend and a note after the envelope", () => {
@@ -29,6 +29,21 @@ suite("parseEnvelope returns result rows only", () => {
       "[note: nothing calls 'Point', but it is used at 2 place(s); find_references lists them.]\n" +
       "</travsr-data>";
     assert.deepStrictEqual(parseEnvelope(raw), []);
+  });
+});
+
+suite("blastCountLabel", () => {
+  test("marks a radius the server cut at max_files", () => {
+    const raw =
+      "<travsr-data>\na.rs\nb.rs\n" +
+      "[note: showing the 2 files nearest the change; more are affected, raise max_files for more]\n" +
+      "</travsr-data>";
+    assert.strictEqual(blastCountLabel(raw, parseEnvelope(raw).length), "2+");
+  });
+
+  test("leaves a complete radius exact", () => {
+    const raw = "<travsr-data>\na.rs\nb.rs\n</travsr-data>";
+    assert.strictEqual(blastCountLabel(raw, parseEnvelope(raw).length), "2");
   });
 });
 
