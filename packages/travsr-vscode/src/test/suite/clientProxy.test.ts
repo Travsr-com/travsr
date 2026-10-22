@@ -6,7 +6,7 @@
 
 import * as assert from "assert";
 import { MutableMcpClientProxy } from "../../clientProxy";
-import type { McpClient } from "../../mcp";
+import { StdioMcpClient, type McpClient } from "../../mcp";
 
 // ── Stub ──────────────────────────────────────────────────────────────────────
 
@@ -251,5 +251,49 @@ suite("S17-5: clientProxy, setOnInvoke", () => {
     proxy.setOnInvoke(() => { throw new Error("telemetry SDK exploded"); });
     const result = await proxy.callTool("get_repo_map");
     assert.strictEqual(result, "result", "inner callTool must still return despite hook throw");
+  });
+});
+
+// ── StdioMcpClient: isError tool results (#1016) ─────────────────────────
+
+suite("#1016: StdioMcpClient, isError tool results", () => {
+  // Drive the client without spawning a binary: a fake process takes the
+  // request line, and the reply is fed through the stdout buffer.
+  type Internals = { proc: unknown; buffer: string; flush(): void };
+  const call = async (client: StdioMcpClient, result: unknown): Promise<string> => {
+    const inner = client as unknown as Internals;
+    inner.proc = { stdin: { write: (): boolean => true } };
+    const pending = client.callTool("get_dependencies", { file: "a.rs" });
+    inner.buffer += JSON.stringify({ jsonrpc: "2.0", id: 1, result }) + "\n";
+    inner.flush();
+    return pending;
+  };
+  const error = {
+    content: [{ type: "text", text: "<travsr-data>\nget_dependencies: `transitive` must be a boolean, got a string\n</travsr-data>" }],
+    isError: true,
+  };
+
+  test("a tool error is not returned as data and is shown as a warning", async () => {
+    const warned: string[] = [];
+    const client = new StdioMcpClient("travsr", undefined, "0", (m) => warned.push(m));
+    assert.strictEqual(await call(client, error), "");
+    assert.deepStrictEqual(warned, ["Travsr: get_dependencies: `transitive` must be a boolean, got a string"]);
+  });
+
+  test("a normal result still resolves to its text, with no warning", async () => {
+    const warned: string[] = [];
+    const client = new StdioMcpClient("travsr", undefined, "0", (m) => warned.push(m));
+    const text = "<travsr-data>\nsrc/b.rs\n</travsr-data>";
+    assert.strictEqual(await call(client, { content: [{ type: "text", text }] }), text);
+    assert.deepStrictEqual(warned, []);
+  });
+
+  test("the same error is shown once, not on every call", async () => {
+    const warned: string[] = [];
+    const client = new StdioMcpClient("travsr", undefined, "0", (m) => warned.push(m));
+    await call(client, error);
+    (client as unknown as { nextId: number }).nextId = 1;
+    await call(client, error);
+    assert.strictEqual(warned.length, 1);
   });
 });

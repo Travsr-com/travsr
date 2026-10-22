@@ -8,6 +8,8 @@
  */
 
 import * as cp from "child_process";
+import * as vscode from "vscode";
+import { stripEnvelope } from "./commands";
 import { assertExecutableBinary } from "./installer";
 
 export interface McpClient {
@@ -18,7 +20,7 @@ export interface McpClient {
 
 interface RpcResponse {
   id?: number;
-  result?: { content?: Array<{ text?: string }> };
+  result?: { content?: Array<{ text?: string }>; isError?: boolean };
 }
 
 export class StdioMcpClient implements McpClient {
@@ -29,11 +31,13 @@ export class StdioMcpClient implements McpClient {
   private nextId = 1;
   private connected = false;
   private readonly disconnectListeners = new Set<() => void>();
+  private readonly shownErrors = new Set<string>();
 
   constructor(
     private readonly binary: string,
     private readonly cwd?: string,
-    private readonly version: string = "0.6.0"
+    private readonly version: string = "0.6.0",
+    private readonly warn: (msg: string) => void = (msg) => void vscode.window.showWarningMessage(msg)
   ) {}
 
   onDisconnect(cb: () => void): { dispose(): void } {
@@ -151,7 +155,19 @@ export class StdioMcpClient implements McpClient {
             this.pending.delete(msg.id);
             clearTimeout(this.pendingTimers.get(msg.id));
             this.pendingTimers.delete(msg.id);
-            resolve(msg.result?.content?.[0]?.text ?? "");
+            const text = msg.result?.content?.[0]?.text ?? "";
+            if (msg.result?.isError) {
+              // #1016: a tool error is not the tool's answer. Callers get the
+              // usual empty failure value; the message is shown once.
+              const warning = `Travsr: ${stripEnvelope(text).trim()}`;
+              if (!this.shownErrors.has(warning)) {
+                this.shownErrors.add(warning);
+                this.warn(warning);
+              }
+              resolve("");
+            } else {
+              resolve(text);
+            }
           }
         }
       } catch {
