@@ -550,7 +550,7 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showInformationMessage(`Travsr: ${file} has no dependents, safe to edit.`);
         return;
       }
-      const label = `${file}: ${count} file${count !== 1 ? "s" : ""} depend on this`;
+      const label = `${file}: ${blastCountLabel(raw, count)} file${count !== 1 ? "s" : ""} depend on this`;
       const action = await vscode.window.showWarningMessage(label, "Show Details", "OK");
       if (action === "Show Details") {
         await vscode.commands.executeCommand("travsr.showBlastRadius", file, files);
@@ -567,7 +567,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const deps = parseEnvelope(raw);
         if (deps.length > 0) {
           void vscode.window.showWarningMessage(
-            `Travsr: renaming ${rel} may break ${deps.length} dependent file${deps.length !== 1 ? "s" : ""}.`,
+            `Travsr: renaming ${rel} may break ${blastCountLabel(raw, deps.length)} dependent file${deps.length !== 1 ? "s" : ""}.`,
             "Show Details"
           ).then((action) => {
             if (action === "Show Details") {
@@ -1029,6 +1029,13 @@ interface FileListOpts {
 }
 
 /** Strip the `<travsr-data>…</travsr-data>` MCP envelope and return trimmed non-empty lines. */
+/** A blast-radius count for display: `N+` when the server cut the list at
+ *  `max_files` (its "showing the N files nearest the change" note, which
+ *  parseEnvelope drops), so a cut list is not reported as an exact count. */
+export function blastCountLabel(raw: string, count: number): string {
+  return /\[note: showing the \d+ files nearest the change/.test(raw) ? `${count}+` : String(count);
+}
+
 export function parseEnvelope(raw: string): string[] {
   // Every caller counts the lines as results, so drop what is not one: a note
   // the server appends after `</travsr-data>` or inside it, and the `~ =` legend.
