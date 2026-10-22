@@ -133,6 +133,16 @@ fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) 
             }
         }
     }
+    // Same cap as `MAX_CALLER_ROWS`; rows are in BFS order, so the nearest
+    // hops are the ones kept.
+    const MAX_TRANSITIVE_DEP_ROWS: usize = 500;
+    let total = lines.len();
+    if total > MAX_TRANSITIVE_DEP_ROWS {
+        lines.truncate(MAX_TRANSITIVE_DEP_ROWS);
+        lines.push(format!(
+            "[showing {MAX_TRANSITIVE_DEP_ROWS} of {total}; lower depth for a shorter tree]"
+        ));
+    }
     lines.join("\n")
 }
 
@@ -3611,6 +3621,10 @@ pub enum AnalysisMode {
 /// `get_lang_status` return path so the shape never drifts between them.
 const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","statusLine":"not a supported language","builtin":false,"semantic_available":false,"install_hint":"","prerequisites":""}"#;
 
+/// Files listed by `get_blast_radius` when `max_files` is not given, the same
+/// cap as `MAX_CALLER_ROWS` and `MAX_PATTERN_MATCHES`.
+const DEFAULT_BLAST_RADIUS_FILES: usize = 500;
+
 /// Return the set of files transitively affected if the given file changes.
 ///
 /// Uses reverse BFS over `DefinesBinding` and `RefCall` edges: starting from
@@ -3620,7 +3634,16 @@ const UNKNOWN_LANG_JSON: &str = r#"{"language":"unknown","status":"unknown","sta
 /// Output format (one line per affected file, sorted):
 ///   `src/service.ts`
 ///   `src/controller.ts`
-pub fn get_blast_radius(store: &SqliteStore, file: &str, mode: AnalysisMode) -> String {
+///
+/// At most `max_files` files are listed (default [`DEFAULT_BLAST_RADIUS_FILES`]);
+/// a cut list keeps the files nearest the change and ends with a note saying
+/// more are affected.
+pub fn get_blast_radius(
+    store: &SqliteStore,
+    file: &str,
+    mode: AnalysisMode,
+    max_files: Option<usize>,
+) -> String {
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_blast_radius rejected invalid arg: {reason}");
         return String::new();
@@ -3629,21 +3652,34 @@ pub fn get_blast_radius(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
     // trusted as the complete impact set.
     with_phase_b_note(
         store,
-        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode)),
+        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode, max_files)),
     )
 }
 
-fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> String {
+fn get_blast_radius_raw(
+    store: &SqliteStore,
+    file: &str,
+    mode: AnalysisMode,
+    max_files: Option<usize>,
+) -> String {
     use std::collections::{HashSet, VecDeque};
     use travsr_core::EdgeKind;
 
     // Hard ceiling: prevents OOM on utility files imported by thousands of callers.
-    // Same guard policy as PPR (MAX_SUBGRAPH_NODES = 250_000); tighter here because
-    // blast-radius is a UI tool whose output must fit in an MCP response.
+    // Same guard policy as PPR (MAX_SUBGRAPH_NODES = 250_000); tighter here
+    // because the traversal backs an interactive tool call.
     const MAX_BLAST_RADIUS_NODES: usize = 50_000;
 
-    // Find all nodes whose VName path matches the given file.
-    let seed_nodes = match store.search_nodes_by_name(file) {
+    // Seed from every node at the exact path (#1004: the name search caps at
+    // 100 and drops most of a large file); fall back to the name search for a
+    // path that is not stored verbatim.
+    let seed_nodes = match store.nodes_at_path(file).and_then(|n| {
+        if n.is_empty() {
+            store.search_nodes_by_name(file)
+        } else {
+            Ok(n)
+        }
+    }) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("get_blast_radius search error: {e}");
@@ -3655,17 +3691,27 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         return String::new();
     }
 
+    let cap = max_files
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BLAST_RADIUS_FILES);
+    // Stop the traversal at the first file past the cap: the rest would only
+    // be cut from the answer, and on a hub file it costs most of the time.
+    let limit = cap.saturating_add(1).min(MAX_BLAST_RADIUS_NODES);
+
     let mut visited: HashSet<travsr_core::NodeId> = HashSet::new();
     let mut queue: VecDeque<travsr_core::NodeId> = VecDeque::new();
-    let mut affected_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Files in the order the traversal reaches them, so a cut list keeps the
+    // files nearest the change rather than the first ones alphabetically.
+    let mut affected_files: HashSet<String> = HashSet::new();
+    let mut affected_order: Vec<String> = Vec::new();
 
     for node in &seed_nodes {
         if visited.insert(node.id) {
             queue.push_back(node.id);
         }
         // The file itself counts as affected.
-        if !node.vname.path.is_empty() {
-            affected_files.insert(node.vname.path.clone());
+        if !node.vname.path.is_empty() && affected_files.insert(node.vname.path.clone()) {
+            affected_order.push(node.vname.path.clone());
         }
     }
 
@@ -3776,15 +3822,13 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
                 .collect();
             for id in &new_srcs {
                 if let Some(src_node) = node_map.get(id) {
-                    if !src_node.vname.path.is_empty() {
-                        affected_files.insert(src_node.vname.path.clone());
-                        // Hard ceiling on the result set (see the Phase-2 note).
-                        if affected_files.len() >= MAX_BLAST_RADIUS_NODES {
-                            tracing::warn!(
-                                "get_blast_radius hit ceiling \
-                                 ({MAX_BLAST_RADIUS_NODES} nodes) for file '{file}'; \
-                                 result may be incomplete"
-                            );
+                    if !src_node.vname.path.is_empty()
+                        && affected_files.insert(src_node.vname.path.clone())
+                    {
+                        affected_order.push(src_node.vname.path.clone());
+                        // Cap or hard ceiling on the result set (see the
+                        // Phase-2 note).
+                        if affected_order.len() >= limit {
                             break 'fixpoint;
                         }
                     }
@@ -3812,7 +3856,7 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         // discovered importer files land here on the next pass, giving
         // transitivity. TS/JS/Rust files map to NoopResolver, so re-processing
         // them is a cheap no-op.
-        let todo: Vec<String> = affected_files
+        let todo: Vec<String> = affected_order
             .iter()
             .filter(|f| !phase2_done.contains(*f))
             .cloned()
@@ -3872,18 +3916,16 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
                                 queue.push_back(*id);
                             }
                             if let Some(src_node) = node_map.get(id) {
-                                if !src_node.vname.path.is_empty() {
-                                    affected_files.insert(src_node.vname.path.clone());
-                                    // Hard ceiling: abort the whole fixpoint the
-                                    // instant the result reaches the cap, so a
-                                    // hub file imported by tens of thousands
-                                    // cannot overshoot within a single pass.
-                                    if affected_files.len() >= MAX_BLAST_RADIUS_NODES {
-                                        tracing::warn!(
-                                            "get_blast_radius hit ceiling \
-                                             ({MAX_BLAST_RADIUS_NODES} nodes) for file \
-                                             '{file}'; result may be incomplete"
-                                        );
+                                if !src_node.vname.path.is_empty()
+                                    && affected_files.insert(src_node.vname.path.clone())
+                                {
+                                    affected_order.push(src_node.vname.path.clone());
+                                    // Abort the whole fixpoint the instant the
+                                    // result reaches the cap or the hard
+                                    // ceiling, so a hub file imported by tens
+                                    // of thousands cannot overshoot within a
+                                    // single pass.
+                                    if affected_order.len() >= limit {
                                         break 'fixpoint;
                                     }
                                 }
@@ -3895,7 +3937,47 @@ fn get_blast_radius_raw(store: &SqliteStore, file: &str, mode: AnalysisMode) -> 
         }
     }
 
-    affected_files.into_iter().collect::<Vec<_>>().join("\n")
+    if affected_order.len() >= MAX_BLAST_RADIUS_NODES {
+        tracing::warn!(
+            "get_blast_radius hit ceiling ({MAX_BLAST_RADIUS_NODES} nodes) for file \
+             '{file}'; result may be incomplete"
+        );
+    }
+    let cut = affected_order.len() > cap;
+    let mut shown: Vec<String> = affected_order.into_iter().take(cap).collect();
+    shown.sort();
+    let mut body = shown.join("\n");
+    if cut {
+        body.push_str(&format!(
+            "\n[note: showing the {cap} files nearest the change; more are affected, \
+             raise max_files for more]"
+        ));
+    }
+
+    // #1005: a Rust `mod x;` is only stored parent -> child, so the reverse
+    // BFS never reaches the child's dependents. Name those child files so a
+    // caller editing the `mod` line knows to query them too.
+    let mut children: Vec<String> = seed_nodes
+        .iter()
+        .filter(|n| n.kind == "file-module")
+        .filter_map(|n| store.iter_edges_from_kind(n.id, EdgeKind::ResolvesTo).ok())
+        .flatten()
+        .filter_map(|e| store.get_node(e.dst).ok().flatten())
+        .map(|n| n.vname.path)
+        .filter(|p| !p.is_empty() && p != file)
+        .collect();
+    children.sort();
+    children.dedup();
+    if children.is_empty() {
+        return body;
+    }
+    format!(
+        "{body}\n[note: dependents of the {} child module(s) this file declares are not included \
+         (only removing or renaming a `mod` line breaks them); query those files for their own \
+         radius: {}]",
+        children.len(),
+        children.join(", ")
+    )
 }
 
 /// Blast-radius Phase-2 search hints for a file: the parent directory's last
@@ -3941,6 +4023,7 @@ pub fn get_blast_radius_global(
     file: &str,
     repo: Option<&str>,
     mode: AnalysisMode,
+    max_files: Option<usize>,
 ) -> String {
     if let Err(reason) = validate_mcp_arg(file) {
         tracing::warn!("get_blast_radius_global rejected invalid arg: {reason}");
@@ -3954,7 +4037,7 @@ pub fn get_blast_radius_global(
             .and_then(|db| repo_head_from_registry_path(db));
         let result = append_read_notes(
             store,
-            get_blast_radius_raw(store, file, mode),
+            get_blast_radius_raw(store, file, mode, max_files),
             head.as_deref(),
         );
         if result.is_empty() || single {
@@ -11957,7 +12040,7 @@ mod tests {
     fn blast_radius_includes_source_file() {
         let a = make_node("a.ts", "fn:a");
         let store = make_store(std::slice::from_ref(&a), &[]);
-        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("a.ts"),
             "source file must appear in its own blast radius"
@@ -11972,7 +12055,7 @@ mod tests {
         let b = make_node("b.ts", "fn:b");
         // B calls A — reverse BFS from A should reach B.
         let store = make_store(&[a.clone(), b.clone()], &[(b.id, a.id, EdgeKind::RefCall)]);
-        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
         assert!(result.contains("a.ts"), "source file must be included");
         assert!(
             result.contains("b.ts"),
@@ -11988,7 +12071,7 @@ mod tests {
         let b = make_node("b.ts", "fn:b");
         // B imports A — Depends edge B→A; reverse BFS from A must reach B.
         let store = make_store(&[a.clone(), b.clone()], &[(b.id, a.id, EdgeKind::Depends)]);
-        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
         assert!(result.contains("a.ts"), "source file must be included");
         assert!(
             result.contains("b.ts"),
@@ -12010,7 +12093,7 @@ mod tests {
             ],
         );
         // Must not hang; both files reachable.
-        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
         assert!(result.contains("a.ts"));
         assert!(result.contains("b.ts"));
     }
@@ -12046,6 +12129,7 @@ mod tests {
             &store,
             "strategies/serverConfig.go",
             AnalysisMode::TreeSitter,
+            None,
         );
         assert!(
             result.contains("strategies/serverConfig.go"),
@@ -12075,7 +12159,7 @@ mod tests {
                 (c.id, a.id, EdgeKind::Depends),
             ],
         );
-        let result = get_blast_radius(&store, "a.ts", AnalysisMode::Semantic);
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::Semantic, None);
         assert!(
             result.contains("b.ts"),
             "RefCall caller must appear in semantic blast radius"
@@ -12100,7 +12184,7 @@ mod tests {
                 (c.id, a.id, EdgeKind::Depends),
             ],
         );
-        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("b.ts") && result.contains("c.ts"),
             "TreeSitter mode must follow both RefCall and Depends"
@@ -12130,10 +12214,146 @@ mod tests {
                 (import_node.id, target.id, EdgeKind::ResolvesTo),
             ],
         );
-        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("src/importer.ts"),
             "importer reached via the Depends→import→ResolvesTo chain must appear, got: {result}"
+        );
+    }
+
+    /// #1004: seeding must cover every node at the path, not the first 100 the
+    /// name search returns. The only dependent calls a function ranked past it.
+    #[test]
+    fn blast_radius_seeds_every_node_of_a_large_file() {
+        use travsr_core::EdgeKind;
+        let mut nodes: Vec<_> = (0..150)
+            .map(|i| make_node("src/big.ts", &format!("fn:f{i:03}")))
+            .collect();
+        let last = nodes[149].id;
+        let caller = make_node("src/caller.ts", "fn:caller");
+        nodes.push(caller.clone());
+        let store = make_store(&nodes, &[(caller.id, last, EdgeKind::RefCall)]);
+        let result = get_blast_radius(&store, "src/big.ts", AnalysisMode::TreeSitter, None);
+        assert!(result.contains("src/caller.ts"), "got: {result}");
+    }
+
+    /// The radius is not cut at the generic 4 KB output cap: every file under
+    /// the default cap and the child-module note come back. A `max_files` cut
+    /// says so and still keeps the child-module note.
+    #[test]
+    fn blast_radius_lists_up_to_max_files_and_says_when_cut() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let target = make_node("src/lib.rs", "fn:shared");
+        let filemod = Node::new(
+            VName::new("", "", "src/lib.rs", "rust", "filemod:child"),
+            "file-module",
+        );
+        let child = Node::new(VName::new("", "", "src/child.rs", "rust", "file"), "file");
+        let mut nodes = vec![target.clone(), filemod.clone(), child.clone()];
+        let mut edges = vec![(filemod.id, child.id, EdgeKind::ResolvesTo)];
+        for i in 0..200 {
+            let user = make_node(&format!("src/dependents/user_{i:03}.rs"), "fn:run");
+            edges.push((user.id, target.id, EdgeKind::RefCall));
+            nodes.push(user);
+        }
+        let store = make_store(&nodes, &edges);
+
+        let full = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, None);
+        assert!(full.len() > 4_096, "len {}", full.len());
+        assert!(full.contains("src/dependents/user_199.rs"), "got: {full}");
+        assert!(full.contains("child module(s)") && full.contains("src/child.rs"));
+        assert!(!full.contains("showing"), "got: {full}");
+
+        let capped = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, Some(10));
+        assert!(
+            capped.contains("[note: showing the 10 files nearest the change"),
+            "got: {capped}"
+        );
+        assert_eq!(
+            capped.matches("src/dependents/").count(),
+            9,
+            "got: {capped}"
+        );
+        assert!(capped.contains("src/lib.rs\n"), "got: {capped}");
+        assert!(capped.contains("child module(s)") && capped.contains("src/child.rs"));
+
+        // 0 is not a cap: it falls back to the default.
+        let zero = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, Some(0));
+        assert!(zero.contains("src/dependents/user_199.rs"), "got: {zero}");
+    }
+
+    /// A cut list keeps the files nearest the change, not the first ones
+    /// alphabetically: the direct caller `z_direct.ts` must survive a cap of 2
+    /// over twenty `a_far_*` files that only reach the target through it.
+    #[test]
+    fn blast_radius_cut_keeps_the_nearest_files() {
+        use travsr_core::EdgeKind;
+        let target = make_node("src/target.ts", "fn:target");
+        let direct = make_node("src/z_direct.ts", "fn:direct");
+        let mut nodes = vec![target.clone(), direct.clone()];
+        let mut edges = vec![(direct.id, target.id, EdgeKind::RefCall)];
+        for i in 0..20 {
+            let far = make_node(&format!("src/a_far_{i:02}.ts"), "fn:far");
+            edges.push((far.id, direct.id, EdgeKind::RefCall));
+            nodes.push(far);
+        }
+        let store = make_store(&nodes, &edges);
+        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::TreeSitter, Some(2));
+        assert!(
+            result.contains("src/target.ts") && result.contains("src/z_direct.ts"),
+            "got: {result}"
+        );
+        assert!(!result.contains("a_far_"), "got: {result}");
+        assert!(result.contains("more are affected"), "got: {result}");
+    }
+
+    /// #1005: a Rust `mod x;` is stored only parent -> child, so the parent's
+    /// radius leaves out the child's dependents. The answer must say so and
+    /// name the child file, without adding the child's dependents.
+    #[test]
+    fn blast_radius_notes_rust_child_modules() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let filemod = Node::new(
+            VName::new("", "", "src/lib.rs", "rust", "filemod:registry"),
+            "file-module",
+        );
+        let child = Node::new(
+            VName::new("", "", "src/registry.rs", "rust", "file"),
+            "file",
+        );
+        let child_fn = Node::new(
+            VName::new("", "", "src/registry.rs", "rust", "fn:all_repos"),
+            "function",
+        );
+        let user = Node::new(
+            VName::new("", "", "src/repo.rs", "rust", "fn:run"),
+            "function",
+        );
+        let store = make_store(
+            &[
+                filemod.clone(),
+                child.clone(),
+                child_fn.clone(),
+                user.clone(),
+            ],
+            &[
+                (filemod.id, child.id, EdgeKind::ResolvesTo),
+                (user.id, child_fn.id, EdgeKind::RefCall),
+            ],
+        );
+        let result = get_blast_radius(&store, "src/lib.rs", AnalysisMode::TreeSitter, None);
+        assert!(!result.contains("src/repo.rs"), "got: {result}");
+        assert!(
+            result.contains("child module(s)") && result.contains("src/registry.rs"),
+            "got: {result}"
+        );
+        // The child's own radius is unchanged: it reaches the parent and its user.
+        let child_result =
+            get_blast_radius(&store, "src/registry.rs", AnalysisMode::TreeSitter, None);
+        assert!(child_result.contains("src/lib.rs") && child_result.contains("src/repo.rs"));
+        assert!(
+            !child_result.contains("child module(s)"),
+            "got: {child_result}"
         );
     }
 
@@ -12155,7 +12375,7 @@ mod tests {
                 (import_node.id, target.id, EdgeKind::ResolvesTo),
             ],
         );
-        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::Semantic);
+        let result = get_blast_radius(&store, "src/target.ts", AnalysisMode::Semantic, None);
         assert!(
             !result.contains("src/importer.ts"),
             "semantic mode must not follow the import chain, got: {result}"
@@ -12197,7 +12417,7 @@ mod tests {
                 (imp_b.id, b.id, EdgeKind::ResolvesTo),
             ],
         );
-        let result = get_blast_radius(&store, "src/c.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "src/c.ts", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("src/b.ts"),
             "direct importer b.ts must appear, got: {result}"
@@ -12240,7 +12460,7 @@ mod tests {
                 (dog.id, dog_import.id, EdgeKind::Depends),
             ],
         );
-        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("ruby/src/cat.rb"),
             "cat.rb requires animal (Phase-2 RubyResolver) and must appear, got: {result}"
@@ -12282,7 +12502,7 @@ mod tests {
                 (dog.id, dog_relative_import.id, EdgeKind::Depends),
             ],
         );
-        let result = get_blast_radius(&store, "ruby/src/json.rb", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "ruby/src/json.rb", AnalysisMode::TreeSitter, None);
         assert!(
             !result.contains("ruby/src/cat.rb"),
             "cat.rb's `require 'json'` is load-path (import:gem:json) and must NOT \
@@ -12325,7 +12545,7 @@ mod tests {
                 (main.id, main_import.id, EdgeKind::Depends),
             ],
         );
-        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("ruby/src/cat.rb"),
             "direct importer cat.rb must appear, got: {result}"
@@ -12367,7 +12587,7 @@ mod tests {
                 (other_helper.id, other_import.id, EdgeKind::Depends),
             ],
         );
-        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "ruby/src/animal.rb", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("ruby/src/cat.rb"),
             "sibling importer cat.rb must appear, got: {result}"
@@ -12396,7 +12616,7 @@ mod tests {
             &[model.clone(), view.clone(), view_import.clone()],
             &[(view.id, view_import.id, EdgeKind::Depends)],
         );
-        let result = get_blast_radius(&store, "app/Model.h", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "app/Model.h", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("app/View.m"),
             "View.m imports Model.h and must appear in its blast radius, got: {result}"
@@ -12770,6 +12990,28 @@ mod tests {
         let trans = get_dependencies(&store, "a.ts", true, 3);
         assert!(trans.contains("b.ts"), "b.ts missing: {trans}");
         assert!(trans.contains("c.ts"), "transitive c.ts missing: {trans}");
+    }
+
+    /// A transitive tree is capped at 500 rows in BFS order and says so: the
+    /// direct dependency stays, the 600-file second hop is cut.
+    #[test]
+    fn get_dependencies_transitive_caps_rows_and_says_so() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let mk = |path: &str| Node::new(VName::new("", "", path, "typescript", path), "file");
+        let a = mk("a.ts");
+        let b = mk("b.ts");
+        let mut nodes = vec![a.clone(), b.clone()];
+        let mut edges = vec![(a.id, b.id, EdgeKind::Depends)];
+        for i in 0..600 {
+            let leaf = mk(&format!("leaf_{i:03}.ts"));
+            edges.push((b.id, leaf.id, EdgeKind::Depends));
+            nodes.push(leaf);
+        }
+        let store = make_store(&nodes, &edges);
+        let trans = get_dependencies(&store, "a.ts", true, 3);
+        assert!(trans.contains("b.ts\n"), "direct dep b.ts missing: {trans}");
+        assert!(trans.contains("[showing 500 of 601;"), "got: {trans}");
+        assert_eq!(trans.matches("leaf_").count(), 499, "got: {trans}");
     }
 
     // ── get_dependencies top-k cap tests ─────────────────────────────────────
@@ -17054,7 +17296,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "abc").unwrap();
         store.set_meta("phase_b_commit", "abc").unwrap();
         store.set_meta("phase_b_dirty", "1").unwrap();
-        let result = get_blast_radius(&store, "src/missing.ts", AnalysisMode::TreeSitter);
+        let result = get_blast_radius(&store, "src/missing.ts", AnalysisMode::TreeSitter, None);
         assert!(
             result.contains("dropped some calls since they were last traced"),
             "empty result must surface the stale note; got: {result}"

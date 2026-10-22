@@ -835,6 +835,7 @@ fn dispatch_tool_call(
                         args["file"].as_str().unwrap_or(""),
                         repo_arg,
                         mode,
+                        args["max_files"].as_u64().map(|n| n as usize),
                     )
                 }
                 "get_lang_status" => tools::get_lang_status_global(

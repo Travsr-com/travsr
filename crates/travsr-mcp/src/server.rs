@@ -158,7 +158,8 @@ fn handle_tool_call(
                 "semantic" => tools::AnalysisMode::Semantic,
                 _ => tools::AnalysisMode::TreeSitter,
             };
-            tools::get_blast_radius(store, file, mode)
+            let max_files = args["max_files"].as_u64().map(|n| n as usize);
+            tools::get_blast_radius(store, file, mode, max_files)
         }
         "get_architecture_brief" => {
             let provenance = args["provenance"].as_str().unwrap_or("ratified");
@@ -436,12 +437,13 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "get_blast_radius",
-                "description": "Return the set of files transitively affected if the given file changes.",
+                "description": "Return the set of files transitively affected if the given file changes. File- or package-level, so it is a completeness check, not a reading list; for one function's use sites call get_callers or find_references.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
-                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." }
+                        "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
+                        "max_files": { "type": "integer", "minimum": 0, "description": "Most files to list (default 500; 0 also means the default). A cut list keeps the files nearest the change and ends with a note." }
                     },
                     "required": ["file"],
                     "additionalProperties": false
@@ -893,6 +895,7 @@ fn handle_tool_call_global(
                 args["file"].as_str().unwrap_or(""),
                 repo_arg,
                 mode,
+                args["max_files"].as_u64().map(|n| n as usize),
             )
         }
         "get_lang_status" => {
@@ -1109,12 +1112,13 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "get_blast_radius",
-                "description": "Return the set of files transitively affected if the given file changes. Supply `repo` to scope results; omit only if the symbol may exist in multiple repos.",
+                "description": "Return the set of files transitively affected if the given file changes. File- or package-level, so it is a completeness check, not a reading list; for one function's use sites call get_callers or find_references. Supply `repo` to scope results; omit only if the symbol may exist in multiple repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file": { "type": "string", "description": "Repo-relative file path to compute blast radius for" },
                         "analysis": { "type": "string", "enum": ["tree-sitter", "semantic"], "description": "Edge mode: 'tree-sitter' (default, structural) or 'semantic' (call/reference edges; needs full cross-file analysis to be built)." },
+                        "max_files": { "type": "integer", "minimum": 0, "description": "Most files to list per repo (default 500; 0 also means the default). A cut list keeps the files nearest the change and ends with a note." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["file"],

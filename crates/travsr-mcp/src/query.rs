@@ -913,14 +913,10 @@ pub fn next_edges(
         if is_seed {
             if let Some(node) = store.get_node(node_id)? {
                 if node.kind == "file" {
-                    // Cap the splice at 200 definitions: pathological generated
-                    // files can hold thousands, each costing an iter_edges_to
-                    // round-trip. Full fidelity remains available via per-symbol
-                    // queries.
-                    for def_id in store
-                        .definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
-                        .into_iter()
-                        .take(200)
+                    // Every definition, uncapped: a cap at 200 silently dropped
+                    // the callers of the rest of a large file.
+                    for def_id in
+                        store.definition_node_ids_in_file(&node.vname.corpus, &node.vname.path)?
                     {
                         incoming.extend(
                             store
@@ -1709,6 +1705,38 @@ mod tests {
         );
         assert!(payload.nodes.iter().any(|n| n.id == caller.id.0));
         assert!(payload.nodes.iter().any(|n| n.id == caller2.id.0));
+    }
+
+    /// The splice covers every definition in the file: a caller of the 250th
+    /// function must surface (a cap at 200 used to drop it silently).
+    #[test]
+    fn file_seed_splices_callers_of_every_definition() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store.put_node(&node("file", "file", "src/big.ts")).unwrap();
+        let defs: Vec<Node> = (1..=250)
+            .map(|i| node(&format!("fn:f{i}"), "function", "src/big.ts").with_line(i))
+            .collect();
+        for d in &defs {
+            store.put_node(d).unwrap();
+        }
+        let caller = node("fn:caller", "function", "src/caller.ts");
+        store.put_node(&caller).unwrap();
+        store
+            .put_edge(&Edge::new(caller.id, defs[249].id, EdgeKind::RefCall))
+            .unwrap();
+        let payload = graph_query(
+            &store,
+            &GraphQueryArgs {
+                query: "src/big.ts".to_string(),
+                path: None,
+                depth: 1,
+                direction: QueryDirection::Callers,
+                edge_mode: QueryEdgeMode::Semantic,
+                include_noise: false,
+            },
+        )
+        .unwrap();
+        assert!(payload.nodes.iter().any(|n| n.id == caller.id.0));
     }
 
     #[test]

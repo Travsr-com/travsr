@@ -1439,7 +1439,16 @@ impl ImportResolver for GoResolver {
         if file_dir.is_empty() {
             return false; // root-level Go files are unexportable main packages
         }
+        // A module checked in under a subdirectory (kubernetes'
+        // `staging/src/k8s.io/api/core/v1`) has a dir ending with the whole
+        // import path. Domain-qualified paths only, so stdlib `errors` does
+        // not match `pkg/util/errors`.
+        let qualified = import_path
+            .split('/')
+            .next()
+            .is_some_and(|h| h.contains('.'));
         path_suffix_match(import_path, &file_dir)
+            || (qualified && path_suffix_match(&file_dir, import_path))
     }
 }
 
@@ -1846,6 +1855,16 @@ mod tests {
             "rust",
             "fn:sample",
         )
+    }
+
+    #[test]
+    fn go_resolver_matches_a_module_under_a_subdirectory() {
+        let r = resolver_for_language("go");
+        let f = "staging/src/k8s.io/api/core/v1/types.go";
+        assert!(r.resolves_to("import:k8s.io/api/core/v1", "pkg/a.go", f));
+        assert!(!r.resolves_to("import:k8s.io/api/core", "pkg/a.go", f));
+        // Stdlib paths never match a same-named repo dir by suffix.
+        assert!(!r.resolves_to("import:errors", "pkg/a.go", "pkg/util/errors/e.go"));
     }
 
     #[test]
