@@ -807,7 +807,15 @@ fn dispatch_tool_call(
                     return jsonrpc_error(rpc_id, INVALID_PARAMS, "missing tool name");
                 }
             };
-            let args = &params["arguments"];
+            // SSE serves a subset of the global tools, with the same arguments.
+            let args = &match crate::server::check_tool_args(
+                &crate::server::tools_list_global(),
+                tool_name,
+                &params["arguments"],
+            ) {
+                Ok(args) => args,
+                Err(msg) => return jsonrpc_ok(rpc_id, crate::server::invalid_args_result(&msg)),
+            };
             let repo_arg = args["repo"].as_str();
 
             let _span = tracing::info_span!("mcp.sse.tool_call", tool = tool_name, tenant = "sse")
