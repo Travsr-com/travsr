@@ -9092,14 +9092,13 @@ fn seed_source_display(source: crate::seed::SeedSource) -> &'static str {
 /// A gold present in RAWKNN but absent from KNNSEED dropped at `embed_path_seeds`;
 /// present in KNNSEED but absent from FINAL dropped at semantic_validate/scope;
 /// present in FINAL with `CONF none` is a GATE (abstain) case.
+///
+/// With embeddings off, RAWKNN and KNNSEED are replaced by one
+/// `[embed KNN unavailable, ...]` line and the remaining stages still run.
 pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
     if validate_mcp_arg(query).is_err() {
         return String::new();
     }
-    let knn_fn = match store.embed_knn_fn() {
-        Some(f) => f,
-        None => return "[embed KNN unavailable, embeddings not wired]".to_string(),
-    };
     let mut out = String::new();
 
     // Calibration anchors for the active model (identity for bge/un-calibrated).
@@ -9108,9 +9107,11 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
 
     let fmt_loc = |n: &CoreNode| n.line.map(|l| format!(":{l}")).unwrap_or_default();
 
-    // Stage 1: raw embed-KNN (top 50), identical source to embed_knn_probe.
-    let raw = knn_fn(query, 50);
-    {
+    // #1014: with embeddings off the KNN stages are skipped and the exact and
+    // lexical legs are still traced, the same inputs get_context uses then.
+    let (knn_selected, knn_oracle) = if let Some(knn_fn) = store.embed_knn_fn() {
+        // Stage 1: raw embed-KNN (top 50), identical source to embed_knn_probe.
+        let raw = knn_fn(query, 50);
         let ids: Vec<NodeId> = raw.iter().map(|&(id, _)| id).collect();
         let nodes = store.get_nodes(&ids).unwrap_or_default();
         let by_id: HashMap<NodeId, &CoreNode> = nodes.iter().map(|n| (n.id, n)).collect();
@@ -9126,20 +9127,24 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
                 ));
             }
         }
-    }
 
-    // Stage 2: seeds selected by embed_path_seeds (the first hard KNN filter).
-    let (knn_selected, _n_elig, _ms, knn_oracle) =
-        embed_path_seeds(store, query, &knn_fn, &OpenFilter);
-    for (n, cos) in &knn_selected {
-        out.push_str(&format!(
-            "KNNSEED\t{:.4}\t{}\t{}{}\n",
-            cos,
-            n.vname.signature,
-            n.vname.path,
-            fmt_loc(n)
-        ));
-    }
+        // Stage 2: seeds selected by embed_path_seeds (the first hard KNN filter).
+        let (knn_selected, _n_elig, _ms, knn_oracle) =
+            embed_path_seeds(store, query, &knn_fn, &OpenFilter);
+        for (n, cos) in &knn_selected {
+            out.push_str(&format!(
+                "KNNSEED\t{:.4}\t{}\t{}{}\n",
+                cos,
+                n.vname.signature,
+                n.vname.path,
+                fmt_loc(n)
+            ));
+        }
+        (knn_selected, knn_oracle)
+    } else {
+        out.push_str("[embed KNN unavailable, embeddings not wired]\n");
+        (vec![], HashMap::new())
+    };
 
     // Stage 3: full build_seed_set — final surviving seeds + confidence.
     let score_fn = store.embed_score_fn();
