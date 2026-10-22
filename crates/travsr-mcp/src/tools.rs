@@ -3721,6 +3721,12 @@ fn get_blast_radius_raw(
     //   target file, a local `seen_here` set dedups candidate import nodes so
     //   the pure `resolves_to` runs at most once per candidate.)
     let mut phase2_done: HashSet<String> = HashSet::new();
+    // #1015: import nodes that already resolved to some reached file. What a
+    // resolved import contributes (its `Depends` importers) does not depend on
+    // which file it resolved to, so it is never checked again. On kubernetes'
+    // core/v1/types.go this skipped 43% of 31M `resolves_to` calls and 91% of
+    // the edge lookups behind them.
+    let mut resolved_imports: HashSet<usize> = HashSet::new();
 
     // Phase-2 candidate index, built once per call from a single bulk load.
     // Transitive resolution (#613) re-resolves importers for every newly reached
@@ -3881,7 +3887,7 @@ fn get_blast_radius_raw(
                         continue;
                     };
                     for &idx in cands {
-                        if !seen_here.insert(idx) {
+                        if resolved_imports.contains(&idx) || !seen_here.insert(idx) {
                             continue;
                         }
                         let (imp_id, imp_sig, imp_lang, imp_path) = &import_records[idx];
@@ -3893,6 +3899,7 @@ fn get_blast_radius_raw(
                         if !resolver.resolves_to(imp_sig, imp_path, &target_file) {
                             continue;
                         }
+                        resolved_imports.insert(idx);
                         let Ok(edges) = store.iter_edges_to(*imp_id) else {
                             continue;
                         };
