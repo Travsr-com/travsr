@@ -10132,41 +10132,6 @@ fn get_graph_json_raw(
         node_ids_out.contains(src) && node_ids_out.contains(tgt)
     });
 
-    // #1013: the BFS charges `token_cost`, a fraction of a node's JSON, and
-    // nothing for edges, which are most of the bytes. Charge what is returned:
-    // each node's JSON plus every edge whose later endpoint it is (an edge
-    // survives a prefix cut exactly when that endpoint does), then keep the
-    // longest BFS prefix that fits. The seed always survives.
-    if token_budget > 0 && !nodes_out.is_empty() {
-        let index: HashMap<&str, usize> = nodes_out
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
-            .collect();
-        let at = |e: &serde_json::Value, end: &str| {
-            index
-                .get(e[end].as_str().unwrap_or(""))
-                .copied()
-                .unwrap_or(0)
-        };
-        let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
-        for e in &edges_out {
-            cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
-        }
-        let budget_bytes = token_budget.saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN);
-        let mut used = cost[0];
-        let mut keep = 1;
-        while keep < cost.len() && used + cost[keep] <= budget_bytes {
-            used += cost[keep];
-            keep += 1;
-        }
-        if keep < nodes_out.len() {
-            truncated_by_budget = true;
-            edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
-            nodes_out.truncate(keep);
-        }
-    }
-
     // #565 / RFC-002 consistency: surface the SAME ambiguity signal the CLI /
     // daemon `graph_query` path emits, computed via the SAME resolver, so an
     // agent calling get_graph_json can tell a query resolved to multiple distinct
@@ -10192,6 +10157,48 @@ fn get_graph_json_raw(
         } else {
             Vec::new()
         };
+
+    // #1013: the BFS charges `token_cost`, a fraction of a node's JSON, and
+    // nothing for edges, which are most of the bytes. Charge what is returned:
+    // each node's JSON plus every edge whose later endpoint it is (an edge
+    // survives a prefix cut exactly when that endpoint does), then keep the
+    // longest BFS prefix that fits. The seed always survives.
+    if token_budget > 0 && !nodes_out.is_empty() {
+        let index: HashMap<&str, usize> = nodes_out
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
+            .collect();
+        let at = |e: &serde_json::Value, end: &str| {
+            index
+                .get(e[end].as_str().unwrap_or(""))
+                .copied()
+                .unwrap_or(0)
+        };
+        let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
+        for e in &edges_out {
+            cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
+        }
+        // The header returned with the graph comes out of the same budget.
+        let header = coverage.to_string().len()
+            + serde_json::to_string(&ambiguous_candidates).map_or(0, |s| s.len());
+        let budget_bytes = token_budget
+            .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
+            .saturating_sub(header);
+        let mut used = cost[0];
+        let mut keep = 1;
+        while keep < cost.len() && used + cost[keep] <= budget_bytes {
+            used += cost[keep];
+            keep += 1;
+        }
+        if keep < nodes_out.len() {
+            truncated_by_budget = true;
+            // The budget, not the node cap, is what bounds this answer.
+            truncated = false;
+            edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
+            nodes_out.truncate(keep);
+        }
+    }
 
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
@@ -13415,12 +13422,16 @@ mod tests {
 
         let budget = 1000;
         let capped = call(budget);
-        let body = capped["nodes"].to_string().len() + capped["edges"].to_string().len();
+        let body = capped["nodes"].to_string().len()
+            + capped["edges"].to_string().len()
+            + capped["coverage"].to_string().len();
         assert!(
             body / travsr_retrieval::TOKEN_CHARS_PER_TOKEN <= budget,
             "{body} bytes for a {budget} token budget"
         );
         assert_eq!(capped["truncated_by_budget"], true);
+        // The budget cut it, not the node cap.
+        assert!(capped.get("truncated").is_none(), "{capped}");
         assert_eq!(capped["nodes"][0]["id"], all["nodes"][0]["id"]);
         let kept = capped["nodes"].as_array().unwrap().len();
         assert_eq!(capped["edges"].as_array().unwrap().len(), kept - 1);
