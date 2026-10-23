@@ -316,6 +316,12 @@ function visitDefsNode(
       if (!nameNode) break;
       const className = nameNode.text;
       emitSymbol(`class:${className}`, nameNode, relPath, docId, defMap, emitter, defRangeIds);
+      // An `Enum`/`Flag` subclass's bare `NAME = value` lines are its members,
+      // written by tree-sitter as `variant:Class.NAME` (python.rs).
+      for (const member of enumMembers(node)) {
+        const sig = `variant:${className}.${member.text}`;
+        emitSymbol(sig, member, relPath, docId, defMap, emitter, defRangeIds);
+      }
 
       // Recurse into the class body at the next nesting level.
       const bodyNode = node.childForFieldName('body');
@@ -342,6 +348,19 @@ function visitDefsNode(
       // class scope are not recursed — we only index top-level defs.
       break;
   }
+}
+
+/** Name nodes of an `Enum`/`Flag` subclass's members, as python.rs reads them. */
+function enumMembers(classDef: SyntaxNode): SyntaxNode[] {
+  const supers = classDef.childForFieldName('superclasses')?.text ?? '';
+  const body = classDef.childForFieldName('body');
+  if (!body || !(supers.includes('Enum') || supers.includes('Flag'))) return [];
+  return namedChildren(body)
+    .filter((st) => st.type === 'expression_statement')
+    .map((st) => st.firstNamedChild)
+    .filter((a): a is SyntaxNode => a?.type === 'assignment')
+    .map((a) => a.childForFieldName('left'))
+    .filter((l): l is SyntaxNode => l?.type === 'identifier' && !l.text.startsWith('_'));
 }
 
 function emitSymbol(
@@ -580,6 +599,24 @@ function visitRefs(
         emitter.emitItem(info.referenceResultId, [rangeId], docId, 'references');
         refRangeIds.push(rangeId);
       }
+    }
+  }
+
+  // `Outcome.PASS` reads an enum member of a first-party class: a use site,
+  // not a call.
+  if (node.type === 'attribute') {
+    const obj = node.childForFieldName('object');
+    const attr = node.childForFieldName('attribute');
+    const cls =
+      obj?.type === 'identifier'
+        ? resolveClassName(obj.text, importTable, defMap, relPath)
+        : undefined;
+    const info = cls && attr && defMap.get(`${cls.relpath}:variant:${cls.className}.${attr.text}`);
+    if (attr && info) {
+      const rangeId = emitter.emitRange(attr);
+      emitter.emitEdge('next', rangeId, info.resultSetId);
+      emitter.emitItem(info.referenceResultId, [rangeId], docId, 'references', false);
+      refRangeIds.push(rangeId);
     }
   }
 
