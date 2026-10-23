@@ -223,6 +223,23 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     }
   }
 
+  // ── RefEnumMember: `Tone.Warm` reads an enum member ─────────────────────
+  // Not a call, so it is recorded as a use site only. Restricted to enum
+  // members: any other property access would also resolve to a pass-1 symbol
+  // (a method passed as a value), which is not what this arm is for.
+  if (
+    ts.isPropertyAccessExpression(node) &&
+    ((ctx.checker.getSymbolAtLocation(node.name)?.flags ?? 0) & ts.SymbolFlags.EnumMember) !== 0
+  ) {
+    const info = resolveRefTarget(node.name, ctx.checker, ctx.symbolInfos);
+    if (info) {
+      const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
+      ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
+      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
+      ctx.refRangeIds.push(rangeId);
+    }
+  }
+
   // ── RefJsx: <Foo/> and <Foo> usage resolves to the component declaration ──
   // A JSX element is a usage of its tag. The TS AST models it as a
   // JsxOpeningElement / JsxSelfClosingElement, not a CallExpression, so the
@@ -325,6 +342,7 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
  *   method:ClassName.name    → MethodDeclaration (requires parent class walk)
  *   var:varName              → TOP-LEVEL VariableDeclaration
  *   interface:InterfaceName  → InterfaceDeclaration
+ *   variant:Enum.Member      → EnumMember with an identifier name
  *
  * Returns undefined for unrecognised node kinds AND for non-top-level variable
  * declarations — the caller omits travsr_vname in that case, so the resultSet
@@ -364,6 +382,8 @@ function computeTravsrVName(
   ) {
     // An interface method: tree-sitter names it `method:Iface.name` too.
     signature = `method:${node.parent.name.text}.${node.name.text}`;
+  } else if (ts.isEnumMember(node) && ts.isIdentifier(node.name)) {
+    signature = `variant:${node.parent.name.text}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
     // (lexical_declaration (variable_declarator)))`). A local has no node, so
@@ -444,6 +464,9 @@ function resolveDeclarationSymbol(
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+    return [checker.getSymbolAtLocation(node.name), node.name];
+  }
+  if (ts.isEnumMember(node) && ts.isIdentifier(node.name)) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   return [undefined, undefined];
