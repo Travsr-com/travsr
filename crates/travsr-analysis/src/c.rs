@@ -14,6 +14,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (struct_specifier name: (type_identifier) @struct.name)
 (union_specifier name: (type_identifier) @union.name)
 (enum_specifier name: (type_identifier) @enum.name)
+(enumerator name: (identifier) @variant.name)
 (type_definition declarator: (type_identifier) @typedef.name)
 (function_declarator declarator: (identifier) @fn.name)
 (field_declaration declarator: (field_identifier) @field.name)
@@ -29,6 +30,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         // #757: named struct/union members → `field:Owner.name`, contained by
         // their aggregate. A data member's declarator is a bare `field_identifier`,
         // or nests one under a `pointer_declarator` (`char* name;`) / `array_declarator`
@@ -47,6 +50,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
     method_containers: &[
         ("struct_specifier", "struct"),
         ("union_specifier", "struct"),
+        ("enum_specifier", "enum"),
     ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
@@ -163,5 +167,27 @@ mod tests {
             .collect();
         assert!(sigs.contains(&"macro:MAX"), "got {sigs:?}");
         assert!(sigs.contains(&"macro:SQ"), "got {sigs:?}");
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.c");
+        std::fs::write(&path, "enum Color { RED, GREEN = 2 };\n").unwrap();
+        let out = parse("", &path, "e.c").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Color",
+            &["variant:Color.GREEN", "variant:Color.RED"],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.c");
+        std::fs::write(&path, "typedef enum { LOW, HIGH } Level;\n").unwrap();
+        let out = parse("", &path, "t.c").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "type:Level",
+            &["variant:Level.HIGH", "variant:Level.LOW"],
+        );
     }
 }

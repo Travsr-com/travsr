@@ -14,6 +14,9 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (class_definition name: (_) @class.name)
 (object_definition name: (_) @object.name)
 (trait_definition name: (_) @trait.name)
+(enum_definition name: (_) @enum.name)
+(simple_enum_case name: (_) @variant.name)
+(full_enum_case name: (_) @variant.name)
 (function_definition name: (_) @fn.name)
 (function_declaration name: (_) @fn.name)
 (type_definition name: (type_identifier) @typedef.name)
@@ -30,7 +33,10 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class.name", "class", "class"),
         ("object.name", "object", "class"),
         ("trait.name", "trait", "class"),
+        ("enum.name", "enum", "enum"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         ("typedef.name", "type", "type"),
         // #757: class/object/trait `val`/`var` members → `field:Owner.name`.
         // Anchored to `template_body` so local `val`s in method bodies are not
@@ -42,6 +48,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class_definition", "class"),
         ("object_definition", "class"),
         ("trait_definition", "class"),
+        ("enum_definition", "enum"),
     ],
     decl_kinds: &[],
     type_refinements: &[],
@@ -154,5 +161,26 @@ mod tests {
         assert!(kinds.contains(&"object"));
         assert!(kinds.contains(&"function"));
         assert!(kinds.contains(&"import"));
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.scala");
+        std::fs::write(
+            &path,
+            "enum Color:\n  case Red, Green\n  case Rgb(v: Int)\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "e.scala").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Color",
+            &[
+                "variant:Color.Green",
+                "variant:Color.Red",
+                "variant:Color.Rgb",
+            ],
+        );
     }
 }

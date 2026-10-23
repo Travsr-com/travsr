@@ -424,11 +424,14 @@ pub fn candidate_signatures(parsed: &ScipName<'_>) -> Vec<String> {
             let mut sigs = Vec::with_capacity(4);
             if let Some(c) = parsed.container {
                 sigs.push(format!("field:{c}.{name}"));
+                // An enum member is a term of its enum (`Readiness#PartMissing.`).
+                sigs.push(format!("variant:{c}.{name}"));
                 // A bespoke sidecar's dotted container, as in the function arm
                 // (`Zoo.Companion.MAX` vs `field:Zoo.MAX`).
                 if c.contains('.') {
                     for seg in c.split('.') {
                         sigs.push(format!("field:{seg}.{name}"));
+                        sigs.push(format!("variant:{seg}.{name}"));
                     }
                 }
             }
@@ -500,7 +503,9 @@ pub fn native_name_kind<'a>(signature: &'a str, node_kind: &str) -> Option<ScipN
         "function" | "method" | "constructor" => "function",
         "class" | "struct" | "interface" | "trait" | "enum" | "type" | "protocol" | "object"
         | "extension" => "class",
-        "field" | "variable" | "const" | "constant" | "property" | "var" | "static" => "variable",
+        "field" | "variant" | "variable" | "const" | "constant" | "property" | "var" | "static" => {
+            "variable"
+        }
         _ => return None,
     };
 
@@ -1142,6 +1147,7 @@ mod tests {
             sigs,
             vec![
                 "field:Session.name",
+                "variant:Session.name",
                 "var:name",
                 "const:name",
                 "static:name"

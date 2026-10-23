@@ -515,6 +515,29 @@ test('extensionless ESM import resolves cross-file under bundler resolution (#83
   }
 });
 
+// Tree-sitter writes an enum member as `variant:Enum.Member`; reading one
+// (`Level.High`) is a use site, not a call.
+test('an enum member read references variant:Enum.Member as a non-call', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const sigs = travsrSignatures(result.stdout, 'enums.ts');
+  assert.ok(sigs.includes('variant:Level.Low'), `expected variant:Level.Low in ${JSON.stringify(sigs)}`);
+  const high = parseVertices(result.stdout).find(
+    (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'variant:Level.High'
+  );
+  assert.ok(high, 'variant:Level.High must have a resultSet');
+  const edges = parseEdges(result.stdout);
+  const refResult = edges.find((e) => e['label'] === 'textDocument/references' && e['outV'] === high['id']);
+  assert.ok(refResult, 'variant:Level.High must have a referenceResult');
+  const uses = edges.filter(
+    (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult['inV']
+  );
+  assert.strictEqual(uses.length, 1, 'the one `Level.High` read must be referenced');
+  assert.strictEqual(uses[0]['travsr_call'], false, 'an enum member read is not a call');
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** All travsr_vname signatures in the dump whose path ends with `fileSuffix`. */

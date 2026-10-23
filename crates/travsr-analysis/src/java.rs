@@ -25,6 +25,7 @@ const QUERIES: &str = r#"
 (method_declaration name: (identifier) @method.name)
 (constructor_declaration name: (identifier) @constructor.name)
 (field_declaration declarator: (variable_declarator name: (identifier) @field.name))
+(enum_constant name: (identifier) @variant.name)
 (import_declaration) @import
 "#;
 
@@ -225,6 +226,28 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                             Node::new(vn, "field")
                                 .with_line(line)
                                 .with_end_line(end_line),
+                            parent,
+                        );
+                    }
+                }
+                "variant.name" => {
+                    // A named enum constant → `variant:Enum.NAME`, contained by
+                    // its enum. `enum_constant` only occurs in an enum body.
+                    if let Some((prefix, ty)) = java_enclosing_type(cap.node, &source) {
+                        let vn = VName::new(
+                            corpus,
+                            "",
+                            vname_path,
+                            "java",
+                            format!("variant:{ty}.{text}"),
+                        );
+                        let parent =
+                            VName::new(corpus, "", vname_path, "java", format!("{prefix}:{ty}"))
+                                .id();
+                        push(
+                            &mut nodes,
+                            &mut edges,
+                            Node::new(vn, "variant").with_line(line).with_end_line(line),
                             parent,
                         );
                     }
@@ -469,5 +492,18 @@ mod tests {
             "correct marker kind"
         );
         assert_eq!(out.ffi_markers[0].local_name, "nativeOp");
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("E.java");
+        std::fs::write(
+            &path,
+            "enum E {\n    A,\n    B(2) { void f() {} };\n    E() {}\n    E(int x) {}\n}\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "E.java").unwrap();
+        crate::generic::assert_variants(&out, "enum:E", &["variant:E.A", "variant:E.B"]);
     }
 }

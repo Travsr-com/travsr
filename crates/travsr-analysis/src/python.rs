@@ -183,8 +183,20 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     let node = py_class_node(corpus, vname_path, text)
                         .with_line(line)
                         .with_end_line(decl_end_line(capture.node));
+                    let class_id = node.id;
                     output.edges.push(emit::defines_edge(file_id, node.id));
                     output.nodes.push(node);
+                    // An `Enum`/`Flag` subclass's bare `NAME = value` lines are
+                    // its members → `variant:Class.NAME`, contained by the class.
+                    if let Some(class_def) = capture.node.parent() {
+                        for (name, line) in py_enum_members(class_def, source.as_slice()) {
+                            let node = py_variant_node(corpus, vname_path, text, name)
+                                .with_line(line)
+                                .with_end_line(line);
+                            output.edges.push(emit::defines_edge(class_id, node.id));
+                            output.nodes.push(node);
+                        }
+                    }
                     // #479: a `unittest.TestCase` subclass body is a test scope —
                     // its methods (including non-`test_` helpers) are `Support`.
                     if let Some(class_def) = capture.node.parent() {
@@ -271,6 +283,30 @@ fn py_class_is_testcase(class_def: tree_sitter::Node<'_>, source: &[u8]) -> bool
         .child_by_field_name("superclasses")
         .and_then(|s| s.utf8_text(source).ok())
         .is_some_and(|t| t.contains("TestCase"))
+}
+
+/// The members of an `Enum`/`Flag` subclass (`IntEnum`, `StrEnum`, `IntFlag`
+/// included): each `NAME = value` statement directly in the class body, with
+/// its line. `_sunder_`/`__dunder__` names are settings, not members. Empty for
+/// any other class.
+fn py_enum_members<'a>(class_def: tree_sitter::Node<'_>, source: &'a [u8]) -> Vec<(&'a str, u32)> {
+    let is_enum = class_def
+        .child_by_field_name("superclasses")
+        .and_then(|s| s.utf8_text(source).ok())
+        .is_some_and(|t| t.contains("Enum") || t.contains("Flag"));
+    let Some(body) = class_def.child_by_field_name("body").filter(|_| is_enum) else {
+        return Vec::new();
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|st| st.kind() == "expression_statement")
+        .filter_map(|st| st.named_child(0))
+        .filter(|a| a.kind() == "assignment")
+        .filter_map(|a| a.child_by_field_name("left"))
+        .filter(|l| l.kind() == "identifier")
+        .filter_map(|l| Some((l.utf8_text(source).ok()?, l.start_position().row as u32 + 1)))
+        .filter(|(name, _)| !name.starts_with('_'))
+        .collect()
 }
 
 /// #479: walk up from a `function_definition` to the nearest enclosing class and
@@ -480,6 +516,15 @@ fn py_method_node(corpus: &str, path: &str, class_name: &str, method: &str) -> N
 
 fn py_class_node(corpus: &str, path: &str, name: &str) -> Node {
     Node::new(py_vname(corpus, path, &format!("class:{name}")), "class")
+}
+
+/// A member of an `Enum` subclass, owner-qualified like a field
+/// (`variant:Class.NAME`).
+fn py_variant_node(corpus: &str, path: &str, class: &str, member: &str) -> Node {
+    Node::new(
+        py_vname(corpus, path, &format!("variant:{class}.{member}")),
+        "variant",
+    )
 }
 
 fn py_type_node(corpus: &str, path: &str, name: &str) -> Node {
@@ -745,6 +790,23 @@ mod tests {
                 .iter()
                 .any(|n| n.vname.signature == "import:." && n.kind == "import"),
             "expected import:. for `from . import utils`"
+        );
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.py");
+        std::fs::write(
+            &path,
+            "class Color(str, Enum):\n    _ignore_ = ['X']\n    RED = 'r'\n    GREEN: str = 'g'\n    def label(self):\n        local = 1\n\nclass Plain:\n    A = 1\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "e.py").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "class:Color",
+            &["variant:Color.GREEN", "variant:Color.RED"],
         );
     }
 }

@@ -327,6 +327,13 @@ pub fn unify_all(
         {
             same_file.push(format!("class:{}", parsed.name));
         }
+        // kotlin-language-server kinds an enum entry as a class
+        // (`class:CloseBehavior.DoesNothing`); Phase A wrote the variant.
+        if parsed.kind == "class" {
+            if let Some(c) = parsed.container {
+                same_file.push(format!("variant:{c}.{}", parsed.name));
+            }
+        }
         // A constructor with no declaration of its own (a Kotlin primary
         // constructor, an implicit JVM `<init>`, which Scala's sidecar kinds
         // `sym`) is defined on its class's line, and Phase A wrote only the
@@ -995,6 +1002,42 @@ mod tests {
         let mut refs: Vec<ScipRef> = Vec::new();
         let out = unify_all(&mut store, "c", std::slice::from_ref(&property), &mut refs);
         assert_eq!(out.alias_map.get(&property.id), Some(&field.id));
+    }
+
+    #[test]
+    fn a_kotlin_enum_entry_unifies_onto_its_variant() {
+        // kotlin-language-server kinds an enum entry as a class
+        // (`class:CloseBehavior.DoesNothing`); Phase A writes the variant.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let variant = Node::new(
+            VName::new(
+                "c",
+                "",
+                "k/Close.kt",
+                "kotlin",
+                "variant:CloseBehavior.DoesNothing",
+            ),
+            "variant",
+        )
+        .with_line(5)
+        .with_end_line(5);
+        store
+            .write_phase_b_batch(std::slice::from_ref(&variant), &[], "scip")
+            .unwrap();
+        let entry = Node::new(
+            VName::new(
+                "c",
+                "",
+                "k/Close.kt",
+                "kotlin",
+                "class:CloseBehavior.DoesNothing",
+            ),
+            "class",
+        )
+        .with_line(5);
+        let mut refs: Vec<ScipRef> = Vec::new();
+        let out = unify_all(&mut store, "c", std::slice::from_ref(&entry), &mut refs);
+        assert_eq!(out.alias_map.get(&entry.id), Some(&variant.id));
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (interface_declaration name: (name) @interface.name)
 (trait_declaration name: (name) @trait.name)
 (enum_declaration name: (name) @enum.name)
+(enum_case name: (name) @variant.name)
 (function_definition name: (name) @fn.name)
 (method_declaration name: (name) @fn.name)
 (property_declaration (property_element name: (variable_name (name) @field.name)))
@@ -37,6 +38,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("trait.name", "trait", "trait"),
         ("enum.name", "enum", "enum"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         // #757: class/interface/trait/enum properties → `field:Owner.name`.
         ("field.name", "field", "field"),
         ("import", "import", "import"),
@@ -122,5 +125,22 @@ mod tests {
                 && e.dst == method.id
         });
         assert!(contained, "trait:Logs must contain method:Logs.log");
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.php");
+        std::fs::write(
+            &path,
+            "<?php\nenum Suit: string {\n    case Hearts = 'H';\n    case Spades = 'S';\n}\n",
+        )
+        .unwrap();
+        let out = parse("", &path, "e.php").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Suit",
+            &["variant:Suit.Hearts", "variant:Suit.Spades"],
+        );
     }
 }

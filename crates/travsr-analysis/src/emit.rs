@@ -31,6 +31,14 @@ pub fn field_node(corpus: &str, path: &str, owner_name: &str, field_name: &str) 
     )
 }
 
+/// A named enum member, owner-qualified like a field (`variant:Enum.Member`).
+pub fn variant_node(corpus: &str, path: &str, enum_name: &str, member: &str) -> Node {
+    Node::new(
+        ts_vname(corpus, path, &format!("variant:{enum_name}.{member}")),
+        "variant",
+    )
+}
+
 pub fn interface_node(corpus: &str, path: &str, iface_name: &str) -> Node {
     Node::new(
         ts_vname(corpus, path, &format!("interface:{iface_name}")),
