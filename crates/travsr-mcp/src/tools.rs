@@ -3971,10 +3971,20 @@ fn get_blast_radius_raw(
         if total > MAX_NAMED_SEED_FILES {
             named.push_str(&format!(" and {} more", total - MAX_NAMED_SEED_FILES));
         }
+        // The search stops at a fixed number of symbols, so when it is full
+        // other files that match can be missing from the radius.
+        let capped = if seed_nodes.len() >= travsr_store::NODE_NAME_SEARCH_LIMIT {
+            format!(
+                " (the search stops at {} symbols, so other matching files can be missing)",
+                travsr_store::NODE_NAME_SEARCH_LIMIT
+            )
+        } else {
+            String::new()
+        };
         body.push_str(&format!(
             "\n[note: no file is stored at '{file}'; this is the radius of the {total} file(s) \
-             whose name or path contains it: {named}. get_blast_radius takes a repo-relative \
-             file path.]"
+             a name search for it matched{capped}: {named}. get_blast_radius takes a \
+             repo-relative file path.]"
         ));
     }
 
@@ -12094,21 +12104,34 @@ mod tests {
         assert!(
             dir.contains(
                 "[note: no file is stored at 'src/store'; this is the radius of the 2 file(s) \
-                 whose name or path contains it: src/store/a.ts, src/store/b.ts. \
+                 a name search for it matched: src/store/a.ts, src/store/b.ts. \
                  get_blast_radius takes a repo-relative file path.]"
             ),
             "{dir}"
         );
         let base = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
         assert!(
-            base.contains(
-                "radius of the 1 file(s) whose name or path contains it: src/store/a.ts."
-            ),
+            base.contains("radius of the 1 file(s) a name search for it matched: src/store/a.ts."),
             "{base}"
         );
 
         let exact = get_blast_radius(&store, "src/store/a.ts", AnalysisMode::TreeSitter, None);
         assert!(!exact.contains("note:"), "{exact}");
+
+        // A full search may have missed matching files, and says so rather
+        // than give its file count as all of them.
+        let big: Vec<_> = (0..travsr_store::NODE_NAME_SEARCH_LIMIT)
+            .map(|i| make_node("src/big/a.ts", &format!("fn:f{i}")))
+            .chain([make_node("src/big/b.ts", "fn:g")])
+            .collect();
+        let store = make_store(&big, &[]);
+        let full = get_blast_radius(&store, "src/big", AnalysisMode::TreeSitter, None);
+        assert!(
+            full.contains(
+                "(the search stops at 100 symbols, so other matching files can be missing)"
+            ),
+            "{full}"
+        );
     }
 
     /// B → A (incoming call): blast_radius("a.ts") must include b.ts.
