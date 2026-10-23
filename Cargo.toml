@@ -77,7 +77,7 @@ opentelemetry         = { version = "0.32", default-features = false, features =
 opentelemetry_sdk     = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.33"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.11"
 tar = "0.4"
 flate2 = "1.1"
