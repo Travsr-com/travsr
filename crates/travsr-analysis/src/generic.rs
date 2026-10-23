@@ -296,11 +296,13 @@ pub fn parse_with_config(
             // and its containment edge is parented to the container node, not the
             // file. `member_qual` maps a member's signature prefix to its
             // qualified `(sig_prefix, node_kind)`: a `fn` capture becomes
-            // `method:Type.name`, a `field` capture becomes `field:Type.name`.
+            // `method:Type.name`, a `field` capture becomes `field:Type.name`,
+            // a `variant` capture becomes `variant:Enum.name`.
             // Every other prefix (var/const/type/class/import) stays file-level.
             let member_qual: Option<(&'static str, &'static str)> = match sig_prefix {
                 "fn" => Some(("method", "method")),
                 "field" => Some(("field", "field")),
+                "variant" => Some(("variant", "variant")),
                 _ => None,
             };
             let enclosing = if member_qual.is_some() {
@@ -647,6 +649,35 @@ fn container_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> 
         }
     }
     None
+}
+
+/// Test helper shared by every language module: the file's `variant` nodes
+/// are exactly `members`, each contained by the `owner` node.
+#[cfg(test)]
+pub(crate) fn assert_variants(out: &ParseOutput, owner: &str, members: &[&str]) {
+    let mut got: Vec<&str> = out
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "variant")
+        .map(|n| n.vname.signature.as_str())
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, members);
+    let id = |sig: &str| {
+        out.nodes
+            .iter()
+            .find(|n| n.vname.signature == sig)
+            .map(|n| n.id)
+            .unwrap_or_else(|| panic!("no node {sig}"))
+    };
+    for m in members {
+        assert!(
+            out.edges.iter().any(|e| e.src == id(owner)
+                && e.dst == id(m)
+                && e.kind == EdgeKind::DefinesBinding),
+            "{owner} must contain {m}"
+        );
+    }
 }
 
 #[cfg(test)]

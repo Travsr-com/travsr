@@ -37,6 +37,8 @@ const QUERIES: &str = r"
 (abstract_method_signature name: (property_identifier) @method.name)
 (public_field_definition name: (property_identifier) @field.name)
 (property_signature name: (property_identifier) @field.name)
+(enum_body (property_identifier) @variant.name)
+(enum_body (enum_assignment name: (property_identifier) @variant.name))
 (program (lexical_declaration (variable_declarator) @topvar))
 (program (export_statement (lexical_declaration (variable_declarator) @topvar)))
 (program (variable_declaration (variable_declarator) @topvar))
@@ -297,6 +299,23 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                             .with_line(line)
                             .with_end_line(line);
                         output.edges.push(emit::defines_edge(container_id, node.id));
+                        output.nodes.push(node);
+                    }
+                }
+                "variant.name" => {
+                    // A named enum member → `variant:Enum.Member`, contained by
+                    // its enum. `enum_body` only ever sits in an
+                    // `enum_declaration`, one or two hops up.
+                    let owner = std::iter::successors(capture.node.parent(), |n| n.parent())
+                        .find(|n| n.kind() == "enum_declaration")
+                        .and_then(|d| d.child_by_field_name("name"))
+                        .and_then(|n| n.utf8_text(source.as_slice()).ok());
+                    if let Some(owner) = owner {
+                        let enum_id = emit::enum_node(corpus, vname_path, owner).id;
+                        let node = emit::variant_node(corpus, vname_path, owner, text)
+                            .with_line(line)
+                            .with_end_line(line);
+                        output.edges.push(emit::defines_edge(enum_id, node.id));
                         output.nodes.push(node);
                     }
                 }
@@ -976,6 +995,30 @@ mod tests {
                 .any(|(_, s)| *s == "var:local" || *s == "var:inner"),
             "locals must be dropped; got {sigs:?}"
         );
+    }
+
+    #[test]
+    fn enum_members_are_owner_qualified_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.ts");
+        std::fs::write(&path, "enum Tone {\n  Warm = \"warm\",\n  Terse,\n}\n").unwrap();
+        let out = parse("", &path, "e.ts").unwrap();
+        let id = |sig: &str| {
+            out.nodes
+                .iter()
+                .find(|n| n.vname.signature == sig)
+                .map(|n| n.id)
+                .expect(sig)
+        };
+        for member in ["variant:Tone.Warm", "variant:Tone.Terse"] {
+            assert!(
+                out.edges
+                    .iter()
+                    .any(|e| e.src == id("enum:Tone") && e.dst == id(member)),
+                "enum:Tone must contain {member}"
+            );
+        }
+        assert_eq!(out.nodes.iter().filter(|n| n.kind == "variant").count(), 2);
     }
 
     // #757: class fields (`public_field_definition`) and interface members

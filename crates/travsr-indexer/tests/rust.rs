@@ -242,22 +242,25 @@ fn use_as_clause_indexes_original_path_not_alias() {
 // deliberately — a silent drift is a bug.
 //
 // Fixture: crates/travsr-indexer/tests/fixtures/rust/simple.rs
-// Expected structure (hand-curated, verified 2026-05-23; #757 added field×1):
-//   file×1  struct×2  field×1  enum×1  trait×1  impl×2  module×1  file-module×1
-//   function×2  method×3  constant×1  static×1  import×3
-//   = 20 nodes, 19 edges
+// Expected structure (hand-curated, verified 2026-05-23; #757 added field×1,
+// enum members added variant×2):
+//   file×1  struct×2  field×1  enum×1  variant×2  trait×1  impl×2  module×1
+//   file-module×1  function×2  method×3  constant×1  static×1  import×3
+//   = 22 nodes, 21 edges
 //   (#757: `struct Config { pub name }` now emits `field:Config.name` + its
-//    containment edge; `struct Worker;` is a unit struct with no fields.)
+//    containment edge; `struct Worker;` is a unit struct with no fields.
+//    `enum Status { Active, Inactive }` emits `variant:Status.Active` and
+//    `variant:Status.Inactive`, each contained by `enum:Status`.)
 
-/// Exact node count for the simple.rs fixture must remain 20.
+/// Exact node count for the simple.rs fixture must remain 22.
 /// Update this number deliberately when the fixture or parser changes.
 #[test]
 fn golden_simple_fixture_node_count() {
     let out = parse_fixture();
     assert_eq!(
         out.nodes.len(),
-        20,
-        "expected exactly 20 nodes from simple.rs, update golden if fixture changed.\n\
+        22,
+        "expected exactly 22 nodes from simple.rs, update golden if fixture changed.\n\
          Actual nodes:\n{}",
         out.nodes
             .iter()
@@ -267,14 +270,14 @@ fn golden_simple_fixture_node_count() {
     );
 }
 
-/// Exact edge count for the simple.rs fixture must remain 19.
+/// Exact edge count for the simple.rs fixture must remain 21.
 #[test]
 fn golden_simple_fixture_edge_count() {
     let out = parse_fixture();
     assert_eq!(
         out.edges.len(),
-        19,
-        "expected exactly 19 edges from simple.rs, update golden if fixture changed."
+        21,
+        "expected exactly 21 edges from simple.rs, update golden if fixture changed."
     );
 }
 
@@ -290,6 +293,8 @@ fn golden_simple_fixture_all_expected_nodes_present() {
         ("field", "field:Config.name"),
         ("struct", "struct:Worker"),
         ("enum", "enum:Status"),
+        ("variant", "variant:Status.Active"),
+        ("variant", "variant:Status.Inactive"),
         ("trait", "trait:Processor"),
         ("impl", "impl:Config"),
         ("impl", "impl:Worker"),
@@ -370,6 +375,8 @@ fn golden_simple_fixture_no_unexpected_nodes() {
         "field:Config.name",
         "struct:Worker",
         "enum:Status",
+        "variant:Status.Active",
+        "variant:Status.Inactive",
         "trait:Processor",
         "impl:Config",
         "impl:Worker",

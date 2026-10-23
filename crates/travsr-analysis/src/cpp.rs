@@ -15,6 +15,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (struct_specifier name: (type_identifier) @struct.name)
 (union_specifier name: (type_identifier) @union.name)
 (enum_specifier name: (type_identifier) @enum.name)
+(enumerator name: (identifier) @variant.name)
 (namespace_definition name: (namespace_identifier) @namespace.name)
 (alias_declaration name: (type_identifier) @using.name)
 (function_declarator declarator: (identifier) @fn.name)
@@ -35,6 +36,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("namespace.name", "namespace", "namespace"),
         ("using.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         // An out-of-line member definition (`void Zoo::add(..) {..}`) is a method
         // of the class its scope names; `qualified_member` builds `Zoo.add`.
         ("member.name", "method", "method"),
@@ -53,6 +56,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class_specifier", "class"),
         ("struct_specifier", "struct"),
         ("union_specifier", "struct"),
+        ("enum_specifier", "enum"),
     ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
@@ -337,5 +341,18 @@ mod tests {
             .collect();
         assert!(sigs.contains(&"macro:PI"), "got {sigs:?}");
         assert!(sigs.contains(&"macro:SQ"), "got {sigs:?}");
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.cpp");
+        std::fs::write(&path, "class W {\n  enum class Mode { On, Off };\n};\n").unwrap();
+        let out = parse("", &path, "e.cpp").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Mode",
+            &["variant:Mode.Off", "variant:Mode.On"],
+        );
     }
 }

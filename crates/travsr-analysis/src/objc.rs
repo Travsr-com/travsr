@@ -44,6 +44,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (field_declaration declarator: (field_identifier) @field.name)
 (field_declaration declarator: (pointer_declarator declarator: (field_identifier) @field.name))
 (field_declaration declarator: (array_declarator declarator: (field_identifier) @field.name))
+(enum_specifier name: (type_identifier) @enum.name)
+(enumerator name: (identifier) @variant.name)
 (preproc_include path: (_) @import)
 (module_import (identifier) @import)
 "#,
@@ -51,8 +53,11 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class.name", "class", "class"),
         ("impl.name", "impl", "impl"),
         ("protocol.name", "protocol", "protocol"),
+        ("enum.name", "enum", "enum"),
         ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         // #757: ivars (`@interface { int _x; }`) and `@property` declarations →
         // `field:Owner.name`, contained by the interface/implementation.
         ("field.name", "field", "field"),
@@ -65,6 +70,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         // A C struct's members, as in `c.rs`.
         ("struct_specifier", "struct"),
         ("union_specifier", "struct"),
+        ("enum_specifier", "enum"),
     ],
     decl_kinds: &["function_definition"],
     type_refinements: &[],
@@ -719,5 +725,18 @@ mod tests {
         ] {
             assert!(sigs.contains(&want), "missing {want}, got {sigs:?}");
         }
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.m");
+        std::fs::write(&path, "enum Dir { DirUp, DirDown };\n").unwrap();
+        let out = parse("", &path, "e.m").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Dir",
+            &["variant:Dir.DirDown", "variant:Dir.DirUp"],
+        );
     }
 }

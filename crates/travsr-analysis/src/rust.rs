@@ -47,6 +47,7 @@ const QUERIES: &str = "
 (type_item name: (type_identifier) @type.name)
 (union_item name: (type_identifier) @union.name)
 (field_declaration name: (field_identifier) @field.name)
+(enum_variant name: (identifier) @variant.name)
 (use_declaration) @use.decl
 ";
 
@@ -287,15 +288,18 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                     output.nodes.push(node);
                 }
                 "field.name" => {
-                    // #757: named struct fields become `field:Owner.name` nodes,
-                    // owner-qualified (collision-free per Invariant #1) and
-                    // contained by their struct — mirroring the Go path
-                    // (`field:Struct.name`). Only named `struct` fields are in
-                    // scope for v1: `rust_struct_field_owner` returns `None` for
-                    // tuple structs (no `field_declaration`), enum-variant fields
-                    // (owner would be the variant, not the enum), and union fields.
-                    let Some(owner) = rust_struct_field_owner(capture.node, source.as_slice())
-                    else {
+                    // #757: named struct and union fields become `field:Owner.name`
+                    // nodes, owner-qualified (collision-free per Invariant #1) and
+                    // contained by their owner, mirroring the Go path
+                    // (`field:Struct.name`). A union's node is `struct:U`, so the
+                    // same containment edge serves both. `rust_member_owner`
+                    // returns `None` for tuple structs (no `field_declaration`)
+                    // and enum-variant fields (owner would be the variant).
+                    let Some(owner) = rust_member_owner(
+                        capture.node,
+                        source.as_slice(),
+                        &["struct_item", "union_item"],
+                    ) else {
                         continue;
                     };
                     let struct_id = rust_struct_node(corpus, vname_path, &owner).id;
@@ -303,6 +307,21 @@ pub fn parse(corpus: &str, abs_path: &Path, vname_path: &str) -> anyhow::Result<
                         .with_line(line)
                         .with_end_line(line);
                     output.edges.push(emit::defines_edge(struct_id, node.id));
+                    output.nodes.push(node);
+                }
+                "variant.name" => {
+                    // A named enum member → `variant:Enum.Member`, contained by
+                    // its enum, the same shape as a field under its struct.
+                    let Some(owner) =
+                        rust_member_owner(capture.node, source.as_slice(), &["enum_item"])
+                    else {
+                        continue;
+                    };
+                    let enum_id = rust_enum_node(corpus, vname_path, &owner).id;
+                    let node = rust_variant_node(corpus, vname_path, &owner, text)
+                        .with_line(line)
+                        .with_end_line(line);
+                    output.edges.push(emit::defines_edge(enum_id, node.id));
                     output.nodes.push(node);
                 }
                 "use.decl" => {
@@ -360,18 +379,23 @@ fn has_impl_or_trait_ancestor(node: tree_sitter::Node<'_>) -> bool {
     false
 }
 
-/// #757: resolve the owning struct name for a `field_identifier` capture, or
-/// `None` when the field is not a named `struct` member (v1 scope). In
-/// tree-sitter-rust a named struct field is exactly:
-/// `field_identifier → field_declaration → field_declaration_list → struct_item`.
+/// #757: resolve the owning item name for a member name capture, or `None`
+/// when the owner three hops up is not one of `owner_kinds`. In
+/// tree-sitter-rust both members have that shape:
+/// `field_identifier → field_declaration → field_declaration_list → struct_item | union_item`
+/// and `identifier → enum_variant → enum_variant_list → enum_item`.
 /// Tuple structs use `ordered_field_declaration_list` (no `field_declaration`,
-/// so the capture never fires), and enum-variant / union fields resolve to an
-/// owner node that is not a `struct_item`, so they are skipped here.
-fn rust_struct_field_owner(name_node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    let field_decl = name_node.parent()?; // field_declaration
-    let list = field_decl.parent()?; // field_declaration_list
-    let owner = list.parent()?; // struct_item (or enum_variant / union_item)
-    if owner.kind() != "struct_item" {
+/// so the capture never fires), and enum-variant fields resolve to an
+/// `enum_variant` owner, so they are skipped here.
+fn rust_member_owner(
+    name_node: tree_sitter::Node<'_>,
+    source: &[u8],
+    owner_kinds: &[&str],
+) -> Option<String> {
+    let decl = name_node.parent()?; // field_declaration / enum_variant
+    let list = decl.parent()?; // field_declaration_list / enum_variant_list
+    let owner = list.parent()?;
+    if !owner_kinds.contains(&owner.kind()) {
         return None;
     }
     let name = owner
@@ -621,6 +645,14 @@ fn rust_field_node(corpus: &str, path: &str, owner: &str, field: &str) -> Node {
     Node::new(
         rust_vname(corpus, path, &format!("field:{owner}.{field}")),
         "field",
+    )
+}
+
+/// A named enum member, owner-qualified like a field (`variant:Enum.Member`).
+fn rust_variant_node(corpus: &str, path: &str, owner: &str, variant: &str) -> Node {
+    Node::new(
+        rust_vname(corpus, path, &format!("variant:{owner}.{variant}")),
+        "variant",
     )
 }
 
@@ -956,26 +988,49 @@ mod tests {
     }
 
     #[test]
-    fn enum_variant_and_union_fields_are_out_of_scope() {
+    fn enum_variants_and_union_fields_are_members() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("e.rs");
         std::fs::write(
             &path,
-            b"enum E {\n    V { x: u32 },\n}\nunion U {\n    f: u32,\n}\n",
+            b"enum E {\n    V { x: u32 },\n    W,\n}\nunion U {\n    f: u32,\n}\n",
         )
         .unwrap();
         let out = parse("", &path, "e.rs").unwrap();
-        // v1 scope is named struct fields only; enum-variant and union members
-        // resolve to a non-`struct_item` owner and are skipped.
-        assert!(
-            !out.nodes.iter().any(|n| n.kind == "field"),
-            "no field nodes for enum-variant / union members in v1, got {:?}",
+        let sigs = |kind: &str| {
+            let mut v: Vec<&str> = out
+                .nodes
+                .iter()
+                .filter(|n| n.kind == kind)
+                .map(|n| n.vname.signature.as_str())
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // Named enum members are `variant:Enum.Member` and union members are
+        // fields of `struct:U`. A variant's own fields (`V { x }`) stay out:
+        // their owner is the variant, which is not a type.
+        assert_eq!(sigs("variant"), ["variant:E.V", "variant:E.W"]);
+        assert_eq!(sigs("field"), ["field:U.f"]);
+        let id = |sig: &str| {
             out.nodes
                 .iter()
-                .filter(|n| n.kind == "field")
-                .map(|n| &n.vname.signature)
-                .collect::<Vec<_>>()
-        );
+                .find(|n| n.vname.signature == sig)
+                .map(|n| n.id)
+                .expect(sig)
+        };
+        for (owner, member) in [
+            ("enum:E", "variant:E.V"),
+            ("enum:E", "variant:E.W"),
+            ("struct:U", "field:U.f"),
+        ] {
+            assert!(
+                out.edges
+                    .iter()
+                    .any(|e| e.src == id(owner) && e.dst == id(member)),
+                "{owner} must contain {member}"
+            );
+        }
     }
 
     #[test]
