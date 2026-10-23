@@ -369,13 +369,13 @@ fn handle_tool_call(
                 .as_u64()
                 .or_else(|| args["k"].as_str().and_then(|s| s.parse::<u64>().ok()))
                 .unwrap_or(200) as u32;
-            tools::embed_knn_probe(store, query, k)
+            crate::sanitize::sanitize_for_mcp(&tools::embed_knn_probe(store, query, k))
         }
         // DIAGNOSTIC (#462 WS0): per-query seed-cascade trace (GATE vs DROP-@-stage).
         // Hidden — not in tools/list; call by name. No shipping path depends on it.
         "seed_trace" => {
             let query = args["query"].as_str().unwrap_or("");
-            tools::seed_trace(store, query)
+            crate::sanitize::sanitize_for_mcp(&tools::seed_trace(store, query))
         }
         "get_graph_json" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -1915,6 +1915,46 @@ mod tests {
         }
         let ok = call(serde_json::json!({ "symbol": "run" }));
         assert!(ok["result"]["isError"].is_null(), "{ok}");
+    }
+
+    /// #1014: the hidden diagnostics answer inside the envelope like every
+    /// other tool, and `seed_trace` still traces the exact and lexical legs
+    /// when embeddings are off (no KNN hook on an in-memory store).
+    #[test]
+    fn hidden_diagnostics_answer_inside_the_envelope() {
+        use travsr_core::{Node, VName};
+        use travsr_store::Store;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let node = Node::new(
+            VName::new("c", "", "src/blast.rs", "rust", "fn:blast_radius"),
+            "function",
+        );
+        store.put_node(&node).unwrap();
+        for (tool, args) in [
+            ("seed_trace", serde_json::json!({ "query": "blast_radius" })),
+            (
+                "embed_knn_probe",
+                serde_json::json!({ "query": "blast_radius", "k": 3 }),
+            ),
+        ] {
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/call".into(),
+                params: Some(serde_json::json!({ "name": tool, "arguments": args })),
+            };
+            let resp = handle_request(&mut store, req).expect("tools/call answers");
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+            assert!(
+                text.starts_with("<travsr-data>") && text.ends_with("</travsr-data>"),
+                "{tool}: {text}"
+            );
+            if tool == "seed_trace" {
+                assert!(text.contains("FINAL\texact\t"), "{text}");
+                assert!(text.contains("fn:blast_radius\tsrc/blast.rs"), "{text}");
+            }
+        }
     }
 
     /// The VS Code client sends every argument as a string, numbers and
