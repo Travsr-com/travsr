@@ -3899,10 +3899,10 @@ fn get_blast_radius_raw(
                         if !resolver.resolves_to(imp_sig, imp_path, &target_file) {
                             continue;
                         }
-                        resolved_imports.insert(idx);
                         let Ok(edges) = store.iter_edges_to(*imp_id) else {
                             continue;
                         };
+                        resolved_imports.insert(idx);
                         let dep_srcs: Vec<NodeId> = edges
                             .iter()
                             .filter(|e| matches!(e.kind, EdgeKind::Depends))
