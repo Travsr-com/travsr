@@ -214,6 +214,19 @@ fn version_is_skewed(daemon_version: Option<&str>, our_version: &str) -> bool {
     daemon_version != Some(our_version)
 }
 
+/// Whether a daemon started from `daemon_exe` runs this binary's path, so a
+/// version skew means this path was rebuilt or upgraded and the daemon is the
+/// stale one. A different copy (a scratch build, an editor's bundled binary)
+/// must not replace it: it may lack the emitters the daemon finds beside its
+/// own path. `None` is a daemon from before the field, kept replaceable.
+fn daemon_runs_our_exe(daemon_exe: Option<&str>, our_exe: &Path) -> bool {
+    let Some(daemon_exe) = daemon_exe else {
+        return true;
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(Path::new(daemon_exe)) == canon(our_exe)
+}
+
 /// Acquire the single-flight restart lock, or `None` when another process
 /// already holds it (i.e. is mid-restart). The returned handle must be kept for
 /// the whole restart; dropping it releases the lock. Self-healing: the OS drops
@@ -232,7 +245,8 @@ fn try_lock_restart(repo_root: &Path) -> Option<std::fs::File> {
 }
 
 /// Restart the running daemon if it was built from a different binary than this
-/// one, so queries and background reindexing are served by current code.
+/// one at the same path, so queries and background reindexing are served by
+/// current code.
 ///
 /// The daemon runs the image it was spawned with for its entire life; installing
 /// a new binary (npm, `travsr install`) leaves the old daemon serving old code
@@ -251,7 +265,9 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
         return; // transiently unreachable (starting, busy pipe) — leave it be
     };
-    if !version_is_skewed(resp.daemon_version.as_deref(), our_build_version()) {
+    if !version_is_skewed(resp.daemon_version.as_deref(), our_build_version())
+        || !daemon_runs_our_exe(resp.daemon_exe.as_deref(), exe)
+    {
         return;
     }
     // Single-flight: only the lock holder performs the swap, so two concurrent
@@ -459,6 +475,26 @@ mod lock_tests {
             version_is_skewed(Some("1.2.3+0a1b"), "1.2.3+9f8e"),
             "same version, rebuilt binary"
         );
+    }
+
+    /// Only a daemon running this binary's own path is replaced on a skew. A
+    /// scratch build elsewhere took over this repo's daemon, could not find the
+    /// TypeScript emitter from its own directory, and left that in the index.
+    #[test]
+    fn only_a_daemon_on_our_path_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("travsr");
+        let other = dir.path().join("scratch-travsr");
+        std::fs::write(&ours, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        let ours_s = ours.to_str().unwrap();
+        assert!(daemon_runs_our_exe(Some(ours_s), &ours), "same path");
+        assert!(!daemon_runs_our_exe(Some(ours_s), &other), "another copy");
+        assert!(daemon_runs_our_exe(None, &other), "pre-field daemon");
+        // A path spelled through a parent `..` is still the same file.
+        let dotted = dir.path().join("x").join("..").join("travsr");
+        std::fs::create_dir(dir.path().join("x")).unwrap();
+        assert!(daemon_runs_our_exe(dotted.to_str(), &ours), "same file");
     }
 
     /// #974: two builds of one version must not compare equal, or a rebuilt

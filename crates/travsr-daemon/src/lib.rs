@@ -97,6 +97,19 @@ pub fn build_version() -> &'static str {
         .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
+/// The executable this daemon was started from, read once. The session start
+/// reads it first: on Linux `current_exe` of a binary replaced by a rebuild
+/// reads as `<path> (deleted)`, which would no longer match the client's path.
+pub fn daemon_exe() -> Option<&'static str> {
+    static EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .as_deref()
+}
+
 /// Statistics returned by [`init_repo`] and displayed by `travsr init`.
 #[derive(Debug, Default)]
 pub struct InitStats {
@@ -14968,6 +14981,7 @@ impl Daemon {
             target: SESSION_LOG_TARGET,
             event = "daemon.session.start",
             version = build_version(),
+            exe = daemon_exe().unwrap_or(""),
             pid = std::process::id(),
             repo = %repo_root.display(),
             // What this file will and will not contain, and who decided. Without
@@ -16897,6 +16911,7 @@ fn handle_control_message(
             // binary does not touch it).
             let mut resp = ControlResponse::ok(Some(msg));
             resp.daemon_version = Some(build_version().to_string());
+            resp.daemon_exe = daemon_exe().map(str::to_string);
             (resp, false)
         }
         Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
