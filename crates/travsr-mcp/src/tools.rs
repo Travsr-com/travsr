@@ -3673,8 +3673,10 @@ fn get_blast_radius_raw(
     // Seed from every node at the exact path (#1004: the name search caps at
     // 100 and drops most of a large file); fall back to the name search for a
     // path that is not stored verbatim.
+    let mut loose = false;
     let seed_nodes = match store.nodes_at_path(file).and_then(|n| {
         if n.is_empty() {
+            loose = true;
             store.search_nodes_by_name(file)
         } else {
             Ok(n)
@@ -3721,6 +3723,12 @@ fn get_blast_radius_raw(
     //   target file, a local `seen_here` set dedups candidate import nodes so
     //   the pure `resolves_to` runs at most once per candidate.)
     let mut phase2_done: HashSet<String> = HashSet::new();
+    // #1015: import nodes that already resolved to some reached file. What a
+    // resolved import contributes (its `Depends` importers) does not depend on
+    // which file it resolved to, so it is never checked again. On kubernetes'
+    // core/v1/types.go this skipped 43% of 31M `resolves_to` calls and 91% of
+    // the edge lookups behind them.
+    let mut resolved_imports: HashSet<usize> = HashSet::new();
 
     // Phase-2 candidate index, built once per call from a single bulk load.
     // Transitive resolution (#613) re-resolves importers for every newly reached
@@ -3881,7 +3889,7 @@ fn get_blast_radius_raw(
                         continue;
                     };
                     for &idx in cands {
-                        if !seen_here.insert(idx) {
+                        if resolved_imports.contains(&idx) || !seen_here.insert(idx) {
                             continue;
                         }
                         let (imp_id, imp_sig, imp_lang, imp_path) = &import_records[idx];
@@ -3896,6 +3904,7 @@ fn get_blast_radius_raw(
                         let Ok(edges) = store.iter_edges_to(*imp_id) else {
                             continue;
                         };
+                        resolved_imports.insert(idx);
                         let dep_srcs: Vec<NodeId> = edges
                             .iter()
                             .filter(|e| matches!(e.kind, EdgeKind::Depends))
@@ -3951,6 +3960,38 @@ fn get_blast_radius_raw(
         body.push_str(&format!(
             "\n[note: showing the {cap} files nearest the change; more are affected, \
              raise max_files for more]"
+        ));
+    }
+    // #1012: a directory or a bare name matches nodes in many files; say which
+    // files the radius was computed for rather than pass it off as the path's.
+    if loose {
+        let mut seed_files: Vec<&str> = seed_nodes
+            .iter()
+            .map(|n| n.vname.path.as_str())
+            .filter(|p| !p.is_empty())
+            .collect();
+        seed_files.sort();
+        seed_files.dedup();
+        const MAX_NAMED_SEED_FILES: usize = 10;
+        let total = seed_files.len();
+        let mut named = seed_files[..total.min(MAX_NAMED_SEED_FILES)].join(", ");
+        if total > MAX_NAMED_SEED_FILES {
+            named.push_str(&format!(" and {} more", total - MAX_NAMED_SEED_FILES));
+        }
+        // The search stops at a fixed number of symbols, so when it is full
+        // other files that match can be missing from the radius.
+        let capped = if seed_nodes.len() >= travsr_store::NODE_NAME_SEARCH_LIMIT {
+            format!(
+                " (the search stops at {} symbols, so other matching files can be missing)",
+                travsr_store::NODE_NAME_SEARCH_LIMIT
+            )
+        } else {
+            String::new()
+        };
+        body.push_str(&format!(
+            "\n[note: no file is stored at '{file}'; this is the radius of the {total} file(s) \
+             a name search for it matched{capped}: {named}. get_blast_radius takes a \
+             repo-relative file path.]"
         ));
     }
 
@@ -9092,14 +9133,13 @@ fn seed_source_display(source: crate::seed::SeedSource) -> &'static str {
 /// A gold present in RAWKNN but absent from KNNSEED dropped at `embed_path_seeds`;
 /// present in KNNSEED but absent from FINAL dropped at semantic_validate/scope;
 /// present in FINAL with `CONF none` is a GATE (abstain) case.
+///
+/// With embeddings off, RAWKNN and KNNSEED are replaced by one
+/// `[embed KNN unavailable, ...]` line and the remaining stages still run.
 pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
     if validate_mcp_arg(query).is_err() {
         return String::new();
     }
-    let knn_fn = match store.embed_knn_fn() {
-        Some(f) => f,
-        None => return "[embed KNN unavailable, embeddings not wired]".to_string(),
-    };
     let mut out = String::new();
 
     // Calibration anchors for the active model (identity for bge/un-calibrated).
@@ -9108,9 +9148,11 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
 
     let fmt_loc = |n: &CoreNode| n.line.map(|l| format!(":{l}")).unwrap_or_default();
 
-    // Stage 1: raw embed-KNN (top 50), identical source to embed_knn_probe.
-    let raw = knn_fn(query, 50);
-    {
+    // #1014: with embeddings off the KNN stages are skipped and the exact and
+    // lexical legs are still traced, the same inputs get_context uses then.
+    let (knn_selected, knn_oracle) = if let Some(knn_fn) = store.embed_knn_fn() {
+        // Stage 1: raw embed-KNN (top 50), identical source to embed_knn_probe.
+        let raw = knn_fn(query, 50);
         let ids: Vec<NodeId> = raw.iter().map(|&(id, _)| id).collect();
         let nodes = store.get_nodes(&ids).unwrap_or_default();
         let by_id: HashMap<NodeId, &CoreNode> = nodes.iter().map(|n| (n.id, n)).collect();
@@ -9126,20 +9168,24 @@ pub fn seed_trace(store: &SqliteStore, query: &str) -> String {
                 ));
             }
         }
-    }
 
-    // Stage 2: seeds selected by embed_path_seeds (the first hard KNN filter).
-    let (knn_selected, _n_elig, _ms, knn_oracle) =
-        embed_path_seeds(store, query, &knn_fn, &OpenFilter);
-    for (n, cos) in &knn_selected {
-        out.push_str(&format!(
-            "KNNSEED\t{:.4}\t{}\t{}{}\n",
-            cos,
-            n.vname.signature,
-            n.vname.path,
-            fmt_loc(n)
-        ));
-    }
+        // Stage 2: seeds selected by embed_path_seeds (the first hard KNN filter).
+        let (knn_selected, _n_elig, _ms, knn_oracle) =
+            embed_path_seeds(store, query, &knn_fn, &OpenFilter);
+        for (n, cos) in &knn_selected {
+            out.push_str(&format!(
+                "KNNSEED\t{:.4}\t{}\t{}{}\n",
+                cos,
+                n.vname.signature,
+                n.vname.path,
+                fmt_loc(n)
+            ));
+        }
+        (knn_selected, knn_oracle)
+    } else {
+        out.push_str("[embed KNN unavailable, embeddings not wired]\n");
+        (vec![], HashMap::new())
+    };
 
     // Stage 3: full build_seed_set — final surviving seeds + confidence.
     let score_fn = store.embed_score_fn();
@@ -9857,6 +9903,7 @@ fn get_graph_json_raw(
     // node would exceed the budget, stop adding nodes (mirrors the node cap).
     let mut tokens_used = 0usize;
     let mut truncated_by_budget = false;
+    let mut truncated = false;
     // Tracks JSON ids already in nodes_out. Two different DB rows can share the
     // same signature (Phase B stores the same symbol once per referencing file).
     // Deduplicate here so Cytoscape never sees two nodes with the same id.
@@ -9895,6 +9942,12 @@ fn get_graph_json_raw(
         if token_budget > 0 && !nodes_out.is_empty() && tokens_used + node_tokens > token_budget {
             truncated_by_budget = true;
             continue;
+        }
+        // #1013: the cap bounds the answer, not only the expansion; nodes
+        // queued before it was reached used to be emitted anyway.
+        if nodes_out.len() >= MAX_GRAPH_JSON_NODES {
+            truncated = true;
+            break;
         }
 
         let json_id = node_json_id(&node);
@@ -10151,6 +10204,48 @@ fn get_graph_json_raw(
             Vec::new()
         };
 
+    // #1013: the BFS charges `token_cost`, a fraction of a node's JSON, and
+    // nothing for edges, which are most of the bytes. Charge what is returned:
+    // each node's JSON plus every edge whose later endpoint it is (an edge
+    // survives a prefix cut exactly when that endpoint does), then keep the
+    // longest BFS prefix that fits. The seed always survives.
+    if token_budget > 0 && !nodes_out.is_empty() {
+        let index: HashMap<&str, usize> = nodes_out
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
+            .collect();
+        let at = |e: &serde_json::Value, end: &str| {
+            index
+                .get(e[end].as_str().unwrap_or(""))
+                .copied()
+                .unwrap_or(0)
+        };
+        let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
+        for e in &edges_out {
+            cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
+        }
+        // The header returned with the graph comes out of the same budget.
+        let header = coverage.to_string().len()
+            + serde_json::to_string(&ambiguous_candidates).map_or(0, |s| s.len());
+        let budget_bytes = token_budget
+            .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
+            .saturating_sub(header);
+        let mut used = cost[0];
+        let mut keep = 1;
+        while keep < cost.len() && used + cost[keep] <= budget_bytes {
+            used += cost[keep];
+            keep += 1;
+        }
+        if keep < nodes_out.len() {
+            truncated_by_budget = true;
+            // The budget, not the node cap, is what bounds this answer.
+            truncated = false;
+            edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
+            nodes_out.truncate(keep);
+        }
+    }
+
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
     // `nodes`/`edges`; the global merge likewise ignores extra keys.
     mark_heuristic_edges(&mut edges_out);
@@ -10166,6 +10261,10 @@ fn get_graph_json_raw(
     if token_budget > 0 {
         out["token_budget"] = serde_json::json!(token_budget);
         out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    if truncated {
+        out["truncated"] = serde_json::json!(true);
+        out["max_nodes"] = serde_json::json!(MAX_GRAPH_JSON_NODES);
     }
     // #617 + #661 WS-D: degraded-state signals — additive envelope field; first-
     // party consumers read only `nodes`/`edges` and ignore extra keys. Phase-B
@@ -12057,6 +12156,49 @@ mod tests {
         );
     }
 
+    /// #1012: a path with no node stored at it (a directory, a bare file name)
+    /// falls back to the name search; the answer says which files the radius
+    /// was computed for instead of passing it off as the radius of the path.
+    #[test]
+    fn blast_radius_names_the_files_a_loose_path_resolved_to() {
+        let a = make_node("src/store/a.ts", "fn:a");
+        let b = make_node("src/store/b.ts", "fn:b");
+        let store = make_store(&[a, b], &[]);
+
+        let dir = get_blast_radius(&store, "src/store", AnalysisMode::TreeSitter, None);
+        assert!(
+            dir.contains(
+                "[note: no file is stored at 'src/store'; this is the radius of the 2 file(s) \
+                 a name search for it matched: src/store/a.ts, src/store/b.ts. \
+                 get_blast_radius takes a repo-relative file path.]"
+            ),
+            "{dir}"
+        );
+        let base = get_blast_radius(&store, "a.ts", AnalysisMode::TreeSitter, None);
+        assert!(
+            base.contains("radius of the 1 file(s) a name search for it matched: src/store/a.ts."),
+            "{base}"
+        );
+
+        let exact = get_blast_radius(&store, "src/store/a.ts", AnalysisMode::TreeSitter, None);
+        assert!(!exact.contains("note:"), "{exact}");
+
+        // A full search may have missed matching files, and says so rather
+        // than give its file count as all of them.
+        let big: Vec<_> = (0..travsr_store::NODE_NAME_SEARCH_LIMIT)
+            .map(|i| make_node("src/big/a.ts", &format!("fn:f{i}")))
+            .chain([make_node("src/big/b.ts", "fn:g")])
+            .collect();
+        let store = make_store(&big, &[]);
+        let full = get_blast_radius(&store, "src/big", AnalysisMode::TreeSitter, None);
+        assert!(
+            full.contains(
+                "(the search stops at 100 symbols, so other matching files can be missing)"
+            ),
+            "{full}"
+        );
+    }
+
     /// B → A (incoming call): blast_radius("a.ts") must include b.ts.
     #[test]
     fn blast_radius_follows_incoming_edges() {
@@ -13316,6 +13458,72 @@ mod tests {
             "seed must survive any budget: {capped}"
         );
         assert!(capped.len() < unbounded.len());
+    }
+
+    /// #1013: a hub seed with more neighbours than the node cap. The cap must
+    /// bound the answer (it used to stop expansion only, and every queued node
+    /// was still emitted), and `token_budget` must bound the JSON actually
+    /// returned, edges included.
+    #[test]
+    fn get_graph_json_bounds_nodes_and_honours_the_token_budget() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        use travsr_store::Store;
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let seed = Node::new(
+            VName::new("test", "", "src/seed.ts", "typescript", "fn:seed"),
+            "function",
+        );
+        store.put_node(&seed).unwrap();
+        for i in 0..300 {
+            let n = Node::new(
+                VName::new(
+                    "test",
+                    "",
+                    format!("src/dep{i}.ts"),
+                    "typescript",
+                    format!("fn:dep{i}"),
+                ),
+                "function",
+            );
+            store.put_node(&n).unwrap();
+            store
+                .put_edge(&Edge::new(seed.id, n.id, EdgeKind::RefCall))
+                .unwrap();
+        }
+        let call = |token_budget: usize| -> serde_json::Value {
+            let raw = get_graph_json(
+                &store,
+                &GraphJsonParams {
+                    query: "fn:seed",
+                    direction: "deps",
+                    depth: 1,
+                    token_budget,
+                    ..Default::default()
+                },
+            );
+            serde_json::from_str(&raw).unwrap()
+        };
+
+        let all = call(0);
+        assert_eq!(all["nodes"].as_array().unwrap().len(), MAX_GRAPH_JSON_NODES);
+        assert_eq!(all["truncated"], true, "{}", all["truncated"]);
+        assert_eq!(all["max_nodes"], MAX_GRAPH_JSON_NODES);
+
+        let budget = 1000;
+        let capped = call(budget);
+        let body = capped["nodes"].to_string().len()
+            + capped["edges"].to_string().len()
+            + capped["coverage"].to_string().len();
+        assert!(
+            body / travsr_retrieval::TOKEN_CHARS_PER_TOKEN <= budget,
+            "{body} bytes for a {budget} token budget"
+        );
+        assert_eq!(capped["truncated_by_budget"], true);
+        // The budget cut it, not the node cap.
+        assert!(capped.get("truncated").is_none(), "{capped}");
+        assert_eq!(capped["nodes"][0]["id"], all["nodes"][0]["id"]);
+        let kept = capped["nodes"].as_array().unwrap().len();
+        assert_eq!(capped["edges"].as_array().unwrap().len(), kept - 1);
     }
 
     // ── P3 overview / LOD tests ────────────────────────────────────────────────

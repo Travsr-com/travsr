@@ -15,6 +15,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (interface_declaration name: (identifier) @interface.name)
 (struct_declaration name: (identifier) @struct.name)
 (enum_declaration name: (identifier) @enum.name)
+(enum_member_declaration name: (identifier) @variant.name)
 (record_declaration name: (identifier) @class.name)
 (delegate_declaration name: (identifier) @delegate.name)
 (method_declaration name: (identifier) @fn.name)
@@ -41,6 +42,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("delegate.name", "delegate", "type"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         // #757: fields and auto-properties → `field:Owner.name`, contained by
         // their type. `field_declaration` and `property_declaration` only occur
         // in a type body, never a method body (locals are
@@ -140,5 +143,18 @@ mod tests {
                 && e.dst == method.id
         });
         assert!(contained, "struct:Point must contain method:Point.Norm");
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.cs");
+        std::fs::write(&path, "enum Color { Red, Green = 2 }\n").unwrap();
+        let out = parse("", &path, "e.cs").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Color",
+            &["variant:Color.Green", "variant:Color.Red"],
+        );
     }
 }

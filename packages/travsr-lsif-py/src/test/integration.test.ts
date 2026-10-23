@@ -519,6 +519,21 @@ test('a method call on a type-annotated local resolves', async () => {
   assert.deepStrictEqual(refs, [{ path: 'app.py', signature: 'method:App.add_url_rule' }]);
 });
 
+test('an enum member read references variant:Class.NAME across files', async () => {
+  // python.rs writes an `Enum` subclass's members as `variant:Outcome.PASS`;
+  // a plain class attribute (`Plain.A`) is not a member and stays unresolved.
+  const refs = await refsFrom(
+    {
+      'e.py':
+        'from enum import Enum\n\n\nclass Outcome(str, Enum):\n    PASS = "p"\n    FAIL = "f"\n\n\n' +
+        'class Plain:\n    A = 1\n',
+      'use.py': 'from e import Outcome, Plain\n\n\ndef go():\n    return Outcome.FAIL, Plain.A\n',
+    },
+    'use.py'
+  );
+  assert.deepStrictEqual(refs, [{ path: 'e.py', signature: 'variant:Outcome.FAIL' }]);
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function parseAll(stdout: string): Record<string, unknown>[] {

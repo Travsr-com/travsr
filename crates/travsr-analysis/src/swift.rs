@@ -14,6 +14,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (class_declaration declaration_kind: "class"     name: (type_identifier) @class.name)
 (class_declaration declaration_kind: "struct"    name: (type_identifier) @struct.name)
 (class_declaration declaration_kind: "enum"      name: (type_identifier) @enum.name)
+(enum_entry name: (simple_identifier) @variant.name)
 (class_declaration declaration_kind: "actor"     name: (type_identifier) @actor.name)
 (class_declaration declaration_kind: "extension" name: (user_type (type_identifier) @extension.name))
 (protocol_declaration name: (type_identifier) @protocol.name)
@@ -50,6 +51,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("protocol.name", "protocol", "class"),
         ("typealias.name", "type", "type"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         ("init.name", "init", "fn"),
         ("import", "import", "import"),
         // #449/#757: properties (`static let shared`, `var count`) become
@@ -386,6 +389,19 @@ mod tests {
         assert!(
             !sigs.iter().any(|s| s.starts_with("method:Cat.init(")),
             "must not emit the full declaration text as the signature, got: {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.swift");
+        std::fs::write(&path, "enum E {\n    case a, b\n    case c(Int)\n}\n").unwrap();
+        let out = parse("", &path, "e.swift").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:E",
+            &["variant:E.a", "variant:E.b", "variant:E.c"],
         );
     }
 }

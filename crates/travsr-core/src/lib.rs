@@ -1395,7 +1395,12 @@ fn file_parent_dir(fp: &str) -> String {
 
 /// True when `haystack` equals `needle` OR `haystack` ends with `/<needle>`.
 fn path_suffix_match(haystack: &str, needle: &str) -> bool {
-    haystack == needle || haystack.ends_with(&format!("/{needle}"))
+    // No `format!("/{needle}")`: blast radius calls this millions of times on
+    // a hub file (#1015).
+    haystack == needle
+        || haystack
+            .strip_suffix(needle)
+            .is_some_and(|rest| rest.ends_with('/'))
 }
 
 /// Shared logic for dot-separated languages (Java, Kotlin, Scala, C#).
@@ -1865,6 +1870,20 @@ mod tests {
         assert!(!r.resolves_to("import:k8s.io/api/core", "pkg/a.go", f));
         // Stdlib paths never match a same-named repo dir by suffix.
         assert!(!r.resolves_to("import:errors", "pkg/a.go", "pkg/util/errors/e.go"));
+    }
+
+    /// #1015 dropped the `format!` from `path_suffix_match`; the match must
+    /// still stop at a `/` boundary.
+    #[test]
+    fn path_suffix_match_needs_a_slash_boundary() {
+        assert!(path_suffix_match("a/b/c", "a/b/c"));
+        assert!(path_suffix_match("a/b/c", "b/c"));
+        assert!(path_suffix_match("a/b/c", "c"));
+        assert!(!path_suffix_match("a/xb/c", "b/c"));
+        assert!(!path_suffix_match("b/c", "a/b/c"));
+        assert!(!path_suffix_match("a/b/c", "b"));
+        assert!(path_suffix_match("a/", ""));
+        assert!(!path_suffix_match("a", ""));
     }
 
     #[test]

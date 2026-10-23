@@ -17,6 +17,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (mixin_declaration     name: (identifier) @mixin.name)
 (extension_declaration name: (identifier) @extension.name)
 (enum_declaration      name: (identifier) @enum.name)
+(enum_constant name: (identifier) @variant.name)
 (type_alias . (type_identifier) @typedef.name)
 (function_signature    name: (identifier) @fn.name)
 (class_body (class_member (declaration (initialized_identifier_list (initialized_identifier name: (identifier) @field.name)))))
@@ -30,6 +31,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("enum.name", "enum", "enum"),
         ("typedef.name", "typedef", "type"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         // #757: instance fields → `field:Owner.name`. Anchored under `class_body`
         // so local variables in method bodies are not captured.
         ("field.name", "field", "field"),
@@ -154,5 +157,18 @@ mod tests {
         assert!(kinds.contains(&"mixin"));
         assert!(kinds.contains(&"enum"));
         assert!(kinds.contains(&"import"));
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.dart");
+        std::fs::write(&path, "enum Status { ok, fail }\n").unwrap();
+        let out = parse("", &path, "e.dart").unwrap();
+        crate::generic::assert_variants(
+            &out,
+            "enum:Status",
+            &["variant:Status.fail", "variant:Status.ok"],
+        );
     }
 }

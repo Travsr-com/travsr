@@ -17,6 +17,7 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
 (type_alias (identifier) @typealias.name)
 (class_body (property_declaration (variable_declaration (identifier) @field.name)))
 (enum_class_body (property_declaration (variable_declaration (identifier) @field.name)))
+(enum_class_body (enum_entry (identifier) @variant.name))
 (import) @import
 (function_declaration
   (modifiers (annotation (user_type (identifier) @_ka)))
@@ -27,6 +28,8 @@ pub const CONFIG: LanguageConfig = LanguageConfig {
         ("class.name", "class", "class"),
         ("object.name", "object", "class"),
         ("fn.name", "function", "fn"),
+        // A named enum member → `variant:Enum.Member`, contained by its enum.
+        ("variant.name", "variant", "variant"),
         ("typealias.name", "type", "type"),
         // #757: class/object properties → `field:Owner.name`. Anchored to
         // `class_body` so local `val`/`var` in function bodies are not captured.
@@ -173,7 +176,7 @@ mod tests {
         // dropped enum-class properties. The `enum_class_body` anchor recovers
         // them, owner-qualified from the enclosing `class_declaration`
         // (`field:E.d`). Enum entries (`X`) are `enum_entry`, not
-        // `property_declaration`, so they are not captured.
+        // `property_declaration`, so they become variants, not fields.
         let out = parse_src("e.kt", "enum class E {\n    X;\n    val d = 4\n}\n");
         let field_sigs: Vec<&str> = out
             .nodes
@@ -261,5 +264,14 @@ mod tests {
             result.is_err(),
             "expected the bounded parse to report a timeout, got {result:?}"
         );
+    }
+
+    #[test]
+    fn enum_members_are_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.kt");
+        std::fs::write(&path, "enum class E {\n    X, Y(2);\n    val d = 4\n}\n").unwrap();
+        let out = parse("", &path, "e.kt").unwrap();
+        crate::generic::assert_variants(&out, "enum:E", &["variant:E.X", "variant:E.Y"]);
     }
 }
