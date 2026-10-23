@@ -218,11 +218,16 @@ fn version_is_skewed(daemon_version: Option<&str>, our_version: &str) -> bool {
 /// version skew means this path was rebuilt or upgraded and the daemon is the
 /// stale one. A different copy (a scratch build, an editor's bundled binary)
 /// must not replace it: it may lack the emitters the daemon finds beside its
-/// own path. `None` is a daemon from before the field, kept replaceable.
+/// own path. `None` is a daemon from before the field, kept replaceable, and
+/// so is one whose binary is gone (a deleted scratch build): nothing at that
+/// path can ever replace it.
 fn daemon_runs_our_exe(daemon_exe: Option<&str>, our_exe: &Path) -> bool {
     let Some(daemon_exe) = daemon_exe else {
         return true;
     };
+    if !Path::new(daemon_exe).exists() {
+        return true;
+    }
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(Path::new(daemon_exe)) == canon(our_exe)
 }
@@ -495,6 +500,13 @@ mod lock_tests {
         let dotted = dir.path().join("x").join("..").join("travsr");
         std::fs::create_dir(dir.path().join("x")).unwrap();
         assert!(daemon_runs_our_exe(dotted.to_str(), &ours), "same file");
+        // A daemon whose binary was deleted can never be replaced from its
+        // own path, so any client may replace it.
+        std::fs::remove_file(&other).unwrap();
+        assert!(
+            daemon_runs_our_exe(other.to_str(), &ours),
+            "deleted daemon binary"
+        );
     }
 
     /// #974: two builds of one version must not compare equal, or a rebuilt
