@@ -13,7 +13,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Master runs must finish so every master commit has a verdict preflight can
+  # read (same policy as bench.yml).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fmt:
