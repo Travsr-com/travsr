@@ -330,6 +330,11 @@ pub struct ControlResponse {
     /// a client reads as "older than me", the case this exists to catch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    /// The executable the daemon was started from, set on the Status reply
+    /// next to `daemon_version`, so a client only replaces a daemon running
+    /// its own binary path. `None` from a daemon that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_exe: Option<String>,
 }
 
 impl ControlResponse {
@@ -340,6 +345,7 @@ impl ControlResponse {
             protocol: None,
             result: None,
             daemon_version: None,
+            daemon_exe: None,
         }
     }
 
@@ -350,6 +356,7 @@ impl ControlResponse {
             protocol: None,
             result: None,
             daemon_version: None,
+            daemon_exe: None,
         }
     }
 
@@ -361,6 +368,7 @@ impl ControlResponse {
             protocol: Some(QUERY_PROTOCOL_VERSION),
             result: Some(result),
             daemon_version: None,
+            daemon_exe: None,
         }
     }
 }
