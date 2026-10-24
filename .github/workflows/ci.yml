@@ -47,6 +47,8 @@ jobs:
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -70,6 +72,8 @@ jobs:
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Install bubblewrap (Linux sandbox enforcement tests)
         if: runner.os == 'Linux'
@@ -270,6 +274,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # RUSTUP_TOOLCHAIN is mandatory here, do not remove it. The repo root has
       # a rust-toolchain.toml pinning `channel = "stable"`, and a directory
@@ -373,6 +378,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: automation-regression
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # Debug, not release: this indexes a 7-file fixture, so compile time
       # dominates and a release build would roughly double the job for no signal.
@@ -568,9 +574,6 @@ jobs:
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
 
       - name: TL1 — assert travsr-mcp pulls zero LLM dependencies (all configs)
         # Fail the build if any LLM provider crate appears in the dep tree.

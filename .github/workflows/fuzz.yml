@@ -62,8 +62,9 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
-          # Separate cache key per fuzz target so builds don't collide.
-          key: fuzz-${{ matrix.target }}
+          # One shared cache for all fuzz targets: they build the same
+          # dependency set, so a per-target key only multiplies entries.
+          shared-key: fuzz
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
