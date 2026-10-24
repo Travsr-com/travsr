@@ -33,6 +33,8 @@ jobs:
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-cli
 
       - name: Setup Node
         uses: actions/setup-node@v7

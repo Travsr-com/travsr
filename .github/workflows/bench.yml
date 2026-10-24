@@ -33,6 +33,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: bench
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       # ------------------------------------------------------------------
       # On PRs: restore the most recent master baseline so critcmp can diff

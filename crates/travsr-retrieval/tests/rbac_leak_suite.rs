@@ -1,7 +1,7 @@
 //! RBAC correctness test suite — ensures denied-corpus nodes never appear in
 //! any traversal result (get_execution_path / BFS), regardless of graph topology.
 //!
-//! These tests form the "rbac-leak-gate" CI check (S14, 172h).
+//! These tests run in the `test (*)` CI jobs via `cargo test --workspace` (S14, 172h).
 //! Every test asserts the **absence** of denied-corpus nodes rather than the
 //! presence of allowed ones — denial must be absolute, not probabilistic.
 
@@ -248,7 +248,7 @@ fn bfs_with_filter(
 
 // ── PPR RBAC tests (#413) ─────────────────────────────────────────────────────
 //
-// H2: this suite is the "rbac-leak-gate" CI check, but until #413 every case
+// H2: this suite is the RBAC leak gate in `test (*)`, but until #413 every case
 // above exercised either PCST or `bfs_with_filter`, a helper defined in this
 // file. Nothing drove the production PPR path that powers `get_context` and
 // `ask` — so the gate could report green while that path had no filter wired

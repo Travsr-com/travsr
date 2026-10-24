@@ -1,12 +1,6 @@
 name: VS Code Extension
 
 on:
-  push:
-    branches:
-      - master
-      - main
-    paths:
-      - 'packages/travsr-vscode/**'
   pull_request:
     paths:
       - 'packages/travsr-vscode/**'

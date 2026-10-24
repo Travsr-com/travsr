@@ -149,29 +149,27 @@ traceback, so a broken check is never mistaken for a passing one.
 
 ## CI
 
-All in `.github/workflows/ci.yml`. No scheduled runs.
+The self-test and regression jobs are in `.github/workflows/ci.yml`; the sanity
+jobs are in `.github/workflows/release-sanity.yml`. No scheduled runs.
 
 | Job | When | Mode |
 | --- | --- | --- |
 | `automation self-test` | every PR and push | `selftest.py`, seconds, no binary |
 | `automation regression` | every PR and push | `--binary target/debug/travsr` |
-| `automation sanity (ubuntu / macos)` | a release is published, or a manual run naming a tag | `--tag` |
+| `automation sanity (ubuntu / macos)` | after every publish or promotion in `release.yml`, or a manual run naming a tag | `--tag` |
 
-The sanity job is guarded by
+The sanity job is called from `release.yml` by a job guarded by
 
 ```yaml
-if: github.event_name == 'release' || github.event.inputs.sanity_tag != ''
+if: |
+  always() &&
+  (needs.publish.result == 'success' || needs.promote.result == 'success')
 ```
 
-so it is skipped on every ordinary push and pull request, where `--tag` has
-nothing to download. To verify a tag by hand: Actions, CI, "Run workflow", fill in
-`sanity_tag` (and tick `sanity_with_cpp` if the runner has the scip-clang
-sidecar).
-
-Adding the `release: published` trigger means the rest of CI runs once per
-release too. That is a few extra runner minutes, and `preflight` in `release.yml`
-already required those checks green on the tagged commit, so treat it as
-confirmation rather than new signal.
+so it runs after every publish or promotion, on both paths, and never on an
+ordinary push or pull request, where `--tag` has nothing to download. To verify
+a tag by hand: Actions, "Release sanity", "Run workflow", fill in `tag` (and tick
+`with_cpp` if the runner has the scip-clang sidecar).
 
 The regression job builds **debug**, not release: it indexes a seven-file
 fixture, so compile time dominates and a release build would roughly double the
