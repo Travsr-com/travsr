@@ -88,8 +88,8 @@ $ travsr daemon start
 ## how do I connect it to an AI agent?
 > Travsr speaks MCP, so any agent that supports it can query the graph.
 - detects the coding tools you already have installed
-- claude-code, cursor, zed, opencode and kilo are written for you
-- other tools get their config printed for you to paste
+- detected tools (Claude Code, Cursor, Copilot, Gemini CLI, Zed, OpenCode, Kilo) are written for you
+- a few (Codex, Windsurf, Antigravity) get their config printed for you to paste
 - travsr connect --print   shows what would change first
 Run it from the repo you want the agent to see. Start with --print, which changes nothing and shows you exactly what it would write, then run it for real.
 $ travsr connect

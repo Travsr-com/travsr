@@ -950,7 +950,7 @@ impl Tool {
             Tool::OpenCode => vec![Planned {
                 path: opencode_config_file(repo),
                 content: Content::JsoncServer {
-                    entry: local_server_entry(cmd, dirs::home_dir().as_deref()),
+                    entry: local_server_entry(cmd),
                     schema: Some(OPENCODE_SCHEMA),
                 },
                 gitignore: true,
@@ -958,7 +958,7 @@ impl Tool {
             Tool::Kilo => vec![Planned {
                 path: kilo_config_file(repo),
                 content: Content::JsoncServer {
-                    entry: local_server_entry(cmd, dirs::home_dir().as_deref()),
+                    entry: local_server_entry(cmd),
                     schema: None,
                 },
                 gitignore: true,
@@ -1052,10 +1052,11 @@ const JSONC_TOP_KEY: &str = "mcp";
 /// Schema URL OpenCode configs declare; written only into a file we create.
 const OPENCODE_SCHEMA: &str = "https://opencode.ai/config.json";
 
-/// OpenCode reads the first of these; the JSONC one wins when both exist.
+/// OpenCode config names. When both exist we write the JSONC one; which file
+/// OpenCode itself prefers is not documented, so that order is unverified.
 const OPENCODE_FILES: [&str; 2] = ["opencode.jsonc", "opencode.json"];
 
-/// Kilo's project config locations, highest precedence first.
+/// Kilo project config locations in the order we prefer; Kilo's own precedence is unverified.
 const KILO_FILES: [&str; 4] = [
     "kilo.jsonc",
     "kilo.json",
@@ -1087,24 +1088,12 @@ fn kilo_config_file(repo: &Path) -> PathBuf {
 
 /// The command as an absolute path, for tools that do not inherit the shell PATH
 /// (a GUI-launched editor misses `~/.travsr/bin`). `McpCommand` yields bare
-/// `travsr` when that directory is on PATH, so it is expanded to where the
-/// installer put the binary; an already-absolute command is kept as is.
-fn absolute_command(cmd: &McpCommand, home: Option<&Path>) -> String {
+/// `travsr` when that directory is on PATH, but that directory holds wrappers,
+/// not necessarily the binary, so it is expanded to the binary actually running
+/// `connect`; an already-absolute command is kept as is.
+fn absolute_command(cmd: &McpCommand) -> String {
     if Path::new(&cmd.command).is_absolute() {
         return cmd.command.clone();
-    }
-    let bin = if cfg!(windows) {
-        "travsr.exe"
-    } else {
-        "travsr"
-    };
-    if let Some(h) = home {
-        return h
-            .join(".travsr")
-            .join("bin")
-            .join(bin)
-            .to_string_lossy()
-            .into_owned();
     }
     std::env::current_exe()
         .ok()
@@ -1114,8 +1103,8 @@ fn absolute_command(cmd: &McpCommand, home: Option<&Path>) -> String {
 
 /// OpenCode/Kilo's local MCP server shape: `command` is one array holding the
 /// executable and its arguments.
-fn local_server_entry(cmd: &McpCommand, home: Option<&Path>) -> Value {
-    let mut command = vec![absolute_command(cmd, home)];
+fn local_server_entry(cmd: &McpCommand) -> Value {
+    let mut command = vec![absolute_command(cmd)];
     command.extend(cmd.args.iter().cloned());
     json!({ "type": "local", "command": command, "enabled": true })
 }
@@ -1125,10 +1114,7 @@ fn jsonc_snippet(target: &str, cmd: &McpCommand, schema: Option<&str>) -> String
     if let Some(s) = schema {
         root.insert("$schema".into(), json!(s));
     }
-    root.insert(
-        "mcp".into(),
-        json!({ "travsr": local_server_entry(cmd, dirs::home_dir().as_deref()) }),
-    );
+    root.insert("mcp".into(), json!({ "travsr": local_server_entry(cmd) }));
     let body = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
     format!("  add to {target}:\n{}", indent(&body))
 }
@@ -3606,7 +3592,7 @@ mod tests {
     }
 
     fn expected_entry() -> Value {
-        local_server_entry(&McpCommand::resolve(), dirs::home_dir().as_deref())
+        local_server_entry(&McpCommand::resolve())
     }
 
     fn ignored(repo: &Path) -> Vec<String> {
@@ -4040,9 +4026,7 @@ mod tests {
 
     #[test]
     fn absolute_command_is_always_absolute() {
-        let root = std::env::temp_dir();
-        let home = root.join("someone");
-        let opt = root
+        let opt = std::env::temp_dir()
             .join("opt")
             .join("travsr")
             .to_string_lossy()
@@ -4051,29 +4035,16 @@ mod tests {
             command: opt.clone(),
             args: vec!["mcp".into(), "--stdio".into()],
         };
-        assert_eq!(absolute_command(&abs, Some(&home)), opt);
-        assert_eq!(absolute_command(&abs, None), opt);
+        assert_eq!(absolute_command(&abs), opt);
 
-        let expected = home
-            .join(".travsr")
-            .join("bin")
-            .join(if cfg!(windows) {
-                "travsr.exe"
-            } else {
-                "travsr"
-            })
-            .to_string_lossy()
-            .into_owned();
-        let bare = absolute_command(&cmd(), Some(&home));
+        // A bare command resolves to the running binary, which exists. It must
+        // never be a guessed `~/.travsr/bin/travsr` that may not be installed.
+        let bare = absolute_command(&cmd());
         assert!(Path::new(&bare).is_absolute(), "{bare}");
-        assert_eq!(bare, expected);
+        assert!(Path::new(&bare).is_file(), "{bare}");
 
-        // No home: falls back to the running binary, still absolute.
-        let fallback = absolute_command(&cmd(), None);
-        assert!(Path::new(&fallback).is_absolute(), "{fallback}");
-
-        let entry = local_server_entry(&cmd(), Some(&home));
-        assert_eq!(entry["command"], json!([expected, "mcp", "--stdio"]));
+        let entry = local_server_entry(&cmd());
+        assert_eq!(entry["command"], json!([bare, "mcp", "--stdio"]));
     }
 
     #[test]
