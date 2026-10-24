@@ -35,7 +35,7 @@
 - **Graph, not chunks.** Tree-sitter and LSIF build real call, import and reference edges, so an answer names the callers rather than the files that read similarly.
 - **Always fresh.** A post-commit hook and a file watcher re-index only what changed, so the graph tracks HEAD instead of the last time someone rebuilt an index.
 - **Local by default.** The graph is a SQLite file in your repo. Nothing leaves the machine unless you opt in.
-- **Works with the tools you already use.** One MCP server serves every repo you have indexed, and `travsr connect` wires up Claude Code, Cursor, VS Code Copilot, Codex, Gemini CLI, Windsurf, Zed and Antigravity for you.
+- **Works with the tools you already use.** One MCP server serves every repo you have indexed, and `travsr connect` wires up Claude Code, Cursor, VS Code Copilot, Codex, Gemini CLI, Windsurf, Zed, Antigravity, OpenCode and Kilo Code for you.
 
 ---
 
@@ -359,7 +359,7 @@ travsr rerank status                 Show whether the reranker model is installe
 
 **AI tool auto-wiring.** `travsr init` (unless run with `--no-connect`) and
 `travsr connect` detect installed AI coding tools, Claude Code, Cursor, VS Code
-Copilot, Gemini CLI, Antigravity, Codex, Windsurf, and Zed, and for each one
+Copilot, Gemini CLI, Antigravity, Codex, Windsurf, Zed, OpenCode, and Kilo Code, and for each one
 register the `travsr mcp --stdio` server. Pass `--rules` to also write an
 always-on rules file telling the agent to query Travsr before grep or a raw
 file read; it is opt-in because an agent re-reads it on every turn of every
@@ -475,7 +475,7 @@ TRAVSR_GUARD=off claude
 
 **Claude Code only.** This is enforcement, and enforcement needs a pre-tool
 contract to hook into. Claude Code is the only host Travsr wires that has one.
-Cursor, Copilot, Gemini CLI, Antigravity, Codex, Windsurf and Zed get the MCP
+Cursor, Copilot, Gemini CLI, Antigravity, Codex, Windsurf, Zed, OpenCode and Kilo Code get the MCP
 wiring and the optional `--rules` guidance, and nothing here changes that:
 they are not enforced, and this section does not claim otherwise.
 

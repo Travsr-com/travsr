@@ -19,6 +19,7 @@ mod index;
 mod init;
 mod install;
 mod invariants;
+mod jsonc;
 mod lang;
 mod logo;
 mod pattern;
