@@ -214,14 +214,14 @@ fn version_is_skewed(daemon_version: Option<&str>, our_version: &str) -> bool {
     daemon_version != Some(our_version)
 }
 
-/// Whether a daemon started from `daemon_exe` runs this binary's path, so a
-/// version skew means this path was rebuilt or upgraded and the daemon is the
-/// stale one. A different copy (a scratch build, an editor's bundled binary)
+/// Whether a daemon started from `daemon_exe` may be replaced by a client at
+/// `our_exe`. True when it runs this binary's path, so a version skew means
+/// this path was rebuilt or upgraded and the daemon is the stale one. A different copy (a scratch build, an editor's bundled binary)
 /// must not replace it: it may lack the emitters the daemon finds beside its
 /// own path. `None` is a daemon from before the field, kept replaceable, and
 /// so is one whose binary is gone (a deleted scratch build): nothing at that
 /// path can ever replace it.
-fn daemon_runs_our_exe(daemon_exe: Option<&str>, our_exe: &Path) -> bool {
+fn daemon_replaceable_from(daemon_exe: Option<&str>, our_exe: &Path) -> bool {
     let Some(daemon_exe) = daemon_exe else {
         return true;
     };
@@ -267,12 +267,14 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     if !daemon_lock_held(repo_root) {
         return;
     }
+    let stale = |r: &travsr_ipc::ControlResponse| {
+        version_is_skewed(r.daemon_version.as_deref(), our_build_version())
+            && daemon_replaceable_from(r.daemon_exe.as_deref(), exe)
+    };
     let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
         return; // transiently unreachable (starting, busy pipe) — leave it be
     };
-    if !version_is_skewed(resp.daemon_version.as_deref(), our_build_version())
-        || !daemon_runs_our_exe(resp.daemon_exe.as_deref(), exe)
-    {
+    if !stale(&resp) {
         return;
     }
     // Single-flight: only the lock holder performs the swap, so two concurrent
@@ -282,9 +284,10 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
         return;
     };
     // Re-check under the lock: another client may have already restarted it in
-    // the window between our Status read above and taking this lock.
+    // the window between our Status read above and taking this lock, possibly
+    // from another existing path, which this client must then leave alone.
     if let Ok(r) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) {
-        if !version_is_skewed(r.daemon_version.as_deref(), our_build_version()) {
+        if !stale(&r) {
             return;
         }
     }
@@ -493,18 +496,21 @@ mod lock_tests {
         std::fs::write(&ours, b"").unwrap();
         std::fs::write(&other, b"").unwrap();
         let ours_s = ours.to_str().unwrap();
-        assert!(daemon_runs_our_exe(Some(ours_s), &ours), "same path");
-        assert!(!daemon_runs_our_exe(Some(ours_s), &other), "another copy");
-        assert!(daemon_runs_our_exe(None, &other), "pre-field daemon");
+        assert!(daemon_replaceable_from(Some(ours_s), &ours), "same path");
+        assert!(
+            !daemon_replaceable_from(Some(ours_s), &other),
+            "another copy"
+        );
+        assert!(daemon_replaceable_from(None, &other), "pre-field daemon");
         // A path spelled through a parent `..` is still the same file.
         let dotted = dir.path().join("x").join("..").join("travsr");
         std::fs::create_dir(dir.path().join("x")).unwrap();
-        assert!(daemon_runs_our_exe(dotted.to_str(), &ours), "same file");
+        assert!(daemon_replaceable_from(dotted.to_str(), &ours), "same file");
         // A daemon whose binary was deleted can never be replaced from its
         // own path, so any client may replace it.
         std::fs::remove_file(&other).unwrap();
         assert!(
-            daemon_runs_our_exe(other.to_str(), &ours),
+            daemon_replaceable_from(other.to_str(), &ours),
             "deleted daemon binary"
         );
     }
