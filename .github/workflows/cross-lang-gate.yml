@@ -29,6 +29,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-cli
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Python
         uses: actions/setup-python@v7
