@@ -13,8 +13,10 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # Master runs must finish so every master commit has a verdict preflight can
-  # read (same policy as bench.yml).
+  # Newer pushes never cancel an in-progress master run, so preflight can read
+  # each master commit's verdict (same policy as bench.yml). GitHub still drops
+  # a pending run when a newer one queues, so a burst of merges can leave a
+  # middle commit with no result; re-run CI on it if preflight needs one.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
