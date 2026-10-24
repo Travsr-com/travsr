@@ -1,18 +1,22 @@
-//! `travsr connect`: wire detected AI coding tools to the Travsr MCP server and
-//! drop an always-on "use Travsr first" rules file for each. Also invoked by
-//! `travsr init` (RFC-026).
+//! `travsr connect`: wire detected AI coding tools to the Travsr MCP server and,
+//! for most of them, drop an always-on "use Travsr first" rules file. Also invoked
+//! by `travsr init` (RFC-026).
 //!
-//! Two co-equal outputs per detected tool:
+//! Two outputs per detected tool:
 //!   1. register `travsr mcp --stdio` in the tool's MCP config, and
 //!   2. write an always-on rules/instructions file directing the agent to query
 //!      Travsr before grep/find. Wiring alone does not change agent behavior, the
-//!      rules are what make the agent actually use Travsr.
+//!      rules are what make the agent actually use Travsr. OpenCode and Kilo Code
+//!      get only (1); they have no rules file written.
 //!
 //! Safety (RFC-026): generated files are local and git-ignored by default (never
 //! committed, since a committed MCP server definition is an RCE-on-clone vector); the
 //! server command is the bare `travsr` when it is on PATH (no absolute-path /
-//! username leak); existing non-strict-JSON configs are skipped, never clobbered;
-//! markdown rules use a single balanced managed block. All failures are non-fatal.
+//! username leak), except OpenCode and Kilo Code, which always get an absolute path
+//! (`absolute_command`); existing non-strict-JSON configs are skipped, never
+//! clobbered, except OpenCode and Kilo Code `.json`/`.jsonc` files, which are edited
+//! in place with comments preserved (`jsonc.rs`); markdown rules use a single
+//! balanced managed block. All failures are non-fatal.
 
 use std::path::{Path, PathBuf};
 
@@ -98,7 +102,7 @@ fn found_tools(repo: &Path, home: Option<&Path>, cmd: &McpCommand) -> Vec<(&'sta
                 tool.id(),
                 tool.plan(repo, cmd, None)
                     .iter()
-                    .any(|p| matches!(p.content, Content::JsonServer { .. })),
+                    .any(|p| p.content.carries_server()),
             )),
             Detection::Print => Some((tool.id(), false)),
             Detection::None => None,
@@ -536,6 +540,8 @@ enum Tool {
     Codex,
     Windsurf,
     Zed,
+    OpenCode,
+    Kilo,
 }
 
 /// How a tool was detected, which decides whether we auto-write project files or
@@ -565,6 +571,13 @@ enum Content {
         matcher: &'static str,
         handler: Value,
     },
+    /// One server under the `mcp` key of an OpenCode/Kilo config, which may be
+    /// JSONC (comments, trailing commas). Edited as text by `crate::jsonc` so the
+    /// user's comments survive; `schema` is written only into a file we create.
+    JsoncServer {
+        entry: Value,
+        schema: Option<&'static str>,
+    },
     ManagedMd {
         body: String,
     },
@@ -574,6 +587,14 @@ enum Content {
 }
 
 impl Content {
+    /// Whether this writes the travsr MCP server definition.
+    fn carries_server(&self) -> bool {
+        matches!(
+            self,
+            Content::JsonServer { .. } | Content::JsoncServer { .. }
+        )
+    }
+
     /// Whether this is guidance text rather than MCP wiring.
     ///
     /// The wiring is what makes the tools reachable; the guidance is prose an
@@ -603,7 +624,7 @@ enum Outcome {
 }
 
 impl Tool {
-    const ALL: [Tool; 8] = [
+    const ALL: [Tool; 10] = [
         Tool::ClaudeCode,
         Tool::Cursor,
         Tool::VsCodeCopilot,
@@ -612,6 +633,8 @@ impl Tool {
         Tool::Codex,
         Tool::Windsurf,
         Tool::Zed,
+        Tool::OpenCode,
+        Tool::Kilo,
     ];
 
     /// The name the user knows the tool by.
@@ -625,6 +648,8 @@ impl Tool {
             Tool::Codex => "Codex",
             Tool::Windsurf => "Windsurf",
             Tool::Zed => "Zed",
+            Tool::OpenCode => "OpenCode",
+            Tool::Kilo => "Kilo Code",
         }
     }
 
@@ -638,6 +663,8 @@ impl Tool {
             Tool::Codex => "codex",
             Tool::Windsurf => "windsurf",
             Tool::Zed => "zed",
+            Tool::OpenCode => "opencode",
+            Tool::Kilo => "kilo",
         }
     }
 
@@ -741,6 +768,28 @@ impl Tool {
                     has(h.join(".config/zed")) || has(h.join("Library/Application Support/Zed"))
                 }) {
                     Detection::Print
+                } else {
+                    Detection::None
+                }
+            }
+            // A home dir is enough: what gets written is this project's own
+            // git-ignored config file, never `~/.config/opencode`.
+            Tool::OpenCode => {
+                if opencode_config_file(repo).is_file()
+                    || has(repo.join(".opencode"))
+                    || home.is_some_and(|h| has(h.join(".config/opencode")))
+                {
+                    Detection::Auto
+                } else {
+                    Detection::None
+                }
+            }
+            Tool::Kilo => {
+                if kilo_config_file(repo).is_file()
+                    || has(repo.join(".kilo"))
+                    || home.is_some_and(|h| has(h.join(".config/kilo")))
+                {
+                    Detection::Auto
                 } else {
                     Detection::None
                 }
@@ -896,6 +945,24 @@ impl Tool {
                     gitignore: false,
                 },
             ],
+            // No rules file: the always-on guidance is opt-in and neither tool
+            // has a travsr-owned rules location we write to.
+            Tool::OpenCode => vec![Planned {
+                path: opencode_config_file(repo),
+                content: Content::JsoncServer {
+                    entry: local_server_entry(cmd, dirs::home_dir().as_deref()),
+                    schema: Some(OPENCODE_SCHEMA),
+                },
+                gitignore: true,
+            }],
+            Tool::Kilo => vec![Planned {
+                path: kilo_config_file(repo),
+                content: Content::JsoncServer {
+                    entry: local_server_entry(cmd, dirs::home_dir().as_deref()),
+                    schema: None,
+                },
+                gitignore: true,
+            }],
         }
     }
 
@@ -968,9 +1035,102 @@ impl Tool {
                  ~/.claude.json (user scope, no approval):\n{server}",
                 repo.display()
             ),
+            Tool::OpenCode => jsonc_snippet(
+                "opencode.json (or opencode.jsonc) in this repo",
+                cmd,
+                Some(OPENCODE_SCHEMA),
+            ),
+            Tool::Kilo => jsonc_snippet("kilo.json (or kilo.jsonc) in this repo", cmd, None),
             _ => format!("  MCP server config:\n{server}"),
         }
     }
+}
+
+/// Top-level key OpenCode and Kilo keep MCP servers under.
+const JSONC_TOP_KEY: &str = "mcp";
+
+/// Schema URL OpenCode configs declare; written only into a file we create.
+const OPENCODE_SCHEMA: &str = "https://opencode.ai/config.json";
+
+/// OpenCode reads the first of these; the JSONC one wins when both exist.
+const OPENCODE_FILES: [&str; 2] = ["opencode.jsonc", "opencode.json"];
+
+/// Kilo's project config locations, highest precedence first.
+const KILO_FILES: [&str; 4] = [
+    "kilo.jsonc",
+    "kilo.json",
+    ".kilo/kilo.jsonc",
+    ".kilo/kilo.json",
+];
+
+/// The existing file from `names`, else the first plain `.json` default
+/// (`default`) to create. Writing to the highest-precedence existing file is what
+/// keeps our entry from being shadowed by another one.
+///
+/// Edge case: if a user adds a higher-priority file after `connect` created a
+/// lower one, `--remove` targets the new file and leaves ours in place.
+fn first_existing_or(repo: &Path, names: &[&str], default: &str) -> PathBuf {
+    names
+        .iter()
+        .map(|f| repo.join(f))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| repo.join(default))
+}
+
+fn opencode_config_file(repo: &Path) -> PathBuf {
+    first_existing_or(repo, &OPENCODE_FILES, "opencode.json")
+}
+
+fn kilo_config_file(repo: &Path) -> PathBuf {
+    first_existing_or(repo, &KILO_FILES, "kilo.json")
+}
+
+/// The command as an absolute path, for tools that do not inherit the shell PATH
+/// (a GUI-launched editor misses `~/.travsr/bin`). `McpCommand` yields bare
+/// `travsr` when that directory is on PATH, so it is expanded to where the
+/// installer put the binary; an already-absolute command is kept as is.
+fn absolute_command(cmd: &McpCommand, home: Option<&Path>) -> String {
+    if Path::new(&cmd.command).is_absolute() {
+        return cmd.command.clone();
+    }
+    let bin = if cfg!(windows) {
+        "travsr.exe"
+    } else {
+        "travsr"
+    };
+    if let Some(h) = home {
+        return h
+            .join(".travsr")
+            .join("bin")
+            .join(bin)
+            .to_string_lossy()
+            .into_owned();
+    }
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cmd.command.clone())
+}
+
+/// OpenCode/Kilo's local MCP server shape: `command` is one array holding the
+/// executable and its arguments.
+fn local_server_entry(cmd: &McpCommand, home: Option<&Path>) -> Value {
+    let mut command = vec![absolute_command(cmd, home)];
+    command.extend(cmd.args.iter().cloned());
+    json!({ "type": "local", "command": command, "enabled": true })
+}
+
+fn jsonc_snippet(target: &str, cmd: &McpCommand, schema: Option<&str>) -> String {
+    let mut root = serde_json::Map::new();
+    if let Some(s) = schema {
+        root.insert("$schema".into(), json!(s));
+    }
+    root.insert(
+        "mcp".into(),
+        json!({ "travsr": local_server_entry(cmd, dirs::home_dir().as_deref()) }),
+    );
+    let body = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+    format!("  add to {target}:\n{}", indent(&body))
 }
 
 fn mcp_servers_json(cmd: &McpCommand) -> String {
@@ -1118,6 +1278,55 @@ fn merge_json_server(
     Ok(Outcome::Written)
 }
 
+/// Message for a server definition that would land in a git-tracked file.
+const TRACKED_REFUSAL: &str = "tracked by git, so .gitignore cannot keep it local (re-run with \
+                               --commit to share it)";
+
+/// `merge_json_server` for JSONC files: same contract, but comments and layout
+/// in an existing file are preserved (see `crate::jsonc`).
+fn merge_jsonc_server(
+    path: &Path,
+    entry: &Value,
+    schema: Option<&str>,
+    refuse_new: bool,
+) -> Result<Outcome> {
+    let text = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    Ok(
+        match crate::jsonc::upsert(&text, JSONC_TOP_KEY, entry, schema, refuse_new) {
+            crate::jsonc::Upsert::Changed(new) => {
+                write_atomic(path, &new)?;
+                Outcome::Written
+            }
+            crate::jsonc::Upsert::Unchanged => Outcome::Unchanged,
+            crate::jsonc::Upsert::Refused => Outcome::Skipped(TRACKED_REFUSAL.into()),
+            crate::jsonc::Upsert::Skipped(why) => Outcome::Skipped(why.into()),
+        },
+    )
+}
+
+fn remove_jsonc_server(path: &Path, schema: Option<&str>) -> Result<Outcome> {
+    if !path.exists() {
+        return Ok(Outcome::Absent);
+    }
+    let text = std::fs::read_to_string(path)?;
+    Ok(match crate::jsonc::remove(&text, JSONC_TOP_KEY, schema) {
+        crate::jsonc::Removal::Changed(new) => {
+            write_atomic(path, &new)?;
+            Outcome::Removed
+        }
+        crate::jsonc::Removal::DeleteFile => {
+            std::fs::remove_file(path)?;
+            Outcome::Removed
+        }
+        crate::jsonc::Removal::Absent => Outcome::Absent,
+        crate::jsonc::Removal::Skipped(why) => Outcome::Skipped(why.into()),
+    })
+}
+
 fn remove_json_server(path: &Path, top_key: &str) -> Result<Outcome> {
     if !path.exists() {
         return Ok(Outcome::Absent);
@@ -1238,6 +1447,13 @@ fn execute(p: &Planned, remove: bool, refuse_new: bool) -> Result<Outcome> {
                 remove_json_server(&p.path, top_key)
             } else {
                 merge_json_server(&p.path, top_key, entry, refuse_new)
+            }
+        }
+        Content::JsoncServer { entry, schema } => {
+            if remove {
+                remove_jsonc_server(&p.path, *schema)
+            } else {
+                merge_jsonc_server(&p.path, entry, *schema, refuse_new)
             }
         }
         Content::JsonHook { matcher, handler } => {
@@ -1529,7 +1745,9 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
         // A file travsr owns outright: it exists only because we wrote it.
         Content::Owned { .. } => p.path.exists(),
         // Neither is guidance, so `wanted` never consults this for them.
-        Content::JsonServer { .. } | Content::JsonHook { .. } => false,
+        Content::JsonServer { .. } | Content::JsoncServer { .. } | Content::JsonHook { .. } => {
+            false
+        }
     };
     let wanted =
         |p: &Planned| opts.remove || opts.rules || !p.content.is_guidance() || already_written(p);
@@ -1635,9 +1853,7 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
                                     dir = d.parent();
                                 }
                             }
-                            if matches!(planned.content, Content::JsonServer { .. })
-                                && server_in_place(&outcome)
-                            {
+                            if planned.content.carries_server() && server_in_place(&outcome) {
                                 wired = true;
                             }
                             // A shared file the user owns (never git-ignored)
@@ -1784,7 +2000,8 @@ pub fn run(repo_root: &Path, opts: &ConnectOpts) -> Result<Connected> {
     if !detected {
         say!(
             "tip: no AI coding tool detected. Run `travsr connect` after installing \
-             Claude Code, Cursor, Copilot, Gemini CLI, Codex, Windsurf, or Zed"
+             Claude Code, Cursor, Copilot, Gemini CLI, Codex, Windsurf, Zed, OpenCode, \
+             or Kilo Code"
         );
         connected.problems.push(
             "No AI coding tool found. Run `travsr connect` after installing one.".to_string(),
@@ -2228,8 +2445,7 @@ mod tests {
                 // A file is git-ignored exactly when it carries the server
                 // definition (the RCE-on-clone vector). Every rules file, and
                 // Zed's shared settings.json, stays committable.
-                let carries_server =
-                    matches!(p.content, Content::JsonServer { .. }) && tool != Tool::Zed;
+                let carries_server = p.content.carries_server() && tool != Tool::Zed;
                 let name = p.path.file_name().unwrap().to_string_lossy().into_owned();
                 assert_eq!(
                     p.gitignore, carries_server,
@@ -2425,6 +2641,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = dir.path();
         for tool in Tool::ALL {
+            // OpenCode and Kilo are wired without a rules file by design (#999).
+            if matches!(tool, Tool::OpenCode | Tool::Kilo) {
+                continue;
+            }
             let plan = tool.plan(repo, &cmd(), None);
             let has_rules = plan
                 .iter()
@@ -2451,7 +2671,7 @@ mod tests {
             let writes_server = tool
                 .plan(repo, &cmd(), None)
                 .iter()
-                .any(|p| matches!(p.content, Content::JsonServer { .. }));
+                .any(|p| p.content.carries_server());
             if writes_server {
                 assert!(
                     tool.note(&cmd()).is_none(),
@@ -3350,5 +3570,519 @@ mod tests {
                  not serve"
             );
         }
+    }
+
+    // ---- OpenCode and Kilo Code (#999) ----
+
+    fn jsonc_opts(only: &str) -> ConnectOpts {
+        ConnectOpts {
+            only: Some(only.to_string()),
+            dry_run: false,
+            remove: false,
+            commit: false,
+            rules: false,
+            guard: None,
+            report: Report::Silent,
+        }
+    }
+
+    /// A repo with a `.git` dir (so the gitignore block is written) and the
+    /// tool's project marker.
+    fn jsonc_repo(marker: &str) -> tempfile::TempDir {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".git")).unwrap();
+        if marker.ends_with('/') {
+            std::fs::create_dir_all(d.path().join(marker)).unwrap();
+        } else if let Some(parent) = Path::new(marker).parent() {
+            std::fs::create_dir_all(d.path().join(parent)).unwrap();
+            std::fs::write(d.path().join(marker), "{}").unwrap();
+        }
+        d
+    }
+
+    fn read_jsonc(p: &Path) -> Value {
+        let text = std::fs::read_to_string(p).unwrap();
+        serde_json::from_str(&crate::jsonc::mask(&text).unwrap()).unwrap()
+    }
+
+    fn expected_entry() -> Value {
+        local_server_entry(&McpCommand::resolve(), dirs::home_dir().as_deref())
+    }
+
+    fn ignored(repo: &Path) -> Vec<String> {
+        block_entries(&repo.join(".gitignore"), GI_BEGIN, GI_END).unwrap_or_default()
+    }
+
+    #[test]
+    fn opencode_fresh_repo_writes_schema_and_exact_entry() {
+        let d = jsonc_repo(".opencode/");
+        let c = run(d.path(), &jsonc_opts("opencode")).unwrap();
+        assert_eq!(c.tools, vec!["opencode"]);
+        let v = read_jsonc(&d.path().join("opencode.json"));
+        assert_eq!(v["$schema"], "https://opencode.ai/config.json");
+        let e = &v["mcp"]["travsr"];
+        assert_eq!(e["type"], "local");
+        assert_eq!(e["enabled"], true);
+        let command = e["command"].as_array().expect("command is an array");
+        assert_eq!(command.len(), 3);
+        assert!(
+            Path::new(command[0].as_str().unwrap()).is_absolute(),
+            "{command:?}"
+        );
+        assert_eq!(command[1], "mcp");
+        assert_eq!(command[2], "--stdio");
+        assert_eq!(e.as_object().unwrap().len(), 3, "no stray keys: {e}");
+        assert_eq!(*e, expected_entry());
+        assert!(ignored(d.path()).contains(&"/opencode.json".to_string()));
+        assert!(!d.path().join("opencode.jsonc").exists());
+    }
+
+    #[test]
+    fn kilo_fresh_repo_writes_no_schema_and_exact_entry() {
+        let d = jsonc_repo(".kilo/");
+        let c = run(d.path(), &jsonc_opts("kilo")).unwrap();
+        assert_eq!(c.tools, vec!["kilo"]);
+        let v = read_jsonc(&d.path().join("kilo.json"));
+        assert!(v.get("$schema").is_none(), "{v}");
+        assert_eq!(v["mcp"]["travsr"], expected_entry());
+        assert!(ignored(d.path()).contains(&"/kilo.json".to_string()));
+    }
+
+    #[test]
+    fn jsonc_connect_is_idempotent_byte_for_byte() {
+        for (tool, marker, file) in [
+            ("opencode", ".opencode/", "opencode.json"),
+            ("kilo", ".kilo/", "kilo.json"),
+        ] {
+            let d = jsonc_repo(marker);
+            run(d.path(), &jsonc_opts(tool)).unwrap();
+            let first = std::fs::read(d.path().join(file)).unwrap();
+            let gi = std::fs::read(d.path().join(".gitignore")).unwrap();
+            let c = run(d.path(), &jsonc_opts(tool)).unwrap();
+            assert_eq!(c.tools, vec![tool]);
+            assert!(c.problems.is_empty(), "{:?}", c.problems);
+            assert_eq!(first, std::fs::read(d.path().join(file)).unwrap(), "{tool}");
+            assert_eq!(gi, std::fs::read(d.path().join(".gitignore")).unwrap());
+        }
+    }
+
+    #[test]
+    fn opencode_existing_config_keeps_other_servers_and_keys() {
+        let d = jsonc_repo(".opencode/");
+        let original = r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "tokyonight",
+  "model": "anthropic/claude",
+  "mcp": {
+    "other": { "type": "remote", "url": "https://example.com/mcp", "enabled": false }
+  }
+}
+"#;
+        let p = d.path().join("opencode.json");
+        std::fs::write(&p, original).unwrap();
+        run(d.path(), &jsonc_opts("opencode")).unwrap();
+        let v = read_jsonc(&p);
+        assert_eq!(v["theme"], "tokyonight");
+        assert_eq!(v["model"], "anthropic/claude");
+        assert_eq!(v["mcp"]["other"]["url"], "https://example.com/mcp");
+        assert_eq!(v["mcp"]["other"]["enabled"], false);
+        assert_eq!(v["mcp"]["travsr"], expected_entry());
+        // The existing schema line is not duplicated.
+        assert_eq!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .matches("$schema")
+                .count(),
+            1
+        );
+
+        // Remove puts the document back to what it was, semantically.
+        let mut rm = jsonc_opts("opencode");
+        rm.remove = true;
+        run(d.path(), &rm).unwrap();
+        assert!(p.exists(), "a file with other content is never deleted");
+        let after = read_jsonc(&p);
+        assert_eq!(
+            after,
+            serde_json::from_str::<Value>(original).unwrap(),
+            "remove changed more than the travsr member"
+        );
+    }
+
+    #[test]
+    fn existing_opencode_file_does_not_gain_a_schema() {
+        let d = jsonc_repo(".opencode/");
+        let p = d.path().join("opencode.json");
+        std::fs::write(&p, "{\n  \"theme\": \"x\"\n}\n").unwrap();
+        run(d.path(), &jsonc_opts("opencode")).unwrap();
+        assert!(read_jsonc(&p).get("$schema").is_none());
+    }
+
+    const KILO_COMMENTED: &str = "// project kilo config\n{\n  /* block\n     comment */\n  \"model\": \"x\", // inline\n  \"mcp\": {\n    // our neighbour\n    \"other\": { \"type\": \"local\", \"command\": [\"o\"], },\n  },\n  // trailing note\n}\n";
+
+    fn all_comments_survive(text: &str) {
+        for c in [
+            "// project kilo config",
+            "/* block\n     comment */",
+            "// inline",
+            "// our neighbour",
+            "// trailing note",
+        ] {
+            assert!(text.contains(c), "lost comment {c:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn kilo_jsonc_with_comments_and_trailing_commas_survives_write_and_remove() {
+        let d = jsonc_repo(".kilo/");
+        let p = d.path().join("kilo.jsonc");
+        std::fs::write(&p, KILO_COMMENTED).unwrap();
+        run(d.path(), &jsonc_opts("kilo")).unwrap();
+
+        let written = std::fs::read_to_string(&p).unwrap();
+        all_comments_survive(&written);
+        assert!(!d.path().join("kilo.json").exists(), "wrote the wrong file");
+        let v = read_jsonc(&p);
+        assert_eq!(v["model"], "x");
+        assert_eq!(v["mcp"]["other"]["command"][0], "o");
+        assert_eq!(v["mcp"]["travsr"], expected_entry());
+
+        // Rerun: no change at all.
+        run(d.path(), &jsonc_opts("kilo")).unwrap();
+        assert_eq!(written, std::fs::read_to_string(&p).unwrap());
+
+        let mut rm = jsonc_opts("kilo");
+        rm.remove = true;
+        run(d.path(), &rm).unwrap();
+        let removed = std::fs::read_to_string(&p).unwrap();
+        all_comments_survive(&removed);
+        let v = read_jsonc(&p);
+        assert!(v["mcp"].get("travsr").is_none());
+        assert_eq!(v["mcp"]["other"]["command"][0], "o");
+        assert_eq!(v["model"], "x");
+    }
+
+    #[test]
+    fn opencode_jsonc_comment_only_travsr_file_is_never_deleted_on_remove() {
+        let d = jsonc_repo(".opencode/");
+        let p = d.path().join("opencode.jsonc");
+        std::fs::write(&p, "// mine\n{}\n").unwrap();
+        run(d.path(), &jsonc_opts("opencode")).unwrap();
+        assert!(std::fs::read_to_string(&p).unwrap().contains("// mine"));
+        let mut rm = jsonc_opts("opencode");
+        rm.remove = true;
+        run(d.path(), &rm).unwrap();
+        assert!(p.exists());
+        assert!(std::fs::read_to_string(&p).unwrap().contains("// mine"));
+    }
+
+    #[test]
+    fn remove_deletes_a_file_connect_created_and_unignores_it() {
+        for (tool, marker, file) in [
+            ("opencode", ".opencode/", "opencode.json"),
+            ("kilo", ".kilo/", "kilo.json"),
+        ] {
+            let d = jsonc_repo(marker);
+            run(d.path(), &jsonc_opts(tool)).unwrap();
+            assert!(d.path().join(file).is_file());
+            let mut rm = jsonc_opts(tool);
+            rm.remove = true;
+            run(d.path(), &rm).unwrap();
+            assert!(!d.path().join(file).exists(), "{tool}");
+            assert!(
+                !ignored(d.path()).contains(&format!("/{file}")),
+                "{:?}",
+                ignored(d.path())
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_writes_nothing_for_opencode_and_kilo() {
+        for (tool, marker) in [("opencode", ".opencode/"), ("kilo", ".kilo/")] {
+            let d = jsonc_repo(marker);
+            let mut o = jsonc_opts(tool);
+            o.dry_run = true;
+            run(d.path(), &o).unwrap();
+            assert!(!d.path().join("opencode.json").exists());
+            assert!(!d.path().join("kilo.json").exists());
+            assert!(!d.path().join(".gitignore").exists());
+        }
+        // And an existing file is left byte-identical.
+        let d = jsonc_repo("opencode.jsonc");
+        let p = d.path().join("opencode.jsonc");
+        std::fs::write(&p, "// c\n{\"a\":1}").unwrap();
+        let mut o = jsonc_opts("opencode");
+        o.dry_run = true;
+        run(d.path(), &o).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "// c\n{\"a\":1}");
+        o.remove = true;
+        run(d.path(), &o).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "// c\n{\"a\":1}");
+    }
+
+    #[test]
+    fn a_tracked_opencode_config_is_refused_without_commit() {
+        let d = jsonc_repo(".opencode/");
+        let repo = d.path();
+        std::fs::remove_dir_all(repo.join(".git")).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let original = "{\n  // shared\n  \"theme\": \"x\"\n}\n";
+        std::fs::write(repo.join("opencode.json"), original).unwrap();
+        assert!(git(&["add", "opencode.json"]));
+
+        let c = run(repo, &jsonc_opts("opencode")).unwrap();
+        assert!(c.tools.is_empty(), "{:?}", c.tools);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("opencode.json")).unwrap(),
+            original
+        );
+
+        // With consent it is written and not ignored.
+        let mut o = jsonc_opts("opencode");
+        o.commit = true;
+        run(repo, &o).unwrap();
+        let text = std::fs::read_to_string(repo.join("opencode.json")).unwrap();
+        assert!(text.contains("// shared"));
+        assert_eq!(
+            read_jsonc(&repo.join("opencode.json"))["mcp"]["travsr"],
+            expected_entry()
+        );
+        assert!(!ignored(repo).contains(&"/opencode.json".to_string()));
+    }
+
+    #[test]
+    fn opencode_file_precedence_prefers_jsonc() {
+        let d = tempdir().unwrap();
+        let r = d.path();
+        assert_eq!(opencode_config_file(r), r.join("opencode.json"));
+        std::fs::write(r.join("opencode.json"), "{}").unwrap();
+        assert_eq!(opencode_config_file(r), r.join("opencode.json"));
+        std::fs::write(r.join("opencode.jsonc"), "{}").unwrap();
+        assert_eq!(opencode_config_file(r), r.join("opencode.jsonc"));
+    }
+
+    #[test]
+    fn kilo_file_precedence_is_the_four_file_order() {
+        let d = tempdir().unwrap();
+        let r = d.path();
+        std::fs::create_dir(r.join(".kilo")).unwrap();
+        assert_eq!(kilo_config_file(r), r.join("kilo.json"));
+        for f in [
+            ".kilo/kilo.json",
+            ".kilo/kilo.jsonc",
+            "kilo.json",
+            "kilo.jsonc",
+        ] {
+            std::fs::write(r.join(f), "{}").unwrap();
+            assert_eq!(kilo_config_file(r), r.join(f), "after adding {f}");
+        }
+    }
+
+    #[test]
+    fn detection_via_repo_markers_and_home_dir() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        for tool in [Tool::OpenCode, Tool::Kilo] {
+            assert!(matches!(tool.detect(repo.path(), None), Detection::None));
+            assert!(matches!(
+                tool.detect(repo.path(), Some(home.path())),
+                Detection::None
+            ));
+        }
+        // Repo markers.
+        for (tool, marker) in [
+            (Tool::OpenCode, "opencode.json"),
+            (Tool::OpenCode, "opencode.jsonc"),
+            (Tool::Kilo, "kilo.json"),
+            (Tool::Kilo, "kilo.jsonc"),
+            (Tool::Kilo, ".kilo/kilo.json"),
+            (Tool::Kilo, ".kilo/kilo.jsonc"),
+        ] {
+            let r = tempdir().unwrap();
+            if let Some(parent) = Path::new(marker).parent() {
+                std::fs::create_dir_all(r.path().join(parent)).unwrap();
+            }
+            std::fs::write(r.path().join(marker), "{}").unwrap();
+            assert!(
+                matches!(tool.detect(r.path(), None), Detection::Auto),
+                "{marker}"
+            );
+        }
+        for (tool, dir) in [(Tool::OpenCode, ".opencode"), (Tool::Kilo, ".kilo")] {
+            let r = tempdir().unwrap();
+            std::fs::create_dir(r.path().join(dir)).unwrap();
+            assert!(matches!(tool.detect(r.path(), None), Detection::Auto));
+        }
+        // Home markers auto-wire the project, and the plan targets the repo only.
+        std::fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
+        std::fs::create_dir_all(home.path().join(".config/kilo")).unwrap();
+        for tool in [Tool::OpenCode, Tool::Kilo] {
+            assert!(matches!(
+                tool.detect(repo.path(), Some(home.path())),
+                Detection::Auto
+            ));
+            for p in tool.plan(repo.path(), &cmd(), None) {
+                assert!(p.path.starts_with(repo.path()), "{:?}", p.path);
+                assert!(p.gitignore);
+            }
+        }
+        // A stray empty-named sibling is not a marker.
+        let r = tempdir().unwrap();
+        std::fs::write(r.path().join("opencode.txt"), "x").unwrap();
+        assert!(matches!(
+            Tool::OpenCode.detect(r.path(), None),
+            Detection::None
+        ));
+    }
+
+    #[test]
+    fn home_only_marker_never_writes_global_files() {
+        let home = tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
+        let repo = tempdir().unwrap();
+        let before: Vec<_> = std::fs::read_dir(home.path().join(".config/opencode"))
+            .unwrap()
+            .collect();
+        let plan = Tool::OpenCode.plan(repo.path(), &cmd(), None);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].path, repo.path().join("opencode.json"));
+        assert!(!home.path().join(".config/opencode/opencode.json").exists());
+        assert!(before.is_empty());
+    }
+
+    #[test]
+    fn duplicate_mcp_keys_and_array_mcp_are_skipped_untouched() {
+        for (tool, marker, file, body) in [
+            (
+                "opencode",
+                ".opencode/",
+                "opencode.json",
+                "{\"mcp\": {}, \"mcp\": {}}",
+            ),
+            ("opencode", ".opencode/", "opencode.json", "{\"mcp\": []}"),
+            (
+                "kilo",
+                ".kilo/",
+                "kilo.json",
+                "{\"mcp\": {\"travsr\": 1, \"travsr\": 2}}",
+            ),
+            ("kilo", ".kilo/", "kilo.json", "not json at all"),
+        ] {
+            let d = jsonc_repo(marker);
+            let p = d.path().join(file);
+            std::fs::write(&p, body).unwrap();
+            let c = run(d.path(), &jsonc_opts(tool)).unwrap();
+            assert!(c.tools.is_empty(), "{body}");
+            assert!(!c.problems.is_empty(), "{body}");
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn crlf_and_string_edge_cases_survive_a_round_trip() {
+        let d = jsonc_repo(".opencode/");
+        let p = d.path().join("opencode.jsonc");
+        let original = "{\r\n  // note\r\n  \"url\": \"http://x.test/a//b/*c*/\",\r\n  \"q\": \"say \\\"hi\\\" // not a comment\",\r\n  \"mcp\": {\r\n    \"other\": {\"command\": [\"o\"]}\r\n  }\r\n}\r\n";
+        std::fs::write(&p, original).unwrap();
+        run(d.path(), &jsonc_opts("opencode")).unwrap();
+        let written = std::fs::read_to_string(&p).unwrap();
+        assert!(written.contains("// note"));
+        let v = read_jsonc(&p);
+        assert_eq!(v["url"], "http://x.test/a//b/*c*/");
+        assert_eq!(v["q"], "say \"hi\" // not a comment");
+        assert_eq!(v["mcp"]["travsr"], expected_entry());
+        assert_eq!(v["mcp"]["other"]["command"][0], "o");
+        // Every original line ending is still CRLF where it was.
+        assert!(!written.replace("\r\n", "").contains('\r'));
+
+        let mut rm = jsonc_opts("opencode");
+        rm.remove = true;
+        run(d.path(), &rm).unwrap();
+        let v = read_jsonc(&p);
+        assert!(v["mcp"].get("travsr").is_none());
+        assert_eq!(v["url"], "http://x.test/a//b/*c*/");
+    }
+
+    #[test]
+    fn stale_travsr_entry_is_replaced_not_duplicated() {
+        let d = jsonc_repo(".opencode/");
+        let p = d.path().join("opencode.json");
+        std::fs::write(
+            &p,
+            r#"{"mcp":{"travsr":{"type":"local","command":["old"],"enabled":false},"z":{}}}"#,
+        )
+        .unwrap();
+        run(d.path(), &jsonc_opts("opencode")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .matches("\"travsr\"")
+                .count(),
+            1
+        );
+        let v = read_jsonc(&p);
+        assert_eq!(v["mcp"]["travsr"], expected_entry());
+        assert!(v["mcp"]["z"].is_object());
+    }
+
+    #[test]
+    fn absolute_command_is_always_absolute() {
+        let root = std::env::temp_dir();
+        let home = root.join("someone");
+        let opt = root
+            .join("opt")
+            .join("travsr")
+            .to_string_lossy()
+            .into_owned();
+        let abs = McpCommand {
+            command: opt.clone(),
+            args: vec!["mcp".into(), "--stdio".into()],
+        };
+        assert_eq!(absolute_command(&abs, Some(&home)), opt);
+        assert_eq!(absolute_command(&abs, None), opt);
+
+        let expected = home
+            .join(".travsr")
+            .join("bin")
+            .join(if cfg!(windows) {
+                "travsr.exe"
+            } else {
+                "travsr"
+            })
+            .to_string_lossy()
+            .into_owned();
+        let bare = absolute_command(&cmd(), Some(&home));
+        assert!(Path::new(&bare).is_absolute(), "{bare}");
+        assert_eq!(bare, expected);
+
+        // No home: falls back to the running binary, still absolute.
+        let fallback = absolute_command(&cmd(), None);
+        assert!(Path::new(&fallback).is_absolute(), "{fallback}");
+
+        let entry = local_server_entry(&cmd(), Some(&home));
+        assert_eq!(entry["command"], json!([expected, "mcp", "--stdio"]));
+    }
+
+    #[test]
+    fn jsonc_servers_are_listed_in_the_snippet_and_tool_ids() {
+        let ids: Vec<_> = Tool::ALL.iter().map(|t| t.id()).collect();
+        assert!(ids.contains(&"opencode") && ids.contains(&"kilo"));
+        let oc = jsonc_snippet("t", &cmd(), Some(OPENCODE_SCHEMA));
+        assert!(oc.contains("https://opencode.ai/config.json"));
+        let kilo = jsonc_snippet("t", &cmd(), None);
+        assert!(!kilo.contains("$schema"));
     }
 }
