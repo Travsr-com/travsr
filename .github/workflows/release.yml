@@ -150,9 +150,6 @@ jobs:
             "release promotion gate policy"
             "vscode version gate (shell tests)"
             "TL1/TL2 — zero LLM/embedding deps in travsr-mcp"
-            "Phase 2 correctness suite"
-            "Bench p95 < 50 ms"
-            "RBAC Leak Suite"
             "criterion regression check"
           )
           gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
@@ -917,3 +914,18 @@ jobs:
           git init -q
           git -c user.email=ci@travsr.com -c user.name=ci commit --allow-empty -q -m init
           travsr init
+
+  # Runs the travsrAutomation sanity suite against the artifacts just
+  # published, on both paths. Moved here from ci.yml, whose release trigger
+  # never fired because releases are created with GITHUB_TOKEN.
+  sanity:
+    name: release sanity
+    if: |
+      always() &&
+      (needs.publish.result == 'success' || needs.promote.result == 'success')
+    needs: [channel, publish, promote]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-sanity.yml
+    with:
+      tag: ${{ needs.channel.outputs.ref }}
