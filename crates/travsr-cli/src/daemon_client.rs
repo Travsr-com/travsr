@@ -218,9 +218,10 @@ fn version_is_skewed(daemon_version: Option<&str>, our_version: &str) -> bool {
 /// `our_exe`. True when it runs this binary's path, so a version skew means
 /// this path was rebuilt or upgraded and the daemon is the stale one. A
 /// different copy (a scratch build, an editor's bundled binary) must not
-/// replace it: it may lack the emitters the daemon finds beside its own path. `None` is a daemon from before the field, kept replaceable, and
-/// so is one whose binary is gone (a deleted scratch build): nothing at that
-/// path can ever replace it.
+/// replace it: it may lack the emitters the daemon finds beside its own path.
+/// `None` is a daemon from before the field, kept replaceable, and so is one
+/// whose binary is gone (a deleted scratch build): nothing at that path can
+/// ever replace it.
 fn daemon_replaceable_from(daemon_exe: Option<&str>, our_exe: &Path) -> bool {
     let Some(daemon_exe) = daemon_exe else {
         return true;
