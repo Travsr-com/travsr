@@ -12,6 +12,8 @@ name: Release
 # see the #714 note in `promote`. There is deliberately no override: a red
 # required gate blocks rc and stable until the gate itself is fixed, and a
 # hotfix that cannot wait ships to beta, which is not gated on these suites.
+# Every channel, beta included, still needs the tagged commit to be on the
+# default branch (see `preflight`), so a hotfix is merged first and then tagged.
 # Promotion reuses artifacts rather than rebuilding because Rust builds here are not
 # bit-reproducible across runs (runner image / cross toolchain drift) — rebuilding on
 # every promotion would mean "stable" is never actually the bits that were beta-tested.
