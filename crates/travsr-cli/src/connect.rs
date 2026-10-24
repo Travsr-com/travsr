@@ -3606,7 +3606,7 @@ mod tests {
     }
 
     fn expected_entry() -> Value {
-        local_server_entry(&cmd(), dirs::home_dir().as_deref())
+        local_server_entry(&McpCommand::resolve(), dirs::home_dir().as_deref())
     }
 
     fn ignored(repo: &Path) -> Vec<String> {
@@ -4040,30 +4040,40 @@ mod tests {
 
     #[test]
     fn absolute_command_is_always_absolute() {
-        let home = Path::new("/home/someone");
+        let root = std::env::temp_dir();
+        let home = root.join("someone");
+        let opt = root
+            .join("opt")
+            .join("travsr")
+            .to_string_lossy()
+            .into_owned();
         let abs = McpCommand {
-            command: "/opt/bin/travsr".into(),
+            command: opt.clone(),
             args: vec!["mcp".into(), "--stdio".into()],
         };
-        assert_eq!(absolute_command(&abs, Some(home)), "/opt/bin/travsr");
-        assert_eq!(absolute_command(&abs, None), "/opt/bin/travsr");
+        assert_eq!(absolute_command(&abs, Some(&home)), opt);
+        assert_eq!(absolute_command(&abs, None), opt);
 
-        let bare = absolute_command(&cmd(), Some(home));
+        let expected = home
+            .join(".travsr")
+            .join("bin")
+            .join(if cfg!(windows) {
+                "travsr.exe"
+            } else {
+                "travsr"
+            })
+            .to_string_lossy()
+            .into_owned();
+        let bare = absolute_command(&cmd(), Some(&home));
         assert!(Path::new(&bare).is_absolute(), "{bare}");
-        assert!(
-            bare.starts_with("/home/someone/.travsr/bin/travsr"),
-            "{bare}"
-        );
+        assert_eq!(bare, expected);
 
         // No home: falls back to the running binary, still absolute.
         let fallback = absolute_command(&cmd(), None);
         assert!(Path::new(&fallback).is_absolute(), "{fallback}");
 
-        let entry = local_server_entry(&cmd(), Some(home));
-        assert_eq!(
-            entry["command"],
-            json!(["/home/someone/.travsr/bin/travsr", "mcp", "--stdio"])
-        );
+        let entry = local_server_entry(&cmd(), Some(&home));
+        assert_eq!(entry["command"], json!([expected, "mcp", "--stdio"]));
     }
 
     #[test]
