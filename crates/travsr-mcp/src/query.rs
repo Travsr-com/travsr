@@ -743,14 +743,16 @@ pub fn ask_query_with_filter(
                 expanded_cap,
                 seed_set.confidence,
             );
-            // #991: sort key, see the sort below.
-            let order = if travsr_core::ident::leaf_of(&n.vname.signature) == query {
-                (0, 0.0)
-            } else if is_primary {
-                (if is_exact { 1 } else { 2 }, score)
-            } else {
-                (3, 0.0)
-            };
+            // #991: sort key, see the sort below. An `impl` carries its type's
+            // name but is not the definition, so it does not take rule 1.
+            let order =
+                if n.kind != "impl" && travsr_core::ident::leaf_of(&n.vname.signature) == query {
+                    (0, 0.0)
+                } else if is_primary {
+                    (if is_exact { 1 } else { 2 }, score)
+                } else {
+                    (3, 0.0)
+                };
             let signature = display_label(&n).into_owned();
             let row = AskRow {
                 score,
@@ -1918,12 +1920,16 @@ mod tests {
         std::env::set_var("TRAVSR_NO_RERANK", "1");
         let mut store = SqliteStore::open_in_memory().unwrap();
         let ty = node("struct:Breaker", "struct", "src/breaker.rs");
+        // The `impl` shares the type's name and, owning the methods, precedes it
+        // in knapsack order.
+        let imp = node("impl:Breaker", "impl", "src/breaker.rs");
+        store.put_node(&imp).unwrap();
         // #463 makes the type's methods its exact anchors, ahead of the type.
         for m in ["should_skip", "record"] {
             let method = node(&format!("method:Breaker.{m}"), "method", "src/breaker.rs");
             store.put_node(&method).unwrap();
             store
-                .put_edge(&Edge::new(ty.id, method.id, EdgeKind::DefinesBinding))
+                .put_edge(&Edge::new(imp.id, method.id, EdgeKind::DefinesBinding))
                 .unwrap();
         }
         store.put_node(&ty).unwrap();
