@@ -31,8 +31,11 @@ const CLI_COMMANDS: &[(&str, &[&str], u64)] = &[
     ("daemon-status", &["daemon", "status"], 30),
     ("embed-list", &["embed", "list", "--json"], 15),
     // `lang list` sweeps PATH per catalog language: ~17 s on a cold Windows
-    // cache, which is why the extension gives it a minute.
-    ("lang-list", &["lang", "list", "--json"], 60),
+    // cache, which is why the extension gives it a minute. Measured at 116 s
+    // on a Windows machine whose endpoint scanner slows every process start,
+    // so the page gives it three: the section shows "checking" meanwhile, and
+    // a cut-off answer is the one outcome that helps nobody.
+    ("lang-list", &["lang", "list", "--json"], 180),
     ("config-list", &["config", "list", "--json"], 8),
     ("status-verbose", &["status", "--verbose"], 45),
 ];

@@ -657,8 +657,15 @@
     };
     draw();
 
-    // Queued first: `lang list` is the slowest source by far, so it gets a CLI
-    // slot before the quick ones rather than starting after them.
+    // The index diagnostics go first and the CLI commands wait for them: both
+    // start processes, and run together the commands starved the diagnostics
+    // past their deadline ("Index status could not be read: no answer within
+    // 60 s"). Alone, get_index_status answers in seconds.
+    const indexRawP = ui.tool("get_index_status");
+    const healthRawP = settle(ui.tool("get_graph_health"), "");
+    ui.holdCliUntil(Promise.allSettled([indexRawP, healthRawP]));
+    // First in the CLI queue: `lang list` is the slowest source by far, so it
+    // gets a slot before the quick ones rather than starting after them.
     const langCliP = settle(ui.cli("lang-list"), null);
     const statusP = settle(ui.api("/api/status", { repo: ui.repo }), null).then((s) => {
       d.status = s;
@@ -686,7 +693,7 @@
       d.logFile = newest || null;
       if (seq === state.seq) renderLog();
     });
-    const indexP = ui.tool("get_index_status").then(
+    const indexP = indexRawP.then(
       (raw) => { d.index = parseIndexHealth(raw); },
       (e) => { d.indexError = e.message; }
     ).then(() => { d.indexLoaded = true; });
@@ -729,7 +736,7 @@
           action: ok ? "reinstallEmbed" : "installEmbed" }];
       } catch (_) { d.sidecars = null; }
     });
-    const healthP = Promise.all([settle(ui.tool("get_graph_health"), ""), statusP, logP]).then(([raw]) => {
+    const healthP = Promise.all([healthRawP, statusP, logP]).then(([raw]) => {
       const body = ui.stripEnvelope(raw).trim();
       if (!body) { d.integrity = null; return; }
       try {

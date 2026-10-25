@@ -97,7 +97,15 @@ window.TravsrUi = (function () {
   const CLI_SLOTS = 2;
   let cliRunning = 0;
   const cliWaiting = [];
+  let cliGate = Promise.resolve();
+  /** Hold every CLI command until `p` settles. Each command starts processes
+   *  of its own (`lang list` sweeps PATH), and on a slow or heavily scanned
+   *  machine they crowded out the index diagnostics started beside them,
+   *  which then missed their deadline. Settled either way: a failed
+   *  diagnostic must not hold the commands back for good. */
+  function holdCliUntil(p) { cliGate = Promise.resolve(p).then(() => {}, () => {}); }
   async function cli(name) {
+    await cliGate;
     if (cliRunning >= CLI_SLOTS) await new Promise((r) => cliWaiting.push(r));
     cliRunning++;
     try {
@@ -310,7 +318,7 @@ window.TravsrUi = (function () {
   }
 
   return {
-    esc, api, tool, cli, init, setConnection, withRepo, editorLink, watch,
+    esc, api, tool, cli, holdCliUntil, init, setConnection, withRepo, editorLink, watch,
     stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
     get repo() { return repo; }, get repoRow() { return repoRow(); }, get repos() { return repos; },
   };
