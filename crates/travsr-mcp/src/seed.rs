@@ -2357,6 +2357,10 @@ pub(crate) fn build_seed_set(
     // uniqueness-gated correction and the g1 subject-share test, not the reranker.
     let mut corrected_anchor_ids: std::collections::HashSet<NodeId> =
         std::collections::HashSet::new();
+    // Nodes whose own name is an emitting token but which the #463 reorder kept out
+    // of the anchor cap (a type behind its own impl/methods). A node here that
+    // still seeds through another leg is classified Exact, not Lexical.
+    let mut named_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
 
     // Boundary predicate reused for both the direct token and a #709 correction:
     // a token counts as resolved only when it appears as a whole word segment (or
@@ -2626,6 +2630,17 @@ pub(crate) fn build_seed_set(
                 specific_token_anchor_ids.insert(node.id);
             }
         }
+        named_ids.extend(
+            anchor_pool
+                .iter()
+                .filter(|n| {
+                    travsr_core::ident::leaf_of(&n.vname.signature)
+                        .eq_ignore_ascii_case(&resolve_token)
+                        && !is_anchor_noise(n)
+                        && filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))
+                })
+                .map(|n| n.id),
+        );
 
         // #540: the measured count, after every drop the loop applies.
         terms[term_idx].anchors_emitted = added_for_this_token;
@@ -2850,7 +2865,7 @@ pub(crate) fn build_seed_set(
                 .max(knn_w.unwrap_or(0.0))
                 .max(rrf_score * 0.5); // fallback: 50% of RRF score when weight unknown
 
-            let source = if anchor_w.is_some() {
+            let source = if anchor_w.is_some() || named_ids.contains(&node_id) {
                 SeedSource::Exact
             } else if knn_w.is_some() {
                 SeedSource::Knn

@@ -1933,6 +1933,34 @@ mod tests {
         assert_eq!(sigs.first(), Some(&"struct:Breaker"), "{sigs:?}");
     }
 
+    /// The type its own methods crowd out of the anchor set still seeds through
+    /// the lexical leg; being named by the query, it is labelled exact.
+    #[test]
+    fn ask_labels_a_crowded_out_named_type_exact() {
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ty = node("struct:Breaker", "struct", "src/breaker.rs");
+        for m in ["should_skip", "record"] {
+            let method = node(&format!("method:Breaker.{m}"), "method", "src/breaker.rs");
+            store.put_node(&method).unwrap();
+            store
+                .put_edge(&Edge::new(ty.id, method.id, EdgeKind::DefinesBinding))
+                .unwrap();
+        }
+        store.put_node(&ty).unwrap();
+        let payload = ask_query(&store, "Breaker", None).unwrap();
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let ty_row = payload
+            .rows
+            .iter()
+            .find(|r| r.signature == "struct:Breaker")
+            .expect("the type is returned");
+        assert_eq!(ty_row.match_source.as_deref(), Some("exact"));
+    }
+
     // ── #376: docs lane on the `ask` surface ─────────────────────────────────
 
     /// Install one doc-chunk node plus a doc-space KNN hook that always returns
