@@ -1,0 +1,409 @@
+/* travsr ui (#1036): the VS Code extension's webview stylesheet, from
+   webviewShell() in packages/travsr-vscode/src/webviews.ts, so the Health,
+   Callers, Dependencies, Blast radius and Repos pages look as they do in the
+   editor. Keep in step with that function. travsr ui additions follow it. */
+  :root {
+    --bg: #141414; --bg-elev: #1a1a1a; --bg-input: #333333;
+    --border: #4d4d4d;
+    --fg: #f6f1ed; --fg-muted: #c8b7ab; --fg-subtle: #8f7a6c;
+    --green: #86df86; --green-deep: #17340e; --gold: #fcd053;
+    --orange: #fb923c; --orange-deep: #4f2000;
+    --error: #ef4444;
+    --blue: #7dd3fc;
+  }
+  /* Light palette, keyed on the class VS Code stamps on a webview's body.
+
+     Deliberately NOT a prefers-color-scheme media query, which is what this was.
+     Inside an Electron window that resolves from the OS appearance rather than
+     from the editor theme, so a light Windows running a dark VS Code theme drew
+     a linen panel in the middle of a dark editor, and no amount of switching
+     themes could shift it: the panel was reporting the desktop, not the editor
+     it is docked in.
+
+     The body class is the authoritative signal and VS Code updates it live, so a
+     theme change repaints without a reload. High-contrast light is named
+     separately because it is a light theme kind of its own that vscode-light does
+     not cover. The reduced-motion query below stays a media query, since that one
+     genuinely is an OS preference.
+
+     No backticks in this comment: the stylesheet is inside a template literal. */
+  body.vscode-light, body.vscode-high-contrast-light {
+    --bg: #f6f1ed; --bg-elev: #fbfaf9; --bg-input: #eee5de;
+    --border: #e2d4ca;
+    --fg: #1a1a1a; --fg-muted: #705f54; --fg-subtle: #8f7a6c;
+    --green: #429429; --green-deep: #dbf6db; --gold: #d89a02;
+    --orange: #b35500; --orange-deep: #fff7ed;
+    --error: #b91c1c;
+    --blue: #0369a1;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: var(--vscode-font-family,'Segoe UI',system-ui,sans-serif);
+    background: var(--bg); color: var(--fg); margin: 0; padding: 16px; font-size: 13px; }
+  h2 { margin: 0 0 4px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .sub { color: var(--fg-subtle); margin: 0 0 16px; font-size: 12px; }
+  .btn { background: var(--bg-input); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px; transition: background 120ms; }
+  .btn:hover:not(:disabled) { background: var(--bg-elev); border-color: var(--fg-muted); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn.primary { background: var(--green-deep); border-color: var(--green); color: var(--green); }
+  .btn.primary:hover:not(:disabled) { background: #1e4a1e; }
+  .btn.danger:hover:not(:disabled) { background: var(--orange-deep); border-color: var(--orange); color: var(--orange); }
+  input, select { background: var(--bg-input); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px; font-family: inherit; }
+  input:focus, select:focus { outline: 2px solid var(--green); outline-offset: 1px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--fg-subtle); font-weight: 600; padding: 6px 8px;
+    border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:hover td { background: var(--bg-elev); }
+  .mono { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 12px; }
+  .muted { color: var(--fg-muted); }
+  .empty { color: var(--fg-subtle); font-style: italic; padding: 12px 0; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; background: var(--green-deep);
+    color: var(--green); border-radius: 12px; padding: 2px 6px 2px 10px; margin: 2px; font-size: 12px; }
+  .chip .x { cursor: pointer; opacity: 0.7; padding: 0 2px; line-height: 1; }
+  .chip .x:hover { opacity: 1; color: var(--orange); }
+  .chip-area { min-height: 28px; display: flex; flex-wrap: wrap; align-items: center;
+    gap: 2px; padding: 4px; background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 6px; margin-bottom: 6px; }
+  .badge { border-radius: 10px; padding: 2px 8px; font-size: 11px; font-weight: 600; }
+  .badge.ok { background: var(--green-deep); color: var(--green); }
+  .badge.stale { background: var(--orange-deep); color: var(--orange); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .addrow { display: flex; gap: 8px; margin: 14px 0; align-items: flex-start; flex-wrap: wrap; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; }
+  .card { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; min-width: 120px; }
+  .card .k { color: var(--fg-subtle); font-size: 11px; text-transform: uppercase; }
+  .card .v { font-size: 22px; color: var(--green); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .x-btn { cursor: pointer; color: var(--fg-subtle); background: none; border: none;
+    padding: 2px 4px; border-radius: 4px; font-size: 13px; }
+  .x-btn:hover { color: var(--orange); }
+  section { margin-top: 20px; }
+  section h3 { font-size: 13px; font-weight: 600; color: var(--fg-muted); text-transform: uppercase;
+    letter-spacing: 0.05em; margin: 0 0 8px; }
+  .lang-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); margin-right: 6px; }
+  /* Recent activity: one row per lifecycle event. */
+  .activity { width: 100%; border-collapse: collapse; }
+  .activity td { padding: 5px 8px; border-bottom: 1px solid var(--border);
+    vertical-align: top; font-size: 12px; }
+  .activity td:first-child { white-space: nowrap; width: 1%; }
+  .activity .detail { font-size: 11px; }
+  .activity .when { font-variant-numeric: tabular-nums; white-space: nowrap; width: 1%; }
+  .activity .what { color: var(--fg); }
+  /* A dot per family, so a run of one kind of work is findable without reading
+     any of it. Same hues the log gives each subsystem. */
+  .activity td.fam { width: 1%; padding-right: 0; }
+  .fam-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--fg-subtle); vertical-align: middle; }
+  .activity tr[data-fam="daemon"] .fam-dot { background: var(--green); }
+  .activity tr[data-fam="git"]    .fam-dot { background: #a78bfa; }
+  .activity tr[data-fam="index"]  .fam-dot { background: var(--orange); }
+  .activity tr[data-fam="search"] .fam-dot { background: var(--gold); }
+  .activity tr[data-fam="query"]  .fam-dot { background: #7dd3fc; }
+  /* Not a subsystem: this one came from the editor, not from the daemon
+     doing work, so it gets a hue that belongs to none of them. */
+  .activity tr[data-fam="editor"] .fam-dot { background: #f0abfc; }
+  /* How many times in a row, as a pill rather than loose text. */
+  .run { font-size: 10px; font-variant-numeric: tabular-nums; color: var(--fg-muted);
+    border: 1px solid var(--border); border-radius: 8px; padding: 0 5px; margin-left: 5px; }
+  /* Whole row tinted, not just the label: a warning should read as one thing. */
+  tr.lvl-WARN td { color: var(--gold); }
+  tr.lvl-ERROR td { color: var(--error); }
+  /* After the family rules on purpose: equal specificity, so severity wins. */
+  .activity tr.lvl-WARN  .fam-dot { background: var(--gold); }
+  .activity tr.lvl-ERROR .fam-dot { background: var(--error); }
+
+  /* Daemon log: fixed height so the panel stays scannable, scrolls on both axes
+     so a long line never widens the page. */
+  .log { max-height: 520px; overflow: auto; background: var(--bg-elev);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+  .log-line { display: flex; gap: 8px; align-items: baseline; padding: 2px 0;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    font-size: 11.5px; white-space: pre; }
+  .log-line .t { flex: 0 0 auto; }
+  .log-line .lv { flex: 0 0 44px; font-weight: 600; }
+  .log-line .tg { flex: 0 0 88px; }
+  .log-line .msg { flex: 1 1 auto; color: var(--fg); }
+  .log-line .detail { flex: 0 0 auto; }
+  /* Only the message takes the colour; time and target stay muted so the tint
+     marks the line without shouting the whole row. The pill carries severity as
+     shape as well as hue, so it still reads without colour vision. */
+  .lvl-WARN .msg { color: var(--gold); }
+  .lvl-ERROR .msg { color: var(--error); }
+  .log-line:hover { background: var(--bg-input); border-radius: 3px; }
+
+  /* Rotation boundary: the log spans daily files, and without a marker a jump
+     back to yesterday looks like a gap in one continuous stream. A rule with
+     the date on it, quiet enough not to compete with the entries either side. */
+  .log-day { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px;
+    color: var(--fg-subtle); font-size: 10px; letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
+  .log-day::before, .log-day::after { content: ""; flex: 1 1 auto;
+    border-top: 1px solid var(--border); }
+
+  .pill { flex: 0 0 auto; min-width: 42px; text-align: center; font-size: 9.5px;
+    font-weight: 700; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 3px;
+    border: 1px solid transparent; text-transform: uppercase; }
+  .p-INFO  { color: var(--green); border-color: var(--green); background: var(--green-deep); }
+  .p-DEBUG, .p-TRACE { color: var(--fg-subtle); border-color: var(--border); opacity: .7; }
+  .p-WARN  { color: var(--gold);  border-color: var(--gold);  background: var(--orange-deep); }
+  .p-ERROR { color: var(--error); border-color: var(--error); }
+
+  /* Toolbar: search on the left, severity threshold in the middle, count on the
+     right, so the eye lands on the control it needs without hunting. */
+  .log-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 0 0 8px; }
+  .log-bar input[type=search] { flex: 1 1 220px; min-width: 160px; padding: 4px 8px;
+    background: var(--bg-input); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 5px; font-size: 12px; font-family: inherit; }
+  .log-bar input[type=search]::placeholder { color: var(--fg-subtle); }
+  .chips { display: flex; gap: 4px; }
+  /* Expands a counted-but-hidden group in place. Styled as a link rather than
+     a button because it sits inside a sentence ("and 46 more  Show") and a
+     bordered control there reads as an action on the registry, which this is
+     not: it only reveals rows already in the document. */
+  .link-btn { cursor: pointer; background: none; border: 0; padding: 0 0 0 4px;
+    font: inherit; font-size: 11px; color: var(--blue); text-decoration: underline; }
+  .link-btn:hover { color: var(--fg); }
+  .chip-btn { cursor: pointer; padding: 3px 9px; font-size: 11px; border-radius: 5px;
+    background: var(--bg-elev); color: var(--fg-muted);
+    border: 1px solid var(--border); font-family: inherit; }
+  .chip-btn:hover { color: var(--fg); }
+  .chip-btn.on { background: var(--green-deep); color: var(--green); border-color: var(--green); }
+  .chip-n { opacity: .65; font-variant-numeric: tabular-nums; }
+  .count { font-size: 11px; color: var(--fg-subtle); font-variant-numeric: tabular-nums;
+    margin-left: auto; }
+  .count.filtered { color: var(--gold); }
+  mark { background: var(--gold); color: var(--bg); border-radius: 2px; padding: 0 1px; }
+
+  /* Activity beside the log rather than above it. Activity is eight rows and the
+     log is two hundred, so stacked left most of the panel empty next to a short
+     table. Side by side they balance and the log gets the height back. Collapses
+     to one column on a narrow panel: the log line has five columns and squeezing
+     them is worse than scrolling. */
+  .split { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 1.9fr);
+    gap: 22px; align-items: start; margin-top: 26px; }
+  .split > section { min-width: 0; }
+  .split h2 { margin-top: 0; }
+  @media (max-width: 880px) { .split { grid-template-columns: 1fr; gap: 26px; } }
+
+  /* Health banner: the answer to "is something wrong", before any detail. */
+  .banner { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-radius: 6px; margin: 14px 0 0; font-size: 12px;
+    border: 1px solid transparent; }
+  .banner strong { font-size: 12px; }
+  .banner span { color: var(--fg-muted); }
+  .banner.good { background: var(--green-deep); border-color: var(--green); color: var(--green); }
+  .banner.bad  { background: var(--orange-deep); border-color: var(--orange); color: var(--orange); }
+  .banner.idle { background: var(--bg-elev); border-color: var(--border); color: var(--fg-muted); }
+  /* #755: contract-skew notice. Block, not flex: it carries prose plus a row of
+     actions, so the parts must stack rather than share a baseline. */
+  .banner.verdict { align-items: center; gap: 10px; }
+  .banner.verdict strong { flex-shrink: 0; }
+  .banner.verdict span { flex-grow: 1; min-width: 0; }
+  .banner.verdict .vact { flex-shrink: 0; margin-left: auto; }
+  .banner.warn2 { background: var(--gold-deep, var(--orange-deep)); border-color: var(--gold);
+    color: var(--gold); }
+  .card.warn .v { color: var(--gold); }
+  .card.bad .v { color: var(--error); }
+  .card .n { margin-top: 2px; font-size: 10px; color: var(--gold); }
+  .phead { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 12px; }
+  .phead h2 { margin: 0; }
+  .phead .sub { margin: 2px 0 0; font-size: 11px; }
+  .phead-a { margin-left: auto; display: flex; align-items: center; gap: 9px; }
+  .checked { font-size: 11px; color: var(--fg-muted); }
+  .hcols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    align-items: start; margin-top: 12px; }
+  .hcol { display: flex; flex-direction: column; gap: 10px; }
+  .hsec { border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden; background: var(--bg-elev); }
+  .hsec > summary { list-style: none; cursor: pointer; min-height: 30px; padding: 0 10px 0 6px;
+    display: flex; align-items: center; gap: 7px; background: var(--bg);
+    border-bottom: 1px solid var(--border); }
+  .hsec > summary::-webkit-details-marker { display: none; }
+  .hsec > summary .nm { font-size: 11px; font-weight: 600; color: var(--fg); }
+  .hsec .chev { width: 13px; height: 13px; flex-shrink: 0; color: var(--fg-muted);
+    transition: transform .12s ease; }
+  .hsec[open] > summary .chev { transform: rotate(90deg); }
+  .hsec .sacts { margin-left: 8px; display: flex; gap: 5px; }
+  .chip { margin-left: auto; display: inline-flex; align-items: center; gap: 4px;
+    font-size: 10px; white-space: nowrap; }
+  .chip.ok { color: var(--green); }
+  .chip.warn { color: var(--gold); }
+  .chip.bad { color: var(--error); }
+  .chip.mute { color: var(--fg-muted); }
+  .ci { width: 12px; height: 12px; flex-shrink: 0; }
+  .hrows { padding: 6px 10px 8px; }
+  .hrow { display: flex; align-items: center; gap: 9px; min-height: 22px; font-size: 12px; }
+  .hrow.muted { color: var(--fg-muted); font-size: 11px; padding: 2px 0; }
+  .hrow.mono-only { font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    font-size: 10px; color: var(--fg-muted); padding-left: 118px; min-height: 17px; }
+  /* The key column is a floor, not a box: a repo name longer than 110px wraps
+     inside its own cell instead of painting over the value beside it. */
+  .hrow > span:first-child { flex: 0 0 auto; min-width: 110px; max-width: 45%; color: var(--fg-muted);
+    overflow-wrap: anywhere; word-break: break-word; line-height: 1.3; }
+  .hrow b { font-weight: 400; color: var(--fg); display: inline-flex; align-items: center;
+    gap: 5px; flex-grow: 1; min-width: 0;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px; }
+  .hrow b.ok { color: var(--green); }
+  .hrow b.warn { color: var(--gold); }
+  .hrow b.bad { color: var(--error); }
+  .hrow .ra { width: auto; margin-left: auto; flex-shrink: 0; }
+  table.ltbl { width: 100%; border-collapse: collapse; }
+  table.ltbl th { text-align: left; font-size: 9px; letter-spacing: .05em;
+    text-transform: uppercase; color: var(--fg-muted); font-weight: 600; padding: 0 6px 4px 0; }
+  table.ltbl td { font-size: 11px; color: var(--fg); padding: 3px 6px 3px 0;
+    border-top: 1px solid var(--border); }
+  table.ltbl td.ok { color: var(--green); }
+  table.ltbl td.warn { color: var(--gold); }
+  table.ltbl td .ci { vertical-align: -2px; margin-right: 4px; }
+  table.ltbl .ra { text-align: right; padding-right: 0; white-space: nowrap; }
+  table.ltbl td.mute { color: var(--fg-subtle); }
+  table.ltbl .lprereq { font-size: 10px; color: var(--fg-subtle); line-height: 1.3; }
+  .btn.mini { padding: 2px 8px; font-size: 11px; }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg-muted); }
+  .diag-a { display: flex; align-items: center; gap: 7px; }
+  .diag-a .diag-cmd { flex-grow: 1; }
+  .banner.warn { display: block; background: var(--orange-deep); border-color: var(--orange);
+    color: var(--fg); }
+  .banner.warn b { color: var(--orange); }
+  .banner.warn p { margin: 0; color: var(--fg-muted); }
+  .banner code { font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    background: var(--bg-input); border-radius: 4px; padding: 0 4px; color: var(--fg); }
+
+  /* One card per problem: what broke, what it costs, what to run. */
+  .diags { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .diag { padding: 10px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg-elev); border-left-width: 3px; }
+  .diag.error { border-left-color: var(--error); }
+  .diag.warn  { border-left-color: var(--gold); }
+  .diag-t { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
+  .diag.error .diag-t { color: var(--error); }
+  .diag.warn  .diag-t { color: var(--gold); }
+  .diag-h { font-size: 11.5px; color: var(--fg-muted); line-height: 1.5; }
+  .diag-a { margin-top: 7px; }
+  .diag-cmd { display: inline-block; padding: 3px 7px; border-radius: 4px;
+    background: var(--bg-input); border: 1px solid var(--border); color: var(--fg);
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px;
+    user-select: all; }
+
+  /* Subsystem tint. A categorical axis, separate from severity, so a run of
+     indexer lines is findable by eye without reading any of them. Kept low
+     saturation: severity is the signal, this is only grouping. */
+  .log-line[data-tg="daemon"]      .tg { color: var(--green); opacity: .75; }
+  .log-line[data-tg="store"]       .tg { color: var(--gold);  opacity: .7; }
+  .log-line[data-tg="indexer"]     .tg { color: var(--orange); opacity: .8; }
+  .log-line[data-tg="plugin-host"] .tg { color: #a78bfa; opacity: .85; }
+  .log-line[data-tg="mcp"]         .tg { color: #7dd3fc; opacity: .85; }
+
+  /* Second toolbar row: the modes that mirror the CLI flags. */
+  .log-bar.modes { margin: -2px 0 8px; font-size: 11px; color: var(--fg-subtle); }
+  .sel { display: inline-flex; align-items: center; gap: 4px; }
+  .sel select { background: var(--bg-input); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 2px 4px; font-size: 11px; font-family: inherit; }
+  .tog { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .tog input { margin: 0; }
+  /* Sits between the mode bar and the log itself, and only when the stored
+     level and the running daemon's disagree. Warn-coloured because it reports
+     that a change the reader just made is not in effect yet, which is the same
+     class of thing as a stale index, not a neutral aside. */
+  .log-note { margin: -4px 0 8px; font-size: 11px; color: var(--gold);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .btn-sm { padding: 2px 8px; font-size: 11px; border-radius: 4px; }
+  /* Quiet asides beside the File control: the day boundary is UTC, and the list
+     may be shorter than what is on disk. Both are things a reader needs once
+     and should not have to read twice. */
+  .hint { color: var(--fg-subtle); }
+  .hint[title] { cursor: help; border-bottom: 1px dotted var(--border); }
+
+  /* JSON mode makes each row expandable rather than replacing the list with a
+     wall of objects. The column line is already the summary, so collapsed costs
+     nothing and 200 entries stay scannable; the stored line is one click away.
+     (No backticks in this stylesheet: it is a template literal.) */
+  .caret { display: none; flex: 0 0 10px; color: var(--fg-subtle); user-select: none; }
+  .caret::before { content: "\25B8"; }
+  .log.json-mode .caret { display: inline-block; }
+  .log.json-mode .log-line { cursor: pointer; padding: 3px 0; }
+  .log.json-mode .log-line.open .caret::before { content: "\25BE"; }
+  .log.json-mode .log-line.open { background: var(--bg-input); border-radius: 3px; }
+  .jsonline { display: none; }
+  .log.json-mode .log-line.open .jsonline { display: block; white-space: pre;
+    overflow-x: auto; line-height: 1.5; margin: 6px 0 4px 18px;
+    padding-left: 10px; border-left: 2px solid var(--border); }
+  .log.json-mode .log-line.open { display: block; }
+  .log.json-mode .log-line.open > span:not(.jsonline) { display: inline; }
+
+  /* A file the log is complaining about, made openable. Underlined on hover only,
+     so a wall of log lines does not read as a wall of links. */
+  .ref { color: var(--blue); cursor: pointer; }
+  .ref:hover { text-decoration: underline; }
+
+  .j-k { color: var(--blue); }
+  .j-s { color: var(--green); }
+  .j-n { color: var(--gold); }
+  .j-b { color: var(--orange); }
+  .j-p { color: var(--fg-subtle); }
+  .j-raw { color: var(--fg-muted); }
+  :focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
+  .badge.dim { background: var(--bg-elev); color: var(--fg-subtle); }
+  .consent { margin-top: 6px; }
+  .consent summary { cursor: pointer; font-size: 12px; color: var(--gold); }
+  .consent-body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 10px;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; }
+  .consent-body label { font-size: 11px; color: var(--fg-subtle); }
+  .consent-body input { width: 100%; }
+  .not-here summary { cursor: pointer; font-size: 11px; color: var(--fg-subtle); list-style: none; }
+  .not-here summary::after { content: ' ↓'; }
+  .not-here[open] summary::after { content: ' ↑'; }
+  .not-here-body { margin-top: 6px; }
+  .spinner { display: inline-block; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #status-bar { display:none; align-items:center; gap:6px; padding:7px 12px;
+    border-radius:6px; margin-bottom:12px; font-size:12px; }
+  #status-bar.s-loading { display:flex; background:var(--bg-elev); color:var(--fg-muted); border:1px solid var(--border); }
+  #status-bar.s-error   { display:flex; background:#2d0000; color:var(--error); border:1px solid var(--error); }
+  #status-bar.s-ok      { display:flex; background:var(--green-deep); color:var(--green); border:1px solid var(--green); }
+
+/* ── travsr ui additions ──────────────────────────────────────────────────
+   The webview body carries the 16px padding; here the navigation strip spans
+   the full width above it, so the padding moves to the page container. */
+body.ui-page { padding: 0; min-height: 100vh; }
+.page { padding: 16px; max-width: 1400px; }
+[hidden] { display: none !important; }
+a { color: var(--blue); }
+/* Read-only stand-in for the extension's action buttons: the command that does
+   the same thing, copyable, since a browser page cannot run it. */
+.cmd { display: inline-flex; align-items: center; gap: 5px; }
+.cmd code { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11px;
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px;
+  color: var(--fg); user-select: all; white-space: nowrap; }
+/* Clickable result rows on the Callers, Dependencies and Blast radius pages. */
+ul.results { margin: 0; padding-left: 20px; }
+ul.results li { font-family: var(--vscode-editor-font-family, ui-monospace, monospace); padding: 2px 0;
+  overflow-wrap: anywhere; }
+ul.results li.dep-ext { color: var(--fg-subtle); }
+ul.results a { text-decoration: none; }
+ul.results a:hover { text-decoration: underline; }
+.lookup { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; }
+.lookup input { min-width: 260px; flex: 0 1 420px; }
+.pills { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.pills .lbl { font-size: 11px; color: var(--fg-subtle); margin-right: 4px; }
+.pill-btn { display: inline-block; padding: 4px 14px; border-radius: 20px; font-size: 12px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-input); color: var(--fg-muted); font-family: inherit; }
+.pill-btn[aria-pressed="true"] { background: var(--green-deep); border-color: var(--green); color: var(--green); font-weight: 600; }
+.pill-btn:disabled { opacity: .55; cursor: not-allowed; }
+.note-box { margin: 8px 0 12px; padding: 8px 12px; border-radius: 6px; font-size: 12px;
+  background: var(--orange-deep); border: 1px solid var(--orange); color: var(--fg); }
+@media (max-width: 760px) { .hcols { grid-template-columns: 1fr; } .lookup input { min-width: 0; flex: 1 1 100%; } }
+/* The page header wraps on a narrow window instead of pushing the Refresh
+   control off the right edge. */
+.phead { flex-wrap: wrap; }
+.phead > div:first-child { min-width: 0; }
+.phead .sub.mono { overflow-wrap: anywhere; }
+.phead-a { flex-wrap: wrap; }

@@ -17087,6 +17087,14 @@ fn run_query(
             payload.watch_shed = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             Ok(serde_json::to_value(payload)?)
         }
+        // #1036: one read-only MCP tool for `travsr ui`. A daemon older than
+        // this arm answers "unknown query tool", which the CLI reads as "route
+        // unavailable" and answers from a direct open instead.
+        "tool" => {
+            let args: query::ToolQueryArgs =
+                serde_json::from_value(args).context("invalid tool query args")?;
+            Ok(serde_json::to_value(query::tool_query(store, &args))?)
+        }
         other => anyhow::bail!("unknown query tool '{other}'"),
     }
 }

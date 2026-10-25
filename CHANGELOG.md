@@ -4,6 +4,14 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## Unreleased
+
+### Added
+
+- **`travsr ui` shows the VS Code extension's pages in a web browser (#1036).** It serves `http://localhost:7330/` with the extension's Health, Graph, Callers, Dependencies, Blast radius and Repos pages and a repo picker. The Graph page is the extension's own graph view, run unchanged; the others reproduce its webviews on the same design tokens, light and dark. Answers come from the same MCP tool code agents call and the same read-only CLI commands the extension runs, graph queries routed through the repository's daemon like `travsr status` (or read from the index when no daemon runs). Index diagnostics that shell out to git are answered from a read-only open so they never hold up the daemon. Everything is compiled into the binary; action buttons copy the command to run. The server binds loopback only and rejects non-loopback `Host` headers against DNS rebinding; another address needs `--allow-remote`. A port already in use is reported with a `--port` hint.
+
+---
+
 ## v1.3.0 - 2026-10-13
 
 > Install with `npm i -g @travsr.com/travsr` or

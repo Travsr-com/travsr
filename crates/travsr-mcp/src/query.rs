@@ -382,6 +382,36 @@ pub fn dirty_semantic_state(resolved: u64, pending: u64) -> String {
     }
 }
 
+/// Arguments of the `tool` query: one [`crate::BROWSE_TOOLS`] MCP tool call.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToolQueryArgs {
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// The `tool` query's answer: the MCP tool's text, or the argument error an MCP
+/// client would get. A bad argument is an answer, not a failed query, so the
+/// daemon route does not fall back to a direct open just to fail again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolPayload {
+    pub text: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Run one read-only MCP tool for `travsr ui` (#1036), through the same
+/// dispatch `tools/call` uses.
+pub fn tool_query(store: &SqliteStore, args: &ToolQueryArgs) -> ToolPayload {
+    match crate::browse_tool_call(store, &args.tool, &args.args) {
+        Ok(text) => ToolPayload { text, error: None },
+        Err(e) => ToolPayload {
+            text: String::new(),
+            error: Some(e),
+        },
+    }
+}
+
 pub fn status_query(store: &SqliteStore) -> anyhow::Result<StatusPayload> {
     let nodes = store.node_count()?;
     // L11: detect FTS/nodes skew — indicates a partial write or a bad migration.

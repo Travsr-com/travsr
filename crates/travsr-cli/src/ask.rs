@@ -763,7 +763,7 @@ const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     ("Set up a repo", &["init", "connect", "guard", "lang"]),
     (
         "Ask about code",
-        &["ask", "graph", "references", "pattern", "explain"],
+        &["ask", "graph", "references", "pattern", "explain", "ui"],
     ),
     ("Run in the background", &["daemon", "mcp", "serve"]),
     (

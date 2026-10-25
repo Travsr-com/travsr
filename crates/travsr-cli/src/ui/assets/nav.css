@@ -1,0 +1,53 @@
+/* travsr ui navigation strip. Scoped under .tsr-nav and self-contained, because
+   it sits on pages styled by two different sheets (shell.css and the
+   extension's graph.css) whose class names overlap. Tokens are the extension's
+   travsr-designer ones, light keyed on body.vscode-light like everything else. */
+
+.tsr-nav {
+  --n-bg: #0f0f0f; --n-border: #333333; --n-fg: #f6f1ed; --n-muted: #c8b7ab;
+  --n-subtle: #8f7a6c; --n-input: #262626; --n-green: #86df86; --n-green-deep: #17340e;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex-shrink: 0;
+  padding: 6px 14px; min-height: 40px;
+  background: var(--n-bg); color: var(--n-fg);
+  border-bottom: 1px solid var(--n-border);
+  font: 12.5px/1.4 'Segoe UI', -apple-system, system-ui, sans-serif;
+  position: relative; z-index: 20;
+}
+body.vscode-light .tsr-nav, body.vscode-high-contrast-light .tsr-nav {
+  --n-bg: #fbfaf9; --n-border: #e2d4ca; --n-fg: #1a1a1a; --n-muted: #705f54;
+  --n-subtle: #8f7a6c; --n-input: #eee5de; --n-green: #429429; --n-green-deep: #dbf6db;
+}
+.tsr-nav .tsr-brand { display: flex; align-items: center; gap: 7px; margin-right: 10px;
+  color: inherit; text-decoration: none; }
+.tsr-nav .tsr-brand img { width: 20px; height: 20px; border-radius: 5px; }
+.tsr-nav .tsr-brand span { font: 700 15px/1 Georgia, Cambria, serif; letter-spacing: .2px; }
+.tsr-nav .tsr-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.tsr-nav .tsr-tab {
+  padding: 4px 10px; border-radius: 5px; font-size: 12px; color: var(--n-muted);
+  border: 1px solid transparent; text-decoration: none; white-space: nowrap;
+}
+.tsr-nav .tsr-tab:hover { color: var(--n-fg); background: var(--n-input); }
+.tsr-nav .tsr-tab[aria-current="page"] {
+  color: var(--n-green); background: var(--n-green-deep); border-color: var(--n-green);
+}
+.tsr-nav .tsr-spacer { flex: 1; }
+.tsr-nav label { display: inline-flex; align-items: center; gap: 5px; color: var(--n-subtle); font-size: 11px; }
+.tsr-nav select {
+  background: var(--n-input); color: var(--n-fg); border: 1px solid var(--n-border);
+  border-radius: 5px; padding: 3px 6px; font: inherit; font-size: 12px; max-width: 220px;
+}
+.tsr-nav select:focus-visible, .tsr-nav a:focus-visible { outline: 2px solid var(--n-green); outline-offset: 1px; }
+.tsr-nav .tsr-conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--n-muted); }
+.tsr-nav .tsr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--n-subtle); }
+.tsr-nav .tsr-dot.ok { background: var(--n-green); }
+.tsr-nav .tsr-dot.bad { background: #ef4444; }
+.tsr-offline {
+  flex-shrink: 0; padding: 6px 14px; font: 12px 'Segoe UI', system-ui, sans-serif;
+  background: #2d0000; color: #ef4444; border-bottom: 1px solid #ef4444;
+}
+body.vscode-light .tsr-offline { background: #fdecea; color: #b91c1c; border-color: #b91c1c; }
+
+@media (max-width: 720px) {
+  .tsr-nav .tsr-brand span { display: none; }
+  .tsr-nav select { max-width: 40vw; }
+}

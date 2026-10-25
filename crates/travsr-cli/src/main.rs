@@ -31,6 +31,7 @@ mod serve;
 mod sidecar_health;
 mod status;
 mod synonym;
+mod ui;
 
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
@@ -373,6 +374,25 @@ enum Command {
         /// Directory containing tenant data subdirectories.
         #[arg(long)]
         tenants_dir: std::path::PathBuf,
+    },
+    /// Browse the code graph in a web browser: repo status, symbol search,
+    /// callers, dependencies, blast radius and the repo map. Read-only; serves
+    /// on this machine only unless --allow-remote is given.
+    Ui {
+        /// Address to bind on. Must be a loopback address unless
+        /// --allow-remote is also given.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port to serve on (0 picks a free one).
+        #[arg(long, default_value = "7330")]
+        port: u16,
+        /// Allow binding a non-loopback address. The page has no
+        /// authentication, so anyone who can reach the port can read the graph.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Open the page in the default browser once the server is up.
+        #[arg(long)]
+        open: bool,
     },
     /// Set up and manage full cross-file analysis per language.
     Lang {
@@ -1659,6 +1679,12 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             serve::run(host, port, tenants_dir).await?;
         }
+        Command::Ui {
+            host,
+            port,
+            allow_remote,
+            open,
+        } => ui::run(host, port, allow_remote, open).await?,
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
         Command::Rerank { action } => rerank::run(action)?,
