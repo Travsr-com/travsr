@@ -33,8 +33,12 @@
     return { nodes: [], edges: [] };
   }
 
+  // The query the canvas is showing, re-run when the index changes.
+  let lastQuery = null;
+
   // GraphPanel.query, over HTTP.
   async function query(m) {
+    lastQuery = m;
     const mode = m.mode || "";
     const pathPrefix = m.path_prefix || "";
     document.title = mode === "overview"
@@ -149,6 +153,15 @@
     const queued = pending.splice(0);
     if (!queued.some((m) => m.command === "query")) await handle(initial);
     for (const m of queued) await handle(m);
+    // Live refresh: redraw what is on the canvas from the new index. The
+    // request id is dropped so graph.js accepts the render even though the
+    // user issued no new query.
+    ui.watch(() => {
+      if (!lastQuery) return undefined;
+      const again = Object.assign({}, lastQuery);
+      delete again.reqId;
+      return query(again);
+    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);

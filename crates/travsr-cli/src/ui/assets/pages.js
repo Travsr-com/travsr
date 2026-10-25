@@ -11,6 +11,9 @@
   const esc = ui.esc;
   const page = document.getElementById("page");
   const params = new URLSearchParams(location.search);
+  // What the open view re-runs when the index changes; each view sets it to
+  // repeat its current query.
+  let refreshView = null;
 
   // `[edge] label (kind) — path:line ~`, the caller row shape.
   const ROW = /^(?:\[([a-z-]+)\]\s*)?(.+?)\s+\(([^()]+)\)\s+—\s+(.+?)(?::(\d+))?(\s+~)?$/;
@@ -54,11 +57,12 @@
       params.set("symbol", v);
       run(v);
     });
-    async function run(sym) {
+    async function run(sym, quiet) {
+      refreshView = () => run(sym, true);
       const out = document.getElementById("out");
       if (!sym) { out.innerHTML = '<p class="sub">Type a symbol and press Show.</p>'; return; }
       document.title = "Callers, " + sym;
-      out.innerHTML = '<h3 style="margin:0 0 12px">Callers of <code>' + esc(sym) + '</code></h3><p class="sub"><span class="spinner">⟳</span> Loading…</p>';
+      if (!quiet) out.innerHTML = '<h3 style="margin:0 0 12px">Callers of <code>' + esc(sym) + '</code></h3><p class="sub"><span class="spinner">⟳</span> Loading…</p>';
       try {
         const raw = await ui.tool("get_callers", { symbol: sym });
         const lines = ui.parseEnvelope(raw);
@@ -84,11 +88,12 @@
       setQuery("file", v);
       run(v);
     });
-    async function run(target) {
+    async function run(target, quiet) {
+      refreshView = () => run(target, true);
       const out = document.getElementById("out");
       if (!target) { out.innerHTML = '<p class="sub">Type a file path and press Show.</p>'; return; }
       document.title = "Dependencies, " + target;
-      out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Loading…</p>';
+      if (!quiet) out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Loading…</p>';
       try {
         const raw = ui.stripEnvelope(await ui.tool("get_dependencies", { file: target, transitive: "true", depth: "3" }));
         const lines = raw.split("\n").map((l) => l.replace(/\s+$/, "")).filter((l) => l.trim());
@@ -137,9 +142,9 @@
         (!lang.semantic_available && lang.install_hint ? '<div class="note-box mono">' + esc(lang.install_hint) +
           (lang.prerequisites && lang.prerequisites !== "none" ? "<div>needs: " + esc(lang.prerequisites) + "</div>" : "") + "</div>" : "");
     }
-    async function render() {
+    async function render(quiet) {
       const out = document.getElementById("out");
-      out.innerHTML = '<h3 style="margin:0 0 12px">Blast radius for <code>' + esc(target) + "</code></h3>" + pills() + '<p class="sub"><span class="spinner">⟳</span> Loading…</p>';
+      if (!quiet) out.innerHTML = '<h3 style="margin:0 0 12px">Blast radius for <code>' + esc(target) + "</code></h3>" + pills() + '<p class="sub"><span class="spinner">⟳</span> Loading…</p>';
       try {
         const raw = await ui.tool("get_blast_radius", { file: target, analysis: mode });
         const files = ui.parseEnvelope(raw);
@@ -153,6 +158,8 @@
       }
     }
     async function start() {
+      // Keeps the chosen analysis mode; only the answer is re-read.
+      refreshView = () => (target ? render(true) : undefined);
       const out = document.getElementById("out");
       if (!target) { out.innerHTML = '<p class="sub">Type a file path and press Show.</p>'; return; }
       document.title = "Blast radius, " + target;
@@ -197,6 +204,7 @@
         }).join("\n") || '<tr><td colspan="4" class="empty">No repos registered.</td></tr>') + "</tbody></table>";
     }
     page.addEventListener("click", (e) => { if (e.target.id === "refreshBtn") render(); });
+    refreshView = render;
     render();
   }
 
@@ -224,5 +232,6 @@
       return;
     }
     (VIEWS[path] || callers)();
+    ui.watch(() => (refreshView ? refreshView() : undefined));
   })();
 })();

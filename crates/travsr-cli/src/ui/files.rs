@@ -93,6 +93,69 @@ pub(super) async fn cli(
     Ok(Json(resp))
 }
 
+#[derive(Serialize, PartialEq, Debug)]
+pub(super) struct VersionResponse {
+    /// Changes whenever the index does. Opaque to the page: it only compares.
+    fingerprint: String,
+    last_commit: Option<String>,
+}
+
+/// `GET /api/version?repo=<repo>`: what the open pages poll to know the index
+/// moved, the browser's version of the extension's `graph.db` file watcher.
+///
+/// Cheap enough to ask every few seconds: `graph.db`'s time and size, the WAL's
+/// size (SQLite writes land in the WAL first, so `graph.db` itself can lag a
+/// reindex by a checkpoint), plus the two commit markers read from a read-only
+/// open. Never the daemon: a poll must not queue on its pipe.
+///
+/// The WAL's *time* is deliberately left out: opening the database, which this
+/// very poll does, touches it, so every poll would read as a change and the
+/// page would never settle. A real write grows the WAL; a checkpoint moves
+/// `graph.db`. Either one changes the fingerprint.
+pub(super) async fn version(
+    State(state): State<Arc<UiState>>,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> Result<Json<VersionResponse>, ApiError> {
+    let repo = resolve_repo(&state, params.get("repo").map(String::as_str))?;
+    tokio::task::spawn_blocking(move || {
+        let db = repo.db_path();
+        let mut wal = db.clone().into_os_string();
+        wal.push("-wal");
+        // Both stats are taken before the open below, which touches the WAL.
+        let db_stamp = std::fs::metadata(&db)
+            .ok()
+            .map(|m| {
+                let ms = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis());
+                format!("{ms}:{}", m.len())
+            })
+            .unwrap_or_default();
+        let wal_len = std::fs::metadata(Path::new(&wal)).map_or(0, |m| m.len());
+        let (last_commit, phase_b) = match crate::daemon_client::open_read_store(&db) {
+            Ok(store) => (
+                store.get_meta("last_commit").ok().flatten(),
+                store.get_meta("phase_b_commit").ok().flatten(),
+            ),
+            Err(_) => (None, None),
+        };
+        Json(VersionResponse {
+            fingerprint: format!(
+                "{}|{}|{}|{}",
+                db_stamp,
+                wal_len,
+                last_commit.as_deref().unwrap_or(""),
+                phase_b.as_deref().unwrap_or("")
+            ),
+            last_commit,
+        })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// Most lines the log reader returns, the extension's `LOG_MAX_LINES`.
 const LOG_MAX_LINES: usize = 5000;
 /// Rotated files listed, the extension's `LOG_MAX_FILES_LISTED`.

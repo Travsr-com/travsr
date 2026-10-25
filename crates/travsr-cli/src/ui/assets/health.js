@@ -847,7 +847,12 @@
       renderLog();
       return;
     }
-    await gather(row);
+    const first = gather(row);
+    // Redraw the whole page when the index changes, as the extension's Health
+    // panel does on its graph.db watcher. The log filters, chips and toggles
+    // survive: only the sections and the log rows are replaced.
+    ui.watch(() => gather(row));
+    await first;
   }
 
   main();

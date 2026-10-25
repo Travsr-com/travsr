@@ -602,6 +602,11 @@ The pages are read-only: where the extension has an action button (Start
 daemon, Reindex, Install analyzer), the page copies the command to run instead.
 "Open in editor" links open the file in VS Code when it is installed.
 
+Open pages redraw themselves when the index changes (after a commit, a save
+the daemon picks up, or a `travsr init`), as the extension's panels do. The
+strip at the top says `live`, `index changing...` while a reindex is still
+writing, and `updating...` while the page redraws.
+
 **Security.** The server binds `127.0.0.1` and only answers requests addressed
 to a loopback name, so a web page on another site cannot reach it through DNS
 rebinding. It has no login: binding any other address needs

@@ -210,6 +210,72 @@ window.TravsrUi = (function () {
       : "No daemon is running for this repository, so answers are read from the index on disk.";
   }
 
+  // ── Live refresh: the browser's version of the extension's graph.db file
+  // watcher (extension.ts dbWatcher -> refreshOpenPanels). Polls a cheap
+  // fingerprint of the index and calls `redraw` once a change has settled. ──
+  const WATCH_MS = 3000;
+  /**
+   * Redraw the open page when the index changes. `redraw` may be async; a
+   * change that lands while one is running is coalesced into one more run.
+   *
+   * A change is acted on only when the next poll reads the same fingerprint:
+   * a reindex writes for a while, and redrawing mid-write would show a graph
+   * that is neither the old one nor the new one. Polling stops while the tab is
+   * hidden and catches up when it is shown again.
+   */
+  function watch(redraw) {
+    let seen = null;     // fingerprint the page is showing
+    let candidate = null; // changed fingerprint waiting to settle
+    let running = false;
+    let again = false;
+    async function fire() {
+      if (running) { again = true; return; }
+      running = true;
+      setLive("updating");
+      try { await redraw(); } catch (_) { /* the page reports its own errors */ }
+      running = false;
+      setLive("live");
+      if (again) { again = false; fire(); }
+    }
+    async function tick() {
+      if (!repo || document.hidden) return;
+      let v;
+      try { v = await api("/api/version", { repo }); } catch (_) { setLive("offline"); return; }
+      if (seen === null) { seen = v.fingerprint; setLive("live"); return; }
+      if (v.fingerprint === seen) { candidate = null; return; }
+      if (v.fingerprint !== candidate) { candidate = v.fingerprint; setLive("changing"); return; }
+      seen = candidate;
+      candidate = null;
+      fire();
+    }
+    tick();
+    setInterval(tick, WATCH_MS);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
+  }
+
+  /** The strip's live indicator, so a reader can tell the page is watching. */
+  function setLive(stateName) {
+    let el = document.getElementById("tsr-live");
+    const conn = document.getElementById("tsr-conn");
+    if (!el && conn) {
+      el = document.createElement("span");
+      el.id = "tsr-live";
+      el.className = "tsr-live";
+      conn.after(el);
+    }
+    if (!el) return;
+    const TEXT = {
+      live: ["live", "This page redraws when the index changes."],
+      changing: ["index changing…", "The index is being updated; the page redraws once it settles."],
+      updating: ["updating…", "Redrawing with the new index."],
+      offline: ["not watching", "Cannot reach the travsr ui server."],
+    };
+    const [text, title] = TEXT[stateName] || TEXT.live;
+    el.textContent = text;
+    el.title = title;
+    el.dataset.state = stateName;
+  }
+
   /** Load the repo list, pick the repo, draw the strip. Resolves to the repo row. */
   async function init(active) {
     applyTheme();
@@ -231,7 +297,7 @@ window.TravsrUi = (function () {
   }
 
   return {
-    esc, api, tool, cli, init, setConnection, withRepo, editorLink,
+    esc, api, tool, cli, init, setConnection, withRepo, editorLink, watch,
     stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
     get repo() { return repo; }, get repoRow() { return repoRow(); }, get repos() { return repos; },
   };

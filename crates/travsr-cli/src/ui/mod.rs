@@ -185,6 +185,7 @@ fn router(state: Arc<UiState>) -> Router {
         // API. GET only; nothing here writes.
         .route("/api/repos", get(repos))
         .route("/api/status", get(status))
+        .route("/api/version", get(files::version))
         .route("/api/tool/:tool", get(tool))
         .route("/api/cli/:name", get(files::cli))
         .route("/api/logs", get(files::logs))

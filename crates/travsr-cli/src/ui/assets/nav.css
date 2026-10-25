@@ -41,6 +41,12 @@ body.vscode-light .tsr-nav, body.vscode-high-contrast-light .tsr-nav {
 .tsr-nav .tsr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--n-subtle); }
 .tsr-nav .tsr-dot.ok { background: var(--n-green); }
 .tsr-nav .tsr-dot.bad { background: #ef4444; }
+.tsr-nav .tsr-live { font-size: 10px; padding: 1px 6px; border-radius: 8px;
+  border: 1px solid var(--n-border); color: var(--n-subtle); white-space: nowrap; }
+.tsr-nav .tsr-live[data-state="live"] { color: var(--n-green); border-color: var(--n-green); }
+.tsr-nav .tsr-live[data-state="changing"], .tsr-nav .tsr-live[data-state="updating"] { color: #fcd053; border-color: #fcd053; }
+body.vscode-light .tsr-nav .tsr-live[data-state="changing"],
+body.vscode-light .tsr-nav .tsr-live[data-state="updating"] { color: #b35500; border-color: #b35500; }
 .tsr-offline {
   flex-shrink: 0; padding: 6px 14px; font: 12px 'Segoe UI', system-ui, sans-serif;
   background: #2d0000; color: #ef4444; border-bottom: 1px solid #ef4444;
