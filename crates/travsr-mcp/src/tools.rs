@@ -8687,7 +8687,13 @@ fn get_context_body(
     // rendered lines are ordered/headed. Gated behind the flag; and collapsed to a
     // flat list for small N (≤4), where per-section headers cost more than they save.
     let group_output = crate::seed::match_source_grouping_enabled() && n_nodes > 4;
-    let entry_meta = |id: NodeId| -> (crate::seed::MatchSource, f32) {
+    let entry_meta = |n: &CoreNode| -> (crate::seed::MatchSource, f32) {
+        // #991 rule 1, as in `ask`: a node whose own name is the whole query
+        // leads the exact section, a test fn included, whatever its score.
+        if travsr_core::ident::leaf_of(&n.vname.signature) == query.trim() {
+            return (crate::seed::MatchSource::Exact, f32::INFINITY);
+        }
+        let id = n.id;
         let is_exact = matches!(
             seed_source_map.get(&id),
             Some(crate::seed::SeedSource::Exact)
@@ -8882,7 +8888,7 @@ fn get_context_body(
                             .copied()
                             .unwrap_or(NodeRole::Context)
                             .label();
-                        let (ms, score) = entry_meta(n.id);
+                        let (ms, score) = entry_meta(n);
                         let line = format_node_line(
                             n,
                             role,
@@ -8934,7 +8940,7 @@ fn get_context_body(
                 .copied()
                 .unwrap_or(NodeRole::Context)
                 .label();
-            let (ms, score) = entry_meta(n.id);
+            let (ms, score) = entry_meta(n);
             let header = format_node_line(
                 n,
                 role,
@@ -9013,7 +9019,7 @@ fn get_context_body(
                     .copied()
                     .unwrap_or(NodeRole::Context)
                     .label();
-                let (ms, score) = entry_meta(n.id);
+                let (ms, score) = entry_meta(n);
                 let line = format_node_line(
                     n,
                     role,
@@ -16244,6 +16250,43 @@ mod snippet_tests {
             result.contains("[via: seed · exact-name]"),
             "direct exact match must be labelled [via: seed · exact-name]: {result}"
         );
+    }
+
+    /// #991 rule 1 on `get_context`: a test fn named by the whole query leads
+    /// the result instead of rendering in the tests section below the rest.
+    #[test]
+    fn get_context_bare_identifier_puts_the_named_node_first() {
+        use travsr_core::EdgeKind;
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut test_fn = make_fn_node_with_pkg("t.ts", "fn:frob_handles_empty", 1, 3);
+        test_fn.test_role = travsr_core::TestRole::EntryPoint;
+        let frob = make_fn_node_with_pkg("f.ts", "fn:frob", 1, 3);
+        let mut nodes = vec![test_fn.clone(), frob.clone()];
+        let mut edges = vec![(test_fn.id, frob.id, EdgeKind::RefCall)];
+        for dep in ["handles_a", "handles_b", "handles_c", "handles_d"] {
+            let d = make_fn_node_with_pkg(&format!("{dep}.ts"), &format!("fn:{dep}"), 1, 3);
+            edges.push((frob.id, d.id, EdgeKind::Depends));
+            nodes.push(d);
+        }
+        let store = make_store_with_edges(&nodes, &edges);
+        let result = get_context_body(
+            &store,
+            "frob_handles_empty",
+            4096,
+            &OpenFilter,
+            false,
+            None,
+            None,
+        );
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let first = result
+            .lines()
+            .find(|l| l.contains(" — "))
+            .unwrap_or_default();
+        assert!(first.starts_with("fn:frob_handles_empty "), "{result}");
     }
 
     #[test]
