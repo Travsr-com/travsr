@@ -305,10 +305,19 @@
     const diags = d.diags || [];
     // No verdict until the sources it ranks have answered: a premature "Not
     // watching" over a daemon that is merely slow to report would be wrong.
-    const settled = d.daemonDetail !== null && d.indexLoaded && d.diagsLoaded;
-    const verdict = (settled && d.statusLoaded) || (d.statusLoaded && !hasGraph)
+    // Analyzer warnings rank last, so once daemon and index are known every
+    // other outcome (no graph, not answering, not watching, stale) is final
+    // and shown at once; only healthy-versus-degraded waits for the slow
+    // `status --verbose` read.
+    const coreKnown = d.statusLoaded && d.daemonDetail !== null && d.indexLoaded;
+    const early = coreKnown || (d.statusLoaded && !hasGraph)
       ? computeVerdict(mcpConnected, daemonRunning, index, diags, hasGraph)
-      : { verdict: "unindexed", headline: "Checking", detail: "Reading daemon, index and analyzer status…" };
+      : null;
+    const verdict = !early
+      ? { verdict: "unindexed", headline: "Checking", detail: "Reading daemon and index status…" }
+      : !d.diagsLoaded && (early.verdict === "healthy" || early.verdict === "degraded")
+        ? { verdict: "unindexed", headline: "Checking", detail: "Daemon and index are fine; reading analyzer warnings…" }
+        : early;
     const VERDICT_CLASS = { offline: "bad", stale: "warn2", degraded: "warn2", unindexed: "idle", healthy: "good" };
     const verdictBanner = '<div class="banner ' + VERDICT_CLASS[verdict.verdict] + ' verdict"><strong>' + esc(verdict.headline) + "</strong><span>" + esc(verdict.detail) + "</span>" +
       (verdict.action ? '<button class="btn primary vact" data-copy="' + esc(verdict.action.cmd) + '" title="Copy: ' + esc(verdict.action.cmd) + '">' + esc(verdict.action.label) + "</button>" : "") + "</div>";
@@ -697,6 +706,9 @@
       (raw) => { d.index = parseIndexHealth(raw); },
       (e) => { d.indexError = e.message; }
     ).then(() => { d.indexLoaded = true; });
+    // Held behind the index diagnostics like the other commands: run beside
+    // them, its own toolchain probes pushed get_index_status from seconds to
+    // past its deadline on a machine where every process start is slow.
     const diagsP = settle(ui.cli("status-verbose"), null).then((r) => { d.diags = r ? readDiagnostics(r.out) : []; d.diagsLoaded = true; });
     const daemonP = Promise.all([settle(ui.cli("daemon-status"), null), statusP]).then(([r]) => {
       const line = r ? ((/^daemon:\s*(.+)$/m.exec(r.out) || [])[1] || "").trim() : "";

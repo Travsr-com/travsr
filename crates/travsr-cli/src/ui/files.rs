@@ -21,9 +21,9 @@ use super::{resolve_repo, ApiError, UiState};
 
 /// The read-only commands the extension's Health page spawns, by the name the
 /// page asks for. Nothing outside this table can be run, and none of these
-/// writes: the page has no way to name an argument. `daemon status` and
-/// `status --verbose` talk to the daemon themselves, exactly as they do when
-/// the extension runs them.
+/// writes: the page has no way to name an argument. The first four are
+/// answered in-process (see [`in_process`]); the argv here is what they mean
+/// and what the read-only test checks.
 const CLI_COMMANDS: &[(&str, &[&str], u64)] = &[
     ("version", &["--version"], 8),
     // Longer than the CLI's own 20 s pipe timeout, so a busy daemon is
@@ -62,6 +62,17 @@ pub(super) async fn cli(
         .find(|(n, _, _)| *n == name)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("unknown command '{name}'")))?;
     let repo = resolve_repo(&state, params.get("repo").map(String::as_str))?;
+    // This server is the `travsr` binary, so the commands that only format
+    // what this process can read itself are answered here, from the same code
+    // the CLI prints. Starting a process for them cost 4-5 s each on a slow
+    // machine and queued the Daemon section behind `lang list`.
+    if let Some(answer) = in_process(&name, &repo.root).await {
+        return Ok(Json(CliResponse {
+            out: answer.clone(),
+            stdout: answer,
+            code: Some(0),
+        }));
+    }
     let exe = std::env::current_exe()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let child = tokio::process::Command::new(exe)
@@ -94,6 +105,24 @@ pub(super) async fn cli(
         },
     };
     Ok(Json(resp))
+}
+
+/// The output of an allowlisted command that needs no process of its own, or
+/// `None` for the ones that do (`lang list`, `status --verbose`). Each line
+/// ends the way the CLI's `println!` ends it.
+async fn in_process(name: &str, root: &Path) -> Option<String> {
+    let root = root.to_path_buf();
+    let text = match name {
+        "version" => format!("travsr {}", env!("CARGO_PKG_VERSION")),
+        // Pipe I/O, up to the CLI's own 20 s timeout: off the async workers.
+        "daemon-status" => tokio::task::spawn_blocking(move || crate::daemon_status_text(&root))
+            .await
+            .ok()?,
+        "config-list" => crate::config::list_json(Some(&root)),
+        "embed-list" => crate::embed::list_json(Some(&root)),
+        _ => return None,
+    };
+    Some(text + "\n")
 }
 
 #[derive(Serialize, PartialEq, Debug)]

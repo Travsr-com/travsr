@@ -104,7 +104,11 @@ window.TravsrUi = (function () {
    *  which then missed their deadline. Settled either way: a failed
    *  diagnostic must not hold the commands back for good. */
   function holdCliUntil(p) { cliGate = Promise.resolve(p).then(() => {}, () => {}); }
+  // Answered inside the server from the CLI's own code, so they start no
+  // process and need neither the hold nor a slot.
+  const CLI_IN_PROCESS = ["version", "daemon-status", "config-list", "embed-list"];
   async function cli(name) {
+    if (CLI_IN_PROCESS.includes(name)) return api("/api/cli/" + name, { repo });
     await cliGate;
     if (cliRunning >= CLI_SLOTS) await new Promise((r) => cliWaiting.push(r));
     cliRunning++;
