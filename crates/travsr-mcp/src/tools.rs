@@ -8689,8 +8689,9 @@ fn get_context_body(
     let group_output = crate::seed::match_source_grouping_enabled() && n_nodes > 4;
     let entry_meta = |n: &CoreNode| -> (crate::seed::MatchSource, f32) {
         // #991 rule 1, as in `ask`: a node whose own name is the whole query
-        // leads the exact section, a test fn included, whatever its score.
-        if travsr_core::ident::leaf_of(&n.vname.signature) == query.trim() {
+        // leads the exact section, a test fn included, whatever its score. An
+        // `impl` carries its type's name but is not the definition.
+        if n.kind != "impl" && travsr_core::ident::leaf_of(&n.vname.signature) == query.trim() {
             return (crate::seed::MatchSource::Exact, f32::INFINITY);
         }
         let id = n.id;
@@ -16287,6 +16288,40 @@ mod snippet_tests {
             .find(|l| l.contains(" — "))
             .unwrap_or_default();
         assert!(first.starts_with("fn:frob_handles_empty "), "{result}");
+    }
+
+    /// #991 rule 1 on `get_context`: an `impl` shares its type's name and, owning
+    /// the methods, precedes the type in knapsack order; the type still leads.
+    #[test]
+    fn get_context_bare_type_name_leads_its_own_impl() {
+        use travsr_core::EdgeKind;
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let node = |sig: &str, kind: &str| {
+            CoreNode::new(VName::new("corpus", "", "frob.rs", "rust", sig), kind)
+                .with_line(1)
+                .with_end_line(3)
+        };
+        let imp = node("impl:Frob", "impl");
+        let ty = node("struct:Frob", "struct");
+        let mut nodes = vec![imp.clone()];
+        let mut edges = Vec::new();
+        for m in ["open", "close", "read", "write"] {
+            let method = node(&format!("method:Frob.{m}"), "method");
+            edges.push((imp.id, method.id, EdgeKind::DefinesBinding));
+            nodes.push(method);
+        }
+        nodes.push(ty);
+        let store = make_store_with_edges(&nodes, &edges);
+        let result = get_context_body(&store, "Frob", 4096, &OpenFilter, false, None, None);
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let first = result
+            .lines()
+            .find(|l| l.contains(" — "))
+            .unwrap_or_default();
+        assert!(first.starts_with("struct:Frob "), "{result}");
     }
 
     #[test]
