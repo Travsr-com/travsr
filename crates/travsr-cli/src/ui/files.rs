@@ -302,11 +302,25 @@ pub(super) async fn source(
     if !is_plain_relative(&rel) {
         return Err(bad("path must be relative to the repository"));
     }
+    if is_private_dir(&rel) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "the peek shows source files, not .git or .travsr".into(),
+        ));
+    }
     let root = std::fs::canonicalize(&repo.root).map_err(|e| bad(&e.to_string()))?;
     let full = std::fs::canonicalize(root.join(&rel))
         .map_err(|_| ApiError(StatusCode::NOT_FOUND, format!("no file '{rel}'")))?;
     if !full.starts_with(&root) {
         return Err(bad("path leaves the repository"));
+    }
+    // Again on the resolved path: a symlink in the tree can point into .git.
+    let resolved_rel = full.strip_prefix(&root).unwrap_or(&full);
+    if is_private_dir(&resolved_rel.to_string_lossy()) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "the peek shows source files, not .git or .travsr".into(),
+        ));
     }
     if std::fs::metadata(&full)
         .map(|m| m.len())
@@ -316,6 +330,11 @@ pub(super) async fn source(
         return Err(bad("file too large to preview"));
     }
     let text = std::fs::read(&full).map_err(|e| bad(&e.to_string()))?;
+    // A NUL byte in the first 8 KiB is what git calls binary: there is no
+    // definition to show in it, only bytes rendered as mojibake.
+    if text.iter().take(8192).any(|b| *b == 0) {
+        return Err(bad("not a text file"));
+    }
     let text = String::from_utf8_lossy(&text);
     let all: Vec<&str> = text.lines().collect();
     let def = line - 1;
@@ -334,6 +353,19 @@ pub(super) async fn source(
         line,
         lines,
     }))
+}
+
+/// Under `.git` or `.travsr`, at any depth and in any letter case (Windows and
+/// macOS file systems are case-insensitive). Neither holds source: `.git` holds
+/// config that can carry credentials, `.travsr` the index and its logs.
+fn is_private_dir(p: &str) -> bool {
+    Path::new(p).components().any(|c| match c {
+        Component::Normal(s) => {
+            let s = s.to_string_lossy().to_ascii_lowercase();
+            s == ".git" || s == ".travsr"
+        }
+        _ => false,
+    })
 }
 
 /// Relative, with no `..`, root or prefix component.
@@ -358,6 +390,17 @@ mod tests {
         assert!(!is_plain_relative("/etc/passwd"));
         #[cfg(windows)]
         assert!(!is_plain_relative("C:\\Windows\\win.ini"));
+    }
+
+    #[test]
+    fn git_and_travsr_dirs_are_private() {
+        assert!(is_private_dir(".git/config"));
+        assert!(is_private_dir(".GIT/config"));
+        assert!(is_private_dir(".travsr/graph.db"));
+        assert!(is_private_dir("sub/.git/HEAD"));
+        assert!(!is_private_dir("src/main.rs"));
+        assert!(!is_private_dir(".github/workflows/ci.yml"));
+        assert!(!is_private_dir("src/.gitignore"));
     }
 
     #[test]

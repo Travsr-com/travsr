@@ -96,7 +96,13 @@
       if (!quiet) out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Loading…</p>';
       try {
         const raw = ui.stripEnvelope(await ui.tool("get_dependencies", { file: target, transitive: "true", depth: "3" }));
-        const lines = raw.split("\n").map((l) => l.replace(/\s+$/, "")).filter((l) => l.trim());
+        let lines = raw.split("\n").map((l) => l.replace(/\s+$/, "")).filter((l) => l.trim());
+        // Every dependency line is a `kind:specifier`; a line with spaces and
+        // no such prefix is the tool talking ("no file matched ..."), so it
+        // is shown as a note rather than listed as a dependency.
+        const isSpec = (l) => /^\s*(↳\s*)?[\w-]+:\S/.test(l) && !/\s\S+\s/.test(l.trim());
+        const notes = lines.filter((l) => !isSpec(l));
+        lines = lines.filter(isSpec);
         const direct = lines.filter((l) => !l.startsWith(" ") && !l.includes("↳"));
         const transitive = lines.filter((l) => l.startsWith(" ") || l.includes("↳"));
         // The extension resolves `./x` specifiers against the file system to
@@ -109,7 +115,8 @@
         };
         out.innerHTML = '<h3 style="margin:0 0 12px">Dependencies of <code>' + esc(target) + "</code> " +
           '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: target })) + '">show in graph</a></h3>' +
-          '<ul class="results">' + (direct.map(li).join("\n") || "<li><em>none</em></li>") + "</ul>" +
+          notes.map((n) => '<div class="note-box">' + esc(n.trim()) + "</div>").join("") +
+          '<ul class="results">' + (direct.map(li).join("\n") || (notes.length ? "" : "<li><em>none</em></li>")) + "</ul>" +
           (transitive.length ? '<details open><summary style="cursor:pointer;margin:12px 0 6px;font-weight:600;font-size:12px;color:var(--fg-muted)">Transitive (' + transitive.length + ')</summary><ul class="results">' + transitive.map(li).join("\n") + "</ul></details>" : "");
       } catch (e) {
         out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";

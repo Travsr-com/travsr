@@ -407,3 +407,7 @@ ul.results a:hover { text-decoration: underline; }
 .phead > div:first-child { min-width: 0; }
 .phead .sub.mono { overflow-wrap: anywhere; }
 .phead-a { flex-wrap: wrap; }
+/* Long unbroken values (a named-pipe path, an exe path, a registry database
+   path) wrap inside their cell instead of widening the page on a narrow
+   window. */
+.activity td.detail, table td.mono { overflow-wrap: anywhere; word-break: break-word; }

@@ -293,6 +293,19 @@ window.TravsrUi = (function () {
       : current ? current.name
       : (repos.find((r) => r.indexed) || repos[0] || {}).name || null;
     renderNav(active);
+    // A link naming a repo this server does not know (renamed, pruned, or a
+    // typo) must not quietly show a different one under the old name.
+    if (urlRepo && !has(urlRepo)) {
+      const u = new URL(location.href);
+      if (repo) u.searchParams.set("repo", repo); else u.searchParams.delete("repo");
+      history.replaceState(null, "", u.toString());
+      const note = document.createElement("div");
+      note.className = "tsr-offline";
+      note.setAttribute("role", "status");
+      note.textContent = "No indexed repository named “" + urlRepo + "”" +
+        (repo ? "; showing " + repo + " instead." : ".");
+      document.querySelector(".tsr-nav").after(note);
+    }
     return repoRow();
   }
 
