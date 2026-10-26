@@ -8666,7 +8666,18 @@ fn get_context_body(
     // total minus what the docs section already measured and clamped — a
     // docs-free query has `doc_tokens == 0`, so this is byte-identical to the
     // pre-Phase-2 call.
-    let selected = knapsack(items, token_budget.saturating_sub(doc_tokens));
+    //
+    // #991 rule 1 decides inclusion, not just order: a definition named by the
+    // whole query is budgeted first. Its PPR value can be the lowest in the set
+    // (a leaf type with few edges), so a single knapsack over PPR dropped it
+    // while its neighbours filled the budget.
+    let code_budget = token_budget.saturating_sub(doc_tokens);
+    let (named, rest): (Vec<_>, Vec<_>) = items
+        .into_iter()
+        .partition(|(n, _)| crate::seed::is_named_by(n, query.trim()));
+    let mut selected = knapsack(named, code_budget);
+    let named_tokens: usize = selected.iter().map(token_cost).sum();
+    selected.extend(knapsack(rest, code_budget.saturating_sub(named_tokens)));
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
@@ -16321,6 +16332,41 @@ mod snippet_tests {
             .find(|l| l.contains(" — "))
             .unwrap_or_default();
         assert!(first.starts_with("struct:Frob "), "{result}");
+    }
+
+    /// #991 rule 1 under a tight budget: the type has no edges, so its PPR value
+    /// is the lowest and the knapsack filled the budget with its impl and
+    /// methods instead (`get_context("Config", 400)` showed no `Config`).
+    #[test]
+    fn get_context_bare_type_name_survives_a_tight_budget() {
+        use travsr_core::EdgeKind;
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let node = |sig: &str, kind: &str| {
+            CoreNode::new(VName::new("corpus", "", "frob.rs", "rust", sig), kind)
+                .with_line(1)
+                .with_end_line(3)
+        };
+        let imp = node("impl:Frob", "impl");
+        let ty = node("struct:Frob", "struct");
+        let mut nodes = vec![imp.clone()];
+        let mut edges = Vec::new();
+        for m in ["open", "close", "read", "write"] {
+            let method = node(&format!("method:Frob.{m}"), "method");
+            edges.push((imp.id, method.id, EdgeKind::DefinesBinding));
+            nodes.push(method);
+        }
+        nodes.push(ty.clone());
+        let store = make_store_with_edges(&nodes, &edges);
+        let budget = 2 * travsr_retrieval::token_cost(&ty);
+        let result = get_context_body(&store, "Frob", budget, &OpenFilter, false, None, None);
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        assert!(
+            result.lines().any(|l| l.starts_with("struct:Frob ")),
+            "{result}"
+        );
     }
 
     #[test]
