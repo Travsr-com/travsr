@@ -88,8 +88,8 @@ $ travsr daemon start
 ## how do I connect it to an AI agent?
 > Travsr speaks MCP, so any agent that supports it can query the graph.
 - detects the coding tools you already have installed
-- claude-code is configured for you, in .mcp.json and CLAUDE.md
-- cursor and zed get their config printed for you to paste
+- detected tools are configured for you (Claude Code, Cursor, Kilo, ...)
+- Codex, Windsurf and Antigravity get config printed to paste
 - travsr connect --print   shows what would change first
 Run it from the repo you want the agent to see. Start with --print, which changes nothing and shows you exactly what it would write, then run it for real.
 $ travsr connect
@@ -117,11 +117,12 @@ $ travsr mcp --stdio
 1. see what would change, without writing anything :: travsr connect --print
 2. write the config for every tool it can :: travsr connect
 3. restart the agent so it re-reads its config :: 
-- recognised today   claude-code, cursor, zed
-- claude-code is written for you; the others print config to paste
+- recognised today   claude-code, cursor, vscode-copilot, gemini-cli
+- and also           antigravity, codex, windsurf, zed, opencode, kilo
+- opencode and kilo get opencode.json / kilo.json (comments are kept)
 - one tool only      travsr connect --tool cursor
 - undo it later      travsr connect --remove
-connect records the absolute path of the binary it was run from, so an agent started days later launches the same travsr you tested with. Run it again after moving or upgrading the binary, and remember the agent only reads its config at startup.
+OpenCode and Kilo get the absolute path of the binary, since editors started from a launcher do not inherit your PATH; other tools get plain `travsr` when it is on PATH. Run it again after moving or upgrading the binary, and remember the agent only reads its config at startup.
 
 ## how do I stop my agent reaching for grep?
 
