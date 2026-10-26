@@ -743,20 +743,23 @@ pub fn ask_query_with_filter(
                 expanded_cap,
                 seed_set.confidence,
             );
-            // #991: sort key, see the sort below. An `impl` carries its type's
-            // name but is not the definition, so it does not take rule 1.
-            let order =
-                if n.kind != "impl" && travsr_core::ident::leaf_of(&n.vname.signature) == query {
-                    (0, 0.0)
-                } else if is_primary {
-                    (if is_exact { 1 } else { 2 }, score)
-                } else {
-                    (3, 0.0)
-                };
+            // #991: sort key, see the sort below.
+            let named = crate::seed::is_named_by(&n, query);
+            let order = if named {
+                (0, 0.0)
+            } else if is_primary {
+                (if is_exact { 1 } else { 2 }, score)
+            } else {
+                (3, 0.0)
+            };
             let signature = display_label(&n).into_owned();
             let row = AskRow {
                 score,
                 match_source: emit_match_source.then(|| {
+                    // As `get_context` does: the named node leads the exact section.
+                    if named {
+                        return crate::seed::MatchSource::Exact.label().to_string();
+                    }
                     if test_node_ids.contains(&n.id) {
                         return crate::seed::MatchSource::Tests.label().to_string();
                     }
@@ -778,8 +781,8 @@ pub fn ask_query_with_filter(
     // lookup, where the cross-encoder scores a type and its own impl/methods/
     // imports alike), then exact seeds, then semantic seeds, each seed group by
     // displayed score (the rerank score when the seed was reranked), then
-    // non-seeds. Test nodes order by their seed provenance; only their label is
-    // "tests". The sort is stable, so ties and non-seeds keep knapsack order.
+    // non-seeds. Other test nodes order by their seed provenance; only their label
+    // is "tests". The sort is stable, so ties and non-seeds keep knapsack order.
     // Measured on SWE-bench Lite agent queries (#998): django Acc@1 57.9% ->
     // 73.7%, sphinx 68.8% -> 75.0%.
     if emit_match_source {
@@ -1937,6 +1940,95 @@ mod tests {
         std::env::remove_var("TRAVSR_NO_RERANK");
         let sigs: Vec<_> = payload.rows.iter().map(|r| r.signature.as_str()).collect();
         assert_eq!(sigs.first(), Some(&"struct:Breaker"), "{sigs:?}");
+    }
+
+    /// The type its own methods crowd out of the anchor set still seeds through
+    /// the lexical leg; being named by a query token, it is labelled exact. Two
+    /// tokens, so #991 rule 1 (the whole query is the name) cannot label it.
+    #[test]
+    fn ask_labels_a_crowded_out_named_type_exact() {
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ty = node("struct:Breaker", "struct", "src/breaker.rs");
+        for m in ["should_skip", "record"] {
+            let method = node(&format!("method:Breaker.{m}"), "method", "src/breaker.rs");
+            store.put_node(&method).unwrap();
+            store
+                .put_edge(&Edge::new(ty.id, method.id, EdgeKind::DefinesBinding))
+                .unwrap();
+        }
+        store.put_node(&ty).unwrap();
+        let payload = ask_query(&store, "Breaker record", None).unwrap();
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let ty_row = payload
+            .rows
+            .iter()
+            .find(|r| r.signature == "struct:Breaker")
+            .expect("the type is returned");
+        assert_eq!(ty_row.match_source.as_deref(), Some("exact"));
+    }
+
+    /// Only the definition the query names is promoted: not a constant that
+    /// differs in case only (`ask Seed` labelled `var:SEED` exact).
+    #[test]
+    fn ask_does_not_label_a_case_variant_of_the_named_type_exact() {
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ty = node("struct:Breaker", "struct", "src/breaker.rs");
+        for m in ["should_skip", "record", "trip"] {
+            let method = node(&format!("method:Breaker.{m}"), "method", "src/breaker.rs");
+            store.put_node(&method).unwrap();
+            store
+                .put_edge(&Edge::new(ty.id, method.id, EdgeKind::DefinesBinding))
+                .unwrap();
+        }
+        store.put_node(&ty).unwrap();
+        store
+            .put_node(&node("static:BREAKER", "static", "src/breaker.rs"))
+            .unwrap();
+        let payload = ask_query(&store, "Breaker", None).unwrap();
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let labels: Vec<_> = payload
+            .rows
+            .iter()
+            .map(|r| (r.signature.as_str(), r.match_source.as_deref()))
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .all(|(s, l)| *s != "static:BREAKER" || *l != Some("exact")),
+            "{labels:?}"
+        );
+    }
+
+    /// #991 rule 1 labels the named node exact on `ask` as on `get_context`, a
+    /// test fn included, so the human table does not file it under tests.
+    #[test]
+    fn ask_labels_a_named_test_fn_exact() {
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut test_fn = node("fn:frob_handles_empty", "function", "src/frob.rs");
+        test_fn.test_role = travsr_core::TestRole::EntryPoint;
+        let frob = node("fn:frob", "function", "src/frob.rs");
+        store.put_node(&test_fn).unwrap();
+        store.put_node(&frob).unwrap();
+        store
+            .put_edge(&Edge::new(test_fn.id, frob.id, EdgeKind::RefCall))
+            .unwrap();
+        let payload = ask_query(&store, "frob_handles_empty", None).unwrap();
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let first = payload.rows.first().expect("a row");
+        assert_eq!(first.signature, "fn:frob_handles_empty");
+        assert_eq!(first.match_source.as_deref(), Some("exact"));
     }
 
     // ── #376: docs lane on the `ask` surface ─────────────────────────────────

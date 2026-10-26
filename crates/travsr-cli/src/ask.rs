@@ -461,8 +461,9 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
     // RFC-022 §14: when match-source grouping is on (rows carry `match_source`)
     // and the result is large enough (N>4) that section headers pay for themselves,
     // print one table per Exact → Semantic → Docs → Tests → Relevant section.
-    // Otherwise a single flat table (unchanged default). This never reorders the
-    // JSON `rows` (that path returned above); it only regroups the human table.
+    // Otherwise a single flat table (unchanged default). Each section keeps the
+    // JSON `rows` order (#991: the backend already ranks them), except the capped
+    // tests section, which sorts by score so the cap keeps the best tests.
     let grouped = n > 4 && payload.rows.iter().any(|r| r.match_source.is_some());
     if grouped {
         for tag in SECTION_TAGS {
@@ -482,11 +483,11 @@ pub fn run(query_str: &str, format: OutputFormat) -> anyhow::Result<()> {
             if section.is_empty() {
                 continue;
             }
-            section.sort_by(|a, b| b.score.total_cmp(&a.score));
             // #479: cap the tests lane in the human table the same way
             // `get_context`'s `assemble_context_body` does (TESTS_CAP = 3) so a
             // test lane never dominates the summary. The JSON `rows` keep every row.
             if tag == "tests" {
+                section.sort_by(|a, b| b.score.total_cmp(&a.score));
                 section.truncate(3);
             }
             let rows: Vec<Row> = section.iter().map(|r| to_row(r)).collect();
