@@ -530,6 +530,11 @@ mod lock_tests {
     /// Single-flight: while one process holds the restart lock, a second cannot,
     /// so only one ever sends Shutdown. The lock frees on drop (and, in prod,
     /// when the holder dies, since it is an flock).
+    ///
+    /// The flock belongs to the open file description, so a child another test
+    /// is spawning right now holds it too until that child execs (Linux
+    /// `posix_spawn` copies the fd table; CLOEXEC only closes it at exec). The
+    /// re-acquire therefore waits for that window instead of asserting at once.
     #[test]
     fn restart_lock_is_single_flight() {
         let tmp = tempfile::tempdir().unwrap();
@@ -541,10 +546,14 @@ mod lock_tests {
             "a second restarter must be locked out while the first holds it"
         );
         drop(first);
-        assert!(
-            try_lock_restart(tmp.path()).is_some(),
-            "the lock must be free once the holder drops it"
-        );
+        let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while try_lock_restart(tmp.path()).is_none() {
+            assert!(
+                std::time::Instant::now() < cutoff,
+                "the lock must be free once the holder drops it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
