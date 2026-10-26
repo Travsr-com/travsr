@@ -1943,7 +1943,8 @@ mod tests {
     }
 
     /// The type its own methods crowd out of the anchor set still seeds through
-    /// the lexical leg; being named by the query, it is labelled exact.
+    /// the lexical leg; being named by a query token, it is labelled exact. Two
+    /// tokens, so #991 rule 1 (the whole query is the name) cannot label it.
     #[test]
     fn ask_labels_a_crowded_out_named_type_exact() {
         let _guard = crate::rerank::RERANK_ENV_LOCK
@@ -1960,7 +1961,7 @@ mod tests {
                 .unwrap();
         }
         store.put_node(&ty).unwrap();
-        let payload = ask_query(&store, "Breaker", None).unwrap();
+        let payload = ask_query(&store, "Breaker record", None).unwrap();
         std::env::remove_var("TRAVSR_NO_RERANK");
         let ty_row = payload
             .rows
