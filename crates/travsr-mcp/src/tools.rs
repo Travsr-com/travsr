@@ -1632,7 +1632,11 @@ pub(crate) fn resolve_reference_targets(
 /// graph under the original. One bounded text search over the indexed files,
 /// run only when the name has no definition of its own; an original that
 /// resolves to no definition (a cast like `x as u32`) is dropped.
-fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
+pub(crate) fn resolve_alias(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> Vec<CoreNode> {
     if symbol.is_empty() || !symbol.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return Vec::new();
     }
