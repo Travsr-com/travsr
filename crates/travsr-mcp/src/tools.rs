@@ -8689,9 +8689,8 @@ fn get_context_body(
     let group_output = crate::seed::match_source_grouping_enabled() && n_nodes > 4;
     let entry_meta = |n: &CoreNode| -> (crate::seed::MatchSource, f32) {
         // #991 rule 1, as in `ask`: a node whose own name is the whole query
-        // leads the exact section, a test fn included, whatever its score. An
-        // `impl` carries its type's name but is not the definition.
-        if n.kind != "impl" && travsr_core::ident::leaf_of(&n.vname.signature) == query.trim() {
+        // leads the exact section, a test fn included, whatever its score.
+        if crate::seed::is_named_by(n, query.trim()) {
             return (crate::seed::MatchSource::Exact, f32::INFINITY);
         }
         let id = n.id;

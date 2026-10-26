@@ -730,6 +730,14 @@ pub(crate) fn match_source(is_primary_seed: bool, is_exact_source: bool) -> Matc
     }
 }
 
+/// #991: whether `n` is the definition literally named `name` (case-sensitive).
+/// An `impl` or an import carries the same leaf as the type but is not it.
+pub(crate) fn is_named_by(n: &CoreNode, name: &str) -> bool {
+    n.kind != "impl"
+        && n.kind != "import"
+        && travsr_core::ident::leaf_of(&n.vname.signature) == name
+}
+
 /// Precedence of a [`SeedSource`] when a node is reached by several seeds. Exact
 /// (literal-name / FTS) is the most trustworthy, then embedding-KNN, then
 /// fuzzy-lexical. The strongest source decides both the node's displayed
@@ -2634,8 +2642,7 @@ pub(crate) fn build_seed_set(
             anchor_pool
                 .iter()
                 .filter(|n| {
-                    travsr_core::ident::leaf_of(&n.vname.signature)
-                        .eq_ignore_ascii_case(&resolve_token)
+                    is_named_by(n, &resolve_token)
                         && !is_anchor_noise(n)
                         && filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))
                 })
