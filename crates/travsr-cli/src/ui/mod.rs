@@ -284,32 +284,70 @@ struct ReposResponse {
 /// up on reload, and the page can only ever name a repo from this list, never
 /// a path of its choosing.
 fn known_repos(state: &UiState) -> Vec<NamedRepo> {
-    let mut by_root: BTreeMap<PathBuf, NamedRepo> = BTreeMap::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = travsr_store::registry::all_entries() {
-        for (name, entry) in entries {
+        for (_, entry) in entries {
             // A registry entry whose index is gone (a deleted checkout, a test's
             // temp dir) has nothing to show; `travsr repos --prune` drops them.
             if !entry.db_path.is_file() {
                 continue;
             }
-            let Some(root) = entry.db_path.parent().and_then(Path::parent) else {
-                continue;
-            };
-            by_root.insert(
-                root.to_path_buf(),
-                NamedRepo {
-                    name,
-                    root: root.to_path_buf(),
-                },
-            );
+            if let Some(root) = entry.db_path.parent().and_then(Path::parent) {
+                roots.push(root.to_path_buf());
+            }
         }
     }
     if let Some(cur) = &state.current {
-        by_root
-            .entry(cur.root.clone())
-            .or_insert_with(|| cur.clone());
+        roots.push(cur.root.clone());
     }
-    let mut repos: Vec<NamedRepo> = by_root.into_values().collect();
+    name_repos(roots)
+}
+
+/// One plain path per repo, named as `travsr repos` and `repos_list` name it:
+/// the folder name. The registry keys its entries by the full canonical root,
+/// which made URLs carry whole paths and kept the Repos page (which lists
+/// `repos_list` names) from ever matching a row to a repo.
+///
+/// Roots are compared without Windows' `\\?\` prefix and, on Windows, without
+/// case, so the registry's canonical form and the cwd-derived root of the
+/// repo `travsr ui` started in are one repo, not two. Two repos with the same
+/// folder name get the parent folder appended, and the full path if that
+/// still collides, so every name resolves to exactly one repo.
+fn name_repos(roots: Vec<PathBuf>) -> Vec<NamedRepo> {
+    let mut by_key: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for root in roots {
+        by_key
+            .entry(root_key(&root))
+            .or_insert_with(|| plain_path(&root));
+    }
+    let roots: Vec<PathBuf> = by_key.into_values().collect();
+    let count = |names: &[String], n: &str| names.iter().filter(|x| x.as_str() == n).count();
+    let base: Vec<String> = roots.iter().map(|r| repo_display_name(r)).collect();
+    let with_parent: Vec<String> = roots
+        .iter()
+        .zip(&base)
+        .map(|(r, b)| match r.parent().and_then(Path::file_name) {
+            Some(p) => format!("{b} ({})", p.to_string_lossy()),
+            None => b.clone(),
+        })
+        .collect();
+    let mut repos: Vec<NamedRepo> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| {
+            let name = if count(&base, &base[i]) == 1 {
+                base[i].clone()
+            } else if count(&with_parent, &with_parent[i]) == 1 {
+                with_parent[i].clone()
+            } else {
+                root.display().to_string()
+            };
+            NamedRepo {
+                name,
+                root: root.clone(),
+            }
+        })
+        .collect();
     repos.sort_by_key(|r| r.name.to_lowercase());
     repos
 }
@@ -320,13 +358,32 @@ fn repo_display_name(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
+/// `p` without Windows' `\\?\` verbatim prefix.
+fn plain_path(p: &Path) -> PathBuf {
+    PathBuf::from(travsr_store::registry::strip_verbatim_prefix(&p.to_string_lossy()).as_ref())
+}
+
+/// What two roots are compared by: plain, no trailing separator, and
+/// case-folded where the file system is case-insensitive.
+fn root_key(p: &Path) -> String {
+    let s = plain_path(p)
+        .to_string_lossy()
+        .trim_end_matches(['/', '\\'])
+        .to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
 async fn repos(State(state): State<Arc<UiState>>) -> Json<ReposResponse> {
-    let current_root = state.current.as_ref().map(|c| c.root.clone());
+    let current_root = state.current.as_ref().map(|c| root_key(&c.root));
     let rows = known_repos(&state)
         .into_iter()
         .map(|r| RepoRow {
             indexed: r.db_path().is_file(),
-            current: current_root.as_deref() == Some(r.root.as_path()),
+            current: current_root.as_deref() == Some(root_key(&r.root).as_str()),
             root: r.root.display().to_string(),
             name: r.name,
         })
@@ -585,6 +642,52 @@ mod tests {
             current: None,
             check_host: true,
         }))
+    }
+
+    fn names(roots: &[&str]) -> Vec<String> {
+        name_repos(roots.iter().map(PathBuf::from).collect())
+            .into_iter()
+            .map(|r| r.name)
+            .collect()
+    }
+
+    #[test]
+    fn repos_are_named_by_folder_like_travsr_repos() {
+        // The review's case: registry keys are full roots, but the page, the
+        // URL and `repos_list` all speak folder names.
+        assert_eq!(
+            names(&["/Users/ak/Desktop/Proj/travsr", "/Users/ak/code/api"]),
+            vec!["api", "travsr"]
+        );
+    }
+
+    #[test]
+    fn a_shared_folder_name_gets_its_parent_then_its_path() {
+        assert_eq!(
+            names(&["/a/work/travsr", "/b/home/travsr"]),
+            vec!["travsr (home)", "travsr (work)"]
+        );
+        // Same folder and same parent name: only the full path is unique.
+        let full = names(&["/a/work/travsr", "/b/work/travsr"]);
+        assert_eq!(full.len(), 2);
+        assert_ne!(full[0], full[1]);
+        assert!(full
+            .iter()
+            .all(|n| n.ends_with("travsr") && n.contains('/')));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_verbatim_and_a_plain_root_are_one_repo() {
+        // The registry stores canonical `\\?\C:\...`; `travsr ui` started in
+        // the same checkout knows it as `C:\...`.
+        let repos = name_repos(vec![
+            PathBuf::from(r"\\?\C:\Code\Travsr"),
+            PathBuf::from(r"c:\code\travsr\"),
+        ]);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, "Travsr");
+        assert!(!repos[0].root.to_string_lossy().starts_with(r"\\?\"));
     }
 
     async fn get_with_host(uri: &str, host: &str) -> Response {

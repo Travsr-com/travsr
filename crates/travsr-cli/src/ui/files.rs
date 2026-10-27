@@ -129,63 +129,67 @@ async fn in_process(name: &str, root: &Path) -> Option<String> {
 pub(super) struct VersionResponse {
     /// Changes whenever the index does. Opaque to the page: it only compares.
     fingerprint: String,
-    last_commit: Option<String>,
 }
 
 /// `GET /api/version?repo=<repo>`: what the open pages poll to know the index
 /// moved, the browser's version of the extension's `graph.db` file watcher.
+/// Never the daemon: a poll must not queue on its pipe.
 ///
-/// Cheap enough to ask every few seconds: `graph.db`'s time and size, the WAL's
-/// size (SQLite writes land in the WAL first, so `graph.db` itself can lag a
-/// reindex by a checkpoint), plus the two commit markers read from a read-only
-/// open. Never the daemon: a poll must not queue on its pipe.
-///
-/// The WAL's *time* is deliberately left out: opening the database, which this
-/// very poll does, touches it, so every poll would read as a change and the
-/// page would never settle. A real write grows the WAL; a checkpoint moves
-/// `graph.db`. Either one changes the fingerprint.
+/// The fingerprint is the index's *content*, not its files: see
+/// [`index_fingerprint`]. File metadata cannot work here. Every reader moves
+/// it: SQLite touches the WAL on open, and every `SqliteStore` runs
+/// `wal_checkpoint(TRUNCATE)` when dropped, which resets the WAL and rewrites
+/// `graph.db`. This server's own direct reads during a redraw would then read
+/// as a change and redraw again; and after a checkpoint a small write can
+/// leave the WAL's length unchanged, so a length test also misses changes.
 pub(super) async fn version(
     State(state): State<Arc<UiState>>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<Json<VersionResponse>, ApiError> {
     let repo = resolve_repo(&state, params.get("repo").map(String::as_str))?;
     tokio::task::spawn_blocking(move || {
-        let db = repo.db_path();
-        let mut wal = db.clone().into_os_string();
-        wal.push("-wal");
-        // Both stats are taken before the open below, which touches the WAL.
-        let db_stamp = std::fs::metadata(&db)
-            .ok()
-            .map(|m| {
-                let ms = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_millis());
-                format!("{ms}:{}", m.len())
-            })
-            .unwrap_or_default();
-        let wal_len = std::fs::metadata(Path::new(&wal)).map_or(0, |m| m.len());
-        let (last_commit, phase_b) = match crate::daemon_client::open_read_store(&db) {
-            Ok(store) => (
-                store.get_meta("last_commit").ok().flatten(),
-                store.get_meta("phase_b_commit").ok().flatten(),
-            ),
-            Err(_) => (None, None),
-        };
-        Json(VersionResponse {
-            fingerprint: format!(
-                "{}|{}|{}|{}",
-                db_stamp,
-                wal_len,
-                last_commit.as_deref().unwrap_or(""),
-                phase_b.as_deref().unwrap_or("")
-            ),
-            last_commit,
-        })
+        let fingerprint = index_fingerprint(&repo.db_path()).unwrap_or_default();
+        Json(VersionResponse { fingerprint })
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// What changes when the index does, read through a plain read-only
+/// connection that never checkpoints, so the poll writes nothing.
+///
+/// The two commit markers move on every commit and every semantic pass.
+/// Between commits, `files.last_indexed_at` is stamped on every file the
+/// watcher or a hook reindexes, even when its symbols (and so their node ids,
+/// which are content hashes and come back identical) do not change but their
+/// lines do; the node and edge counts cover deletions and the edges a
+/// semantic pass or the live lane adds. `last_indexed_at` has one-second
+/// resolution, so a second reindex in the same second as a poll that already
+/// saw the first is picked up with the next change rather than at once.
+fn index_fingerprint(db: &Path) -> rusqlite::Result<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.query_row(
+        "SELECT (SELECT value FROM meta WHERE key = 'last_commit'),
+                (SELECT value FROM meta WHERE key = 'phase_b_commit'),
+                (SELECT count(*) FROM nodes), (SELECT count(*) FROM edges),
+                (SELECT count(*) FROM files), (SELECT max(last_indexed_at) FROM files)",
+        [],
+        |r| {
+            Ok(format!(
+                "{}|{}|{}|{}|{}|{}",
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            ))
+        },
+    )
 }
 
 /// Most lines the log reader returns, the extension's `LOG_MAX_LINES`.
@@ -369,22 +373,32 @@ pub(super) async fn source(
     }
     let text = String::from_utf8_lossy(&text);
     let all: Vec<&str> = text.lines().collect();
-    let def = line - 1;
-    let start = def.saturating_sub(8);
-    let end = (def + 25).min(all.len().saturating_sub(1));
-    let lines = (start..=end)
-        .filter_map(|i| {
-            all.get(i).map(|t| SourceLine {
-                no: i + 1,
-                text: (*t).to_string(),
-            })
+    let lines = peek_window(line, all.len())
+        .map(|(start, end)| {
+            (start..=end)
+                .map(|i| SourceLine {
+                    no: i + 1,
+                    text: all[i].to_string(),
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     Ok(Json(SourceResponse {
         path: rel,
         line,
         lines,
     }))
+}
+
+/// The 0-based, inclusive line range the peek shows around 1-based `line`: 8
+/// before and 25 after, as the extension shows. `line` comes from the query
+/// string, so it is clamped to the file first: a huge value is the file's last
+/// line, never an overflow (which wrapped in release builds and panicked in
+/// debug ones). `None` for an empty file.
+fn peek_window(line: usize, total: usize) -> Option<(usize, usize)> {
+    let last = total.checked_sub(1)?;
+    let def = line.saturating_sub(1).min(last);
+    Some((def.saturating_sub(8), def.saturating_add(25).min(last)))
 }
 
 /// Under `.git` or `.travsr`, at any depth and in any letter case (Windows and
@@ -422,6 +436,68 @@ mod tests {
         assert!(!is_plain_relative("/etc/passwd"));
         #[cfg(windows)]
         assert!(!is_plain_relative("C:\\Windows\\win.ini"));
+    }
+
+    #[test]
+    fn fingerprint_follows_content_and_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        let w = rusqlite::Connection::open(&db).unwrap();
+        w.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE nodes (id INTEGER PRIMARY KEY, sig TEXT);
+             CREATE TABLE edges (src INTEGER, dst INTEGER, kind TEXT);
+             CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT, last_indexed_at INTEGER);
+             INSERT INTO meta VALUES ('last_commit', 'aaa');
+             INSERT INTO nodes VALUES (11, 'a'), (22, 'b');
+             INSERT INTO files VALUES ('src/a.rs', 'h1', 1000);",
+        )
+        .unwrap();
+        let wal = dir.path().join("graph.db-wal");
+        let wal_before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+
+        let first = index_fingerprint(&db).unwrap();
+        assert_eq!(
+            index_fingerprint(&db).unwrap(),
+            first,
+            "reads alone must not move it"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+            wal_before,
+            "the poll must not checkpoint or otherwise write"
+        );
+
+        // The case the review's max(rowid) idea misses: a reindex that keeps
+        // the same symbols writes the same content-hash node ids back, so
+        // counts and ids are unchanged; only the file's stamp moves.
+        w.execute_batch(
+            "DELETE FROM nodes WHERE id = 22; INSERT INTO nodes VALUES (22, 'b');
+             UPDATE files SET sha256 = 'h2', last_indexed_at = 1001 WHERE path = 'src/a.rs';",
+        )
+        .unwrap();
+        let reindexed = index_fingerprint(&db).unwrap();
+        assert_ne!(reindexed, first);
+
+        w.execute("INSERT INTO edges VALUES (11, 22, 'ref/call')", [])
+            .unwrap();
+        assert_ne!(
+            index_fingerprint(&db).unwrap(),
+            reindexed,
+            "a new edge is a change"
+        );
+    }
+
+    #[test]
+    fn peek_window_is_clamped_to_the_file() {
+        // The reviewed overflow: a line number at usize::MAX.
+        assert_eq!(peek_window(usize::MAX, 100), Some((91, 99)));
+        assert_eq!(peek_window(50, 100), Some((41, 74)));
+        assert_eq!(peek_window(1, 100), Some((0, 25)));
+        assert_eq!(peek_window(0, 100), Some((0, 25)));
+        assert_eq!(peek_window(3, 5), Some((0, 4)));
+        assert_eq!(peek_window(10, 0), None);
     }
 
     #[test]

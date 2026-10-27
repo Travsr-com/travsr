@@ -182,6 +182,13 @@
     start();
   }
 
+  // Same comparison the server's `root_key` makes: no `\\?\` prefix, one kind
+  // of separator, no trailing one, and no case on Windows paths.
+  function rootKey(p) {
+    const s = String(p || "").replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "");
+    return /^[A-Za-z]:\//.test(s) ? s.toLowerCase() : s;
+  }
+
   // ── Repos (buildReposHtml) ─────────────────────────────────────────────
   async function repos() {
     document.title = "Travsr: Repos";
@@ -203,8 +210,11 @@
         '<button class="btn" id="refreshBtn">Refresh</button></div>' +
         "<table><thead><tr><th>Name</th><th>DB Path</th><th>Status</th><th></th></tr></thead><tbody>" +
         (rows.map((r) => {
-          const openable = r.exists && ui.repos.some((x) => x.name === r.name);
-          return '<tr><td class="mono">' + (openable ? '<a href="' + esc("/health?repo=" + encodeURIComponent(r.name)) + '">' + esc(r.name) + "</a>" : esc(r.name)) + "</td>" +
+          // Matched on the repo root, not the name: `repos_list` names a repo
+          // by its folder, and two folders can share a name that this server
+          // disambiguates. The link carries the server's own name for it.
+          const open = r.exists ? ui.repos.find((x) => rootKey(x.root) === rootKey(r.path.replace(/[\\/]\.travsr[\\/]graph\.db$/i, ""))) : null;
+          return '<tr><td class="mono">' + (open ? '<a href="' + esc("/health?repo=" + encodeURIComponent(open.name)) + '">' + esc(r.name) + "</a>" : esc(r.name)) + "</td>" +
             '<td class="mono muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis" title="' + esc(r.path) + '">' + esc(r.path) + "</td>" +
             "<td>" + (r.exists ? '<span class="badge ok">active</span>' : '<span class="badge stale">' + esc(LABEL[r.status] || "stale") + "</span>") + "</td>" +
             '<td><button class="x-btn" data-copy="travsr repos --remove ' + esc(r.name) + '" title="Copy: travsr repos --remove ' + esc(r.name) + '">✕</button></td></tr>';
