@@ -15154,12 +15154,25 @@ fn get_snippets_body(
         let drifted = *drift_cache
             .entry(node.vname.path.clone())
             .or_insert_with(|| file_drifted_since_index(store, &repo_root, &node.vname.path));
+        // Mirror `format_node_line`: carry the definition span so code read
+        // through a snippet is citable, and drop the `[package: ]` tag when the
+        // node has no package. The end line comes from the stored span, so the
+        // header is the only Travsr output that yields a `path:start-end` range.
+        let loc = match (node.line, node.end_line) {
+            (Some(start), Some(end)) => format!(":{start}-{end}"),
+            (Some(start), None) => format!(":{start}"),
+            _ => String::new(),
+        };
+        let pkg = if node.package.is_empty() {
+            String::new()
+        } else {
+            format!(" [package: {}]", node.package)
+        };
         let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]{}",
+            "{} ({}) \u{2014} {}{loc}{pkg}{}",
             display_label(node),
             node.kind,
             node.vname.path,
-            node.package,
             if drifted { STALE_SPAN_MARKER } else { "" }
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
@@ -15649,6 +15662,31 @@ mod snippet_tests {
             drifted.contains("stale:"),
             "a file edited since indexing must be disclosed, not answered \
              silently from the stale span: {drifted}"
+        );
+    }
+
+    // #1045: the snippet header must carry the definition span so code read
+    // through get_snippets is citable, and must not print an empty `[package: ]`
+    // tag when the node has no package.
+    #[test]
+    fn get_snippets_header_carries_span_and_omits_empty_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full);
+        assert!(
+            out.contains("lib.ts:1-3"),
+            "header must carry the path:start-end span: {out}"
+        );
+        assert!(
+            !out.contains("[package:"),
+            "empty package must not print a `[package: ]` tag: {out}"
         );
     }
 
