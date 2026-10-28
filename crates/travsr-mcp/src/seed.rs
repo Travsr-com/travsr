@@ -2444,6 +2444,7 @@ pub(crate) fn build_seed_set(
         // measured, not the unindexed typo) and, being deliberate and unique, is
         // always emitted as an anchor below, the cross-encoder reranker is the
         // precision backstop. Only fires on the exact-miss cold branch.
+        let mut alias_freq: Option<usize> = None;
         let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) = if has_direct {
             (direct_nodes, token.clone(), false)
         } else if let Some(fix) = corrections.get(token) {
@@ -2454,18 +2455,43 @@ pub(crate) fn build_seed_set(
                 (direct_nodes, token.clone(), false)
             }
         } else {
-            (direct_nodes, token.clone(), false)
+            // A bare name that exists only as an `as` alias (`Node as CoreNode`)
+            // anchors its original, as `find_references` resolves it. Parsers
+            // index the original name, so nothing else can ground it. Only for a
+            // single-token query: the lookup is a git grep. The impl/import of
+            // the original share its name but are not it (#991). The alias names
+            // only these definitions, so that count is its frequency: measured by
+            // the original (`Node`, ~700 symbols) it read as generic and abstained,
+            // and the cross-encoder cannot rate a name the definition never spells.
+            let aliased: Vec<CoreNode> = if n_content == 1 {
+                crate::tools::resolve_alias(store, token, None)
+                    .into_iter()
+                    .filter(|n| n.kind != "impl" && n.kind != "import")
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            match aliased.first() {
+                Some(orig) => {
+                    let name = travsr_core::ident::leaf_of(&orig.vname.signature).to_string();
+                    alias_freq = Some(aliased.len());
+                    (aliased, name, false)
+                }
+                None => (direct_nodes, token.clone(), false),
+            }
         };
 
         // #478: absent from the vocabulary (unknown token, or < 3 bytes so
         // never indexed) is treated as maximally generic, matching the
         // previous `unwrap_or(n_total)` failure behaviour. A token we cannot
         // measure must never be *promoted* to a rare anchor.
-        let freq = store
-            .symbol_frequency(&resolve_token)
-            .ok()
-            .flatten()
-            .unwrap_or(n_total);
+        let freq = alias_freq.unwrap_or_else(|| {
+            store
+                .symbol_frequency(&resolve_token)
+                .ok()
+                .flatten()
+                .unwrap_or(n_total)
+        });
         let boundary_matched: Vec<&CoreNode> = exact_nodes
             .iter()
             .filter(|n| boundary(&resolve_token, n))
@@ -6109,6 +6135,78 @@ mod tests {
             seed_ids.contains(&ui.id),
             "the exact `class:UI` match must seed and not be starved by \
              substring-noise methods; seeds present: {seed_ids:?}"
+        );
+    }
+
+    /// `ask CoreNode` abstained: `CoreNode` exists only as `Node as CoreNode`,
+    /// and parsers index the original name, so no token resolved. `references`
+    /// already follows the alias; the seed set must too.
+    #[test]
+    fn build_seed_set_anchors_the_original_of_an_import_alias() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(repo.path().join("travsr-mcp/src")).unwrap();
+        std::fs::write(
+            repo.path().join("travsr-mcp/src/seed.rs"),
+            "use travsr_core::{Node as CoreNode, NodeId};\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+
+        let path = "travsr-core/src/lib.rs";
+        let ty = Node::new(
+            VName::new("corpus", "", path, "rust", "struct:Node"),
+            "struct",
+        );
+        let imp = Node::new(VName::new("corpus", "", path, "rust", "impl:Node"), "impl");
+        store.put_node(&ty).unwrap();
+        store.put_node(&imp).unwrap();
+        // The original name is common, as `Node` is in travsr (~700 symbols), so
+        // measured by it the alias read as generic and abstained.
+        for i in 0..400 {
+            let sig = format!("fn:node_helper_{i}");
+            store
+                .put_node(&Node::new(
+                    VName::new("corpus", "", "other/src/lib.rs", "rust", &sig),
+                    "function",
+                ))
+                .unwrap();
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "CoreNode",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            seed_set.terms[0].top_node,
+            Some(ty.id),
+            "{:?}",
+            seed_set.terms
+        );
+        assert!(seed_set.seeds.iter().any(|s| s.node == ty.id));
+        assert_ne!(
+            seed_set.confidence,
+            Confidence::None,
+            "{:?}",
+            seed_set.terms
         );
     }
 
