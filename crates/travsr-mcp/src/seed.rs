@@ -2491,9 +2491,16 @@ pub(crate) fn build_seed_set(
         // signature-only predicate to match that gate exactly (a path-only match
         // is not an anchor — #478). Borrows from `exact_nodes` (no clone): the
         // pool lives only within this loop iteration.
+        //
+        // Anchor noise is dropped here for the same reason: in-src test helpers
+        // named `node` (functions, so reordered first) filled every slot and
+        // were then all rejected, starving `struct:Node`.
         let anchor_pool: Vec<&CoreNode> = exact_nodes
             .iter()
-            .filter(|n| travsr_core::ident::contains_token(&resolve_token, &n.vname.signature))
+            .filter(|n| {
+                travsr_core::ident::contains_token(&resolve_token, &n.vname.signature)
+                    && !is_anchor_noise(n)
+            })
             .collect();
 
         // #709: the corrected anchor deliberately bypasses the *budget* gates
@@ -6102,6 +6109,47 @@ mod tests {
             seed_ids.contains(&ui.id),
             "the exact `class:UI` match must seed and not be starved by \
              substring-noise methods; seeds present: {seed_ids:?}"
+        );
+    }
+
+    /// `ask Node` never seeded `struct:Node`: in-src test helpers named `node`
+    /// (functions, so reordered ahead of the struct) filled the anchor slots
+    /// and were then all dropped as anchor noise.
+    #[test]
+    fn build_seed_set_type_not_starved_by_test_helper_noise() {
+        use travsr_core::{Node, TestRole, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let target = Node::new(
+            VName::new("corpus", "", "core/src/lib.rs", "rust", "struct:Node"),
+            "struct",
+        );
+        store.put_node(&target).unwrap();
+        for path in ["a/src/lib.rs", "b/src/lib.rs", "c/src/lib.rs"] {
+            let mut helper = Node::new(
+                VName::new("corpus", "", path, "rust", "fn:node"),
+                "function",
+            );
+            helper.test_role = TestRole::Support;
+            store.put_node(&helper).unwrap();
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "Node",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        // The struct is the only non-noise candidate, so one emitted anchor is it.
+        // Asserted on the anchor stage: in this tiny store the lexical leg seeds
+        // the struct anyway, which it does not on the real repo.
+        assert_eq!(
+            seed_set.terms[0].anchors_emitted, 1,
+            "`struct:Node` must anchor and not be starved by test-helper \
+             `fn:node` noise"
         );
     }
 
