@@ -15169,12 +15169,30 @@ fn get_snippets_body(
         let drifted = *drift_cache
             .entry(node.vname.path.clone())
             .or_insert_with(|| file_drifted_since_index(store, &repo_root, &node.vname.path));
+        // Mirror `format_node_line`: carry the definition span so code read
+        // through a snippet is citable, and drop the `[package: ]` tag when the
+        // node has no package. A graph node's end_line is its true definition
+        // boundary, so emit `path:start-end`. A "source-range" node (Tier 2
+        // `path:line`) carries a synthetic end_line that is only a read window,
+        // not a definition boundary, so cite its start line alone rather than a
+        // fabricated span.
+        let loc = match (node.line, node.end_line) {
+            (Some(start), Some(end)) if node.kind != "source-range" => {
+                format!(":{start}-{end}")
+            }
+            (Some(start), _) => format!(":{start}"),
+            _ => String::new(),
+        };
+        let pkg = if node.package.is_empty() {
+            String::new()
+        } else {
+            format!(" [package: {}]", node.package)
+        };
         let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]{}",
+            "{} ({}) \u{2014} {}{loc}{pkg}{}",
             display_label(node),
             node.kind,
             node.vname.path,
-            node.package,
             if drifted { STALE_SPAN_MARKER } else { "" }
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
@@ -15667,6 +15685,31 @@ mod snippet_tests {
         );
     }
 
+    // #1045: the snippet header must carry the definition span so code read
+    // through get_snippets is citable, and must not print an empty `[package: ]`
+    // tag when the node has no package.
+    #[test]
+    fn get_snippets_header_carries_span_and_omits_empty_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full);
+        assert!(
+            out.contains("lib.ts:1-3"),
+            "header must carry the path:start-end span: {out}"
+        );
+        assert!(
+            !out.contains("[package:"),
+            "empty package must not print a `[package: ]` tag: {out}"
+        );
+    }
+
     /// Mirrors `travsr-daemon`'s `hex_encode`: lowercase `{:02x}` over sha256.
     fn sha256_hex_for_test(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
@@ -16009,6 +16052,36 @@ mod snippet_tests {
             "line5 must be in result: {result}"
         );
         assert!(!result.contains("line6"), "line6 must NOT appear: {result}");
+    }
+
+    // #1045: a bare Tier 2 `path:line` request has a synthetic end_line (a
+    // 40-line read window, not a definition boundary). The header must cite
+    // only the requested start line, never the fabricated `start+39` span.
+    #[test]
+    fn get_snippets_path_line_header_cites_start_not_synthetic_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src: String = (1u32..=10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(src_dir.join("win.ts"), &src).unwrap();
+
+        // No graph nodes — PathLine builds a synthetic source-range node.
+        let db_path = dir.path().join(".travsr").join("graph.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut store = SqliteStore::open(&db_path).unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        let out = get_snippets_body(&store, "src/win.ts:3", 2000, SnippetMode::Full);
+        assert!(
+            out.contains("src/win.ts:3"),
+            "header must cite the requested start line: {out}"
+        );
+        assert!(
+            !out.contains("src/win.ts:3-"),
+            "header must not print a fabricated start+39 span: {out}"
+        );
     }
 
     // T-M7: NodeId tier (Tier 0) resolves directly by DB row id —
