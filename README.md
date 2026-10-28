@@ -597,7 +597,8 @@ Every graph answer is the text the matching MCP tool (`search_symbol`,
 returns for the same arguments, and the Health page runs the same read-only
 CLI commands the extension runs (`daemon status`, `lang list --json`, ...).
 Graph queries go to the repository's running daemon, as `travsr status` does;
-with no daemon running they read the index file directly and the page says so.
+with no daemon running they read the index directly (writable only if it has
+migrations pending, as for the CLI) and the page says so.
 The pages are read-only: where the extension has an action button (Start
 daemon, Reindex, Install analyzer), the page copies the command to run instead.
 "Open in editor" links open the file in VS Code when it is installed.
@@ -611,7 +612,8 @@ writing, and `updating...` while the page redraws.
 to a loopback name, so a web page on another site cannot reach it through DNS
 rebinding. It has no login: binding any other address needs
 `--host <ip> --allow-remote`, and anyone who can reach that port can then read
-the graph. Stop it with Ctrl-C. If the port is taken, `travsr ui` says so and
+the graph and the source of every indexed file (never a file outside the index,
+such as a gitignored `.env`). Stop it with Ctrl-C. If the port is taken, `travsr ui` says so and
 exits; pass `--port` to pick another.
 
 ---

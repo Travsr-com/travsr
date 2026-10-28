@@ -3,7 +3,8 @@
 //! A small HTTP server in the CLI, not on the daemon: the daemon stays a
 //! loopback IPC endpoint and gains no network surface. Every answer comes
 //! through the same route the CLI uses ([`daemon_client::try_query`], falling
-//! back to a read-only open when no daemon is running), and every graph answer
+//! back to a direct open when no daemon is running: read-only, or writable
+//! when migrations are pending, as in the CLI), and every graph answer
 //! is an MCP tool's own text via [`travsr_mcp::browse_tool_call`], so the page
 //! and an agent asking the same question see the same result.
 //!
@@ -429,21 +430,6 @@ enum Route {
     Direct,
 }
 
-/// Tools the Health page calls that inspect the index rather than read the
-/// graph: they shell out to `git` (and `rustc`), so one can take as long as
-/// process start-up does on the machine. Answered from a read-only open, as the
-/// extension's own `travsr mcp --stdio` child answers them, never through the
-/// daemon: the daemon serves its control pipe one request at a time, and a
-/// diagnostic must not hold up the reindex and queries that keep the graph
-/// fresh. (Routing them through it once kept a daemon busy for ten minutes.)
-const DIRECT_TOOLS: &[&str] = &[
-    "get_index_status",
-    "get_graph_health",
-    "get_lang_status",
-    "repos_list",
-    "repo_languages",
-];
-
 /// One daemon round trip at a time from this server. A page loads several
 /// panels at once; the daemon answers its pipe serially, so sending them all
 /// together only queues them inside the daemon, where an abandoned request
@@ -452,7 +438,9 @@ const DIRECT_TOOLS: &[&str] = &[
 static DAEMON_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run one query the way the CLI does: the repo's daemon when it answers,
-/// otherwise a read-only open of its store. Blocking (socket and SQLite I/O),
+/// otherwise a direct open of its store. That open is read-only unless the
+/// index has migrations pending, when it is writable, exactly as the CLI's
+/// own fallback (`daemon_client::open_read_store`) is. Blocking (socket and SQLite I/O),
 /// so it runs off the async workers.
 async fn run_query<T, F>(
     repo: NamedRepo,
@@ -479,10 +467,11 @@ where
     F: FnOnce(&travsr_store::SqliteStore) -> anyhow::Result<T> + Send + 'static,
 {
     let work = tokio::task::spawn_blocking(move || {
-        if use_daemon {
-            // A poisoned lock only means an earlier query panicked; the turn
-            // itself guards nothing that panic could have left half-written.
-            let _turn = DAEMON_TURN.lock().unwrap_or_else(|p| p.into_inner());
+        // No turn within TURN_WAIT means another query is still talking to the
+        // daemon (possibly one whose page already gave up on it at the
+        // deadline): answer from the index, as the CLI does when no daemon
+        // answers, instead of queueing behind it.
+        if let Some(_turn) = use_daemon.then(take_daemon_turn).flatten() {
             if let Some(v) = daemon_client::try_query::<T>(&repo.root, tool, args) {
                 return Ok((v, Route::Daemon));
             }
@@ -503,6 +492,26 @@ where
             .map_err(|e: anyhow::Error| {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
             }),
+    }
+}
+
+/// Longest a query waits for the daemon turn before answering from the index.
+const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The daemon turn, or `None` if it stayed taken for [`TURN_WAIT`]. A poisoned
+/// lock only means an earlier query panicked; the turn guards no data that
+/// panic could have left half-written, so it is taken anyway.
+fn take_daemon_turn() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let until = std::time::Instant::now() + TURN_WAIT;
+    loop {
+        match DAEMON_TURN.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
     }
 }
 
@@ -597,7 +606,10 @@ async fn tool(
     };
     let wire = serde_json::to_value(&args)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let use_daemon = !DIRECT_TOOLS.contains(&tool.as_str());
+    // The Health page's index diagnostics are answered from the index itself,
+    // as the extension's own `travsr mcp --stdio` child answers them; the
+    // daemon refuses them (travsr_mcp::DIRECT_ONLY_TOOLS says why).
+    let use_daemon = !travsr_mcp::DIRECT_ONLY_TOOLS.contains(&tool.as_str());
     let (payload, route): (ToolPayload, Route) = run_query_via(
         repo,
         "tool",

@@ -344,6 +344,25 @@ pub(super) async fn source(
             "the peek shows source files, not .git or .travsr".into(),
         ));
     }
+    // Only files the index holds. The peek exists to show a definition the
+    // graph points at, and every such file has a `files` row; anything else
+    // under the root (a gitignored `.env`, a key, a build output) is not the
+    // graph's to show, and with `--allow-remote` it would be served to
+    // whoever can reach the port.
+    let wanted = index_path(&rel);
+    let indexed = {
+        let db = repo.db_path();
+        let wanted = wanted.clone();
+        tokio::task::spawn_blocking(move || is_indexed_file(&db, &wanted))
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    if !matches!(indexed, Ok(true)) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            format!("'{wanted}' is not a file in this repository's index"),
+        ));
+    }
     let root = std::fs::canonicalize(&repo.root).map_err(|e| bad(&e.to_string()))?;
     let full = std::fs::canonicalize(root.join(&rel))
         .map_err(|_| ApiError(StatusCode::NOT_FOUND, format!("no file '{rel}'")))?;
@@ -388,6 +407,32 @@ pub(super) async fn source(
         line,
         lines,
     }))
+}
+
+/// `rel` in the form the index stores paths (`files.path`, a node's own
+/// path): `/` separators, no leading `./`.
+fn index_path(rel: &str) -> String {
+    let p = rel.replace('\\', "/");
+    let mut s = p.as_str();
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s.to_string()
+}
+
+/// Whether the index has a `files` row for `path`, over a plain read-only
+/// connection (no `SqliteStore`, whose drop checkpoints).
+fn is_indexed_file(db: &Path, path: &str) -> rusqlite::Result<bool> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+        [path],
+        |r| r.get(0),
+    )
 }
 
 /// The 0-based, inclusive line range the peek shows around 1-based `line`: 8
@@ -487,6 +532,26 @@ mod tests {
             reindexed,
             "a new edge is a change"
         );
+    }
+
+    #[test]
+    fn only_indexed_files_can_be_peeked() {
+        // The review's case: `.env` sits in the tree (gitignored) but the
+        // index holds only `src/main.rs`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT, last_indexed_at INTEGER);
+                 INSERT INTO files VALUES ('src/main.rs', 'h', 1);",
+            )
+            .unwrap();
+        assert!(is_indexed_file(&db, &index_path("src/main.rs")).unwrap());
+        assert!(is_indexed_file(&db, &index_path("./src/main.rs")).unwrap());
+        assert!(is_indexed_file(&db, &index_path("src\\main.rs")).unwrap());
+        assert!(!is_indexed_file(&db, &index_path(".env")).unwrap());
+        assert!(!is_indexed_file(&db, &index_path("src/main.rs.bak")).unwrap());
     }
 
     #[test]

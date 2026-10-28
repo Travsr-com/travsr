@@ -387,7 +387,8 @@ enum Command {
         #[arg(long, default_value = "7330")]
         port: u16,
         /// Allow binding a non-loopback address. The page has no
-        /// authentication, so anyone who can reach the port can read the graph.
+        /// authentication, so anyone who can reach the port can read the graph
+        /// and the source of every file in the index.
         #[arg(long)]
         allow_remote: bool,
         /// Open the page in the default browser once the server is up.

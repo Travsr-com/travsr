@@ -253,6 +253,21 @@ pub const BROWSE_TOOLS: &[&str] = &[
     "repo_languages",
 ];
 
+/// The [`BROWSE_TOOLS`] that inspect the index rather than read the graph:
+/// they shell out to `git` (and `rustc`) or read the registry, so one can take
+/// as long as process start-up does on the machine. The daemon serves its
+/// control pipe one request at a time, so these are never served through it
+/// (its query dispatch refuses them) and `travsr ui` answers them from a
+/// read-only open instead. Routed through the daemon once, one kept it busy
+/// for ten minutes.
+pub const DIRECT_ONLY_TOOLS: &[&str] = &[
+    "get_index_status",
+    "get_graph_health",
+    "get_lang_status",
+    "repos_list",
+    "repo_languages",
+];
+
 /// Run one [`BROWSE_TOOLS`] tool on already-checked arguments. `None` for any
 /// other tool name.
 fn browse_tool_text(
