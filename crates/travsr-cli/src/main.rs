@@ -380,8 +380,8 @@ enum Command {
     /// callers, dependencies, blast radius and the repo map. Read-only; serves
     /// on this machine only unless --allow-remote is given.
     Ui {
-        /// Address to bind on. Must be a loopback address unless
-        /// --allow-remote is also given.
+        /// Address to bind on: an IP address, or localhost. Must be a
+        /// loopback address unless --allow-remote is also given.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// TCP port to serve on (0 picks a free one).

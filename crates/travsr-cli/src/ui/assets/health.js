@@ -433,7 +433,7 @@
         : card("Semantic", "full", undefined, ls.length + " languages");
     })();
     const dbSize = d.status && d.status.db_bytes != null ? (d.status.db_bytes / 1048576).toFixed(1) + " MB" : "—";
-    const lastIndexed = d.status && d.status.db_modified_ms ? ui.timeAgo(Date.now() - d.status.db_modified_ms) : "—";
+    const lastIndexed = d.status && d.status.last_indexed_ms ? ui.timeAgo(Math.max(0, Date.now() - d.status.last_indexed_ms)) : "—";
 
     return verdictBanner +
       '<div class="cards">' +
@@ -660,11 +660,20 @@
       daemonPid: "", daemonStopped: "", lastEditor: "", logFile: null,
     };
     state.data = d;
-    const draw = () => {
+    // Eleven sources each report when they land; answers that arrive in the
+    // same frame are drawn once, not once each.
+    let drawQueued = false;
+    const paint = () => {
+      drawQueued = false;
       if (seq !== state.seq) return;
       document.getElementById("top").innerHTML = renderTop(d);
     };
-    draw();
+    const draw = () => {
+      if (drawQueued) return;
+      drawQueued = true;
+      requestAnimationFrame(paint);
+    };
+    paint();
 
     // The index diagnostics go first and the CLI commands wait for them: both
     // start processes, and run together the commands starved the diagnostics

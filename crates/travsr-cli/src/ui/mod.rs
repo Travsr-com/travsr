@@ -88,11 +88,7 @@ impl NamedRepo {
 
 /// Start the server and block until Ctrl-C.
 pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> anyhow::Result<()> {
-    let ip: IpAddr = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse()
-        .map_err(|_| anyhow::anyhow!("--host must be an IP address, got '{host}'"))?;
+    let ip = parse_host(&host)?;
     if !ip.is_loopback() && !allow_remote {
         anyhow::bail!(
             "refusing to bind {ip}: travsr ui serves your code graph over plain HTTP with no \
@@ -193,6 +189,20 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/api/source", get(files::source))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+/// `--host` as an address: an IP literal (`[::1]` brackets allowed), or
+/// `localhost`, the loopback name the printed URL and the Host check use.
+/// Other names are refused rather than resolved: what a name resolves to can
+/// change, and the loopback-only default must not depend on DNS.
+fn parse_host(host: &str) -> anyhow::Result<IpAddr> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--host must be an IP address or localhost, got '{host}'"))
 }
 
 fn page_url(addr: SocketAddr) -> String {
@@ -438,10 +448,13 @@ enum Route {
 static DAEMON_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run one query the way the CLI does: the repo's daemon when it answers,
-/// otherwise a direct open of its store. That open is read-only unless the
-/// index has migrations pending, when it is writable, exactly as the CLI's
-/// own fallback (`daemon_client::open_read_store`) is. Blocking (socket and SQLite I/O),
+/// otherwise a direct open of its store. Blocking (socket and SQLite I/O),
 /// so it runs off the async workers.
+///
+/// Unlike the CLI's `open_read_store`, the direct open never falls back to a
+/// writable one: `travsr ui` is read-only, and a writable open would run
+/// migrations on the user's index and checkpoint it on drop. An index that
+/// needs migrating is reported as such, with the command that upgrades it.
 async fn run_query<T, F>(
     repo: NamedRepo,
     tool: &'static str,
@@ -476,7 +489,7 @@ where
                 return Ok((v, Route::Daemon));
             }
         }
-        let store = daemon_client::open_read_store(&repo.db_path())?;
+        let store = open_index_read_only(&repo)?;
         Ok((direct(&store)?, Route::Direct))
     });
     // A page must not wait forever on one answer. The blocking work cannot be
@@ -493,6 +506,17 @@ where
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
             }),
     }
+}
+
+/// The repo's index, read-only, or an error that says how to upgrade it.
+fn open_index_read_only(repo: &NamedRepo) -> anyhow::Result<travsr_store::SqliteStore> {
+    travsr_store::SqliteStore::open_read_only(&repo.db_path()).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read this index without changing it ({e}); travsr ui never writes the \
+             index, so run `travsr init` in {} to upgrade it, or start its daemon",
+            repo.root.display()
+        )
+    })
 }
 
 /// Longest a query waits for the daemon turn before answering from the index.
@@ -525,10 +549,13 @@ struct StatusResponse {
     root: String,
     route: Route,
     status: StatusPayload,
-    /// `graph.db` size and modification time, the extension's "DB size" and
-    /// "Last indexed" tiles.
+    /// `graph.db` size, the extension's "DB size" tile.
     db_bytes: Option<u64>,
-    db_modified_ms: Option<u64>,
+    /// When a file was last reindexed (newest `files.last_indexed_at`), the
+    /// "Last indexed" tile. Not `graph.db`'s modification time, which the
+    /// extension uses: any WAL checkpoint moves that, so it read "just now"
+    /// after every query rather than after every reindex.
+    last_indexed_ms: Option<u64>,
     /// Whether `.git/hooks/post-commit` runs travsr, as the extension checks
     /// it. `None` when the hook could not be read.
     commit_hook: Option<bool>,
@@ -540,12 +567,14 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let repo = resolve_repo(&state, params.get("repo").map(String::as_str))?;
     let (name, root) = (repo.name.clone(), repo.root.display().to_string());
-    let meta = std::fs::metadata(repo.db_path()).ok();
-    let db_bytes = meta.as_ref().map(std::fs::Metadata::len);
-    let db_modified_ms = meta
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64);
+    let db_bytes = std::fs::metadata(repo.db_path()).ok().map(|m| m.len());
+    let last_indexed_ms = {
+        let db = repo.db_path();
+        tokio::task::spawn_blocking(move || files::last_indexed_ms(&db))
+            .await
+            .ok()
+            .flatten()
+    };
     let commit_hook = commit_hook_installed(&repo.root);
     let (status, route) =
         run_query(repo, "status", serde_json::json!({}), query::status_query).await?;
@@ -555,7 +584,7 @@ async fn status(
         route,
         status,
         db_bytes,
-        db_modified_ms,
+        last_indexed_ms,
         commit_hook,
     }))
 }
@@ -593,6 +622,31 @@ async fn tool(
             StatusCode::NOT_FOUND,
             format!("unknown tool '{tool}'"),
         ));
+    }
+    // `repos_list` reads only the global registry; it takes a store because
+    // every tool does, and never touches it. Answered without resolving a
+    // repo, so the Repos page lists the registry even when no repo here is
+    // indexed (resolving one would 404 exactly when the listing is most
+    // useful).
+    if tool == "repos_list" {
+        let payload = tokio::task::spawn_blocking(|| {
+            let store = travsr_store::SqliteStore::open_in_memory()?;
+            anyhow::Ok(query::tool_query(
+                &store,
+                &ToolQueryArgs {
+                    tool: "repos_list".into(),
+                    args: serde_json::json!({}),
+                },
+            ))
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        return Ok(Json(ToolResponse {
+            tool,
+            route: Route::Direct,
+            text: payload.text,
+        }));
     }
     let repo = resolve_repo(&state, params.remove("repo").as_deref())?;
     let args = ToolQueryArgs {
@@ -654,6 +708,70 @@ mod tests {
             current: None,
             check_host: true,
         }))
+    }
+
+    /// The review's point 2: the direct fallback must never write. A writable
+    /// open would migrate; even dropping a store runs
+    /// `wal_checkpoint(TRUNCATE)`, which must be a no-op on a read-only one.
+    #[test]
+    fn the_direct_open_never_writes_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".travsr")).unwrap();
+        let db = root.join(".travsr").join("graph.db");
+        drop(travsr_store::SqliteStore::open(&db).unwrap()); // create + migrate
+
+        // A writer holding uncheckpointed pages in the WAL, as a running
+        // daemon would.
+        let w = rusqlite::Connection::open(&db).unwrap();
+        w.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             INSERT OR REPLACE INTO meta (key, value) VALUES ('ui_probe', 'x');",
+        )
+        .unwrap();
+        let wal = root.join(".travsr").join("graph.db-wal");
+        let before = std::fs::metadata(&wal).unwrap().len();
+        assert!(before > 0, "the writer left pages in the WAL");
+
+        let repo = NamedRepo {
+            name: "r".into(),
+            root,
+        };
+        drop(open_index_read_only(&repo).unwrap());
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            before,
+            "the read-only open checkpointed the WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_list_needs_no_indexed_repo() {
+        // No current repo and no repo parameter: every other tool 400s here,
+        // the registry listing still answers.
+        let resp = get_with_host("/api/tool/repos_list", "localhost").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_with_host("/api/tool/get_graph_stats", "localhost").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn host_accepts_localhost_and_ip_literals_only() {
+        assert_eq!(
+            parse_host("localhost").unwrap(),
+            IpAddr::from([127, 0, 0, 1])
+        );
+        assert_eq!(
+            parse_host("LocalHost").unwrap(),
+            IpAddr::from([127, 0, 0, 1])
+        );
+        assert_eq!(
+            parse_host("127.0.0.1").unwrap(),
+            IpAddr::from([127, 0, 0, 1])
+        );
+        assert!(parse_host("[::1]").unwrap().is_loopback());
+        assert!(!parse_host("0.0.0.0").unwrap().is_loopback());
+        assert!(parse_host("example.com").is_err());
     }
 
     fn names(roots: &[&str]) -> Vec<String> {

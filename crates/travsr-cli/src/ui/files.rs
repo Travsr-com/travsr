@@ -73,6 +73,22 @@ pub(super) async fn cli(
             code: Some(0),
         }));
     }
+    // At most CLI_PROCESS_SLOTS of these run at once, server-wide. The page's
+    // own throttle is per tab and advisory; a second tab, a script, or (with
+    // --allow-remote) any client could otherwise start unbounded `lang list`
+    // children, each sweeping PATH for up to three minutes. A request that
+    // cannot get a slot in CLI_SLOT_WAIT is told so rather than queued forever.
+    let _slot = match tokio::time::timeout(CLI_SLOT_WAIT, cli_slots().acquire()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "{CLI_PROCESS_SLOTS} travsr commands are already running; try again shortly"
+                ),
+            ))
+        }
+    };
     let exe = std::env::current_exe()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let child = tokio::process::Command::new(exe)
@@ -105,6 +121,17 @@ pub(super) async fn cli(
         },
     };
     Ok(Json(resp))
+}
+
+/// Allowlisted commands that may run as processes at once, across every
+/// client of this server.
+const CLI_PROCESS_SLOTS: usize = 2;
+/// Longest a request waits for one of those slots.
+const CLI_SLOT_WAIT: Duration = Duration::from_secs(30);
+
+fn cli_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(CLI_PROCESS_SLOTS))
 }
 
 /// The output of an allowlisted command that needs no process of its own, or
@@ -153,6 +180,21 @@ pub(super) async fn version(
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// When any file was last reindexed, in ms since the epoch: the newest
+/// `files.last_indexed_at` (whole seconds), over a read-only connection.
+pub(super) fn last_indexed_ms(db: &Path) -> Option<u64> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_secs(2)).ok()?;
+    let secs: Option<i64> = conn
+        .query_row("SELECT max(last_indexed_at) FROM files", [], |r| r.get(0))
+        .ok()?;
+    u64::try_from(secs?).ok().map(|s| s * 1000)
 }
 
 /// What changes when the index does, read through a plain read-only
