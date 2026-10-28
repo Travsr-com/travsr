@@ -597,8 +597,9 @@ Every graph answer is the text the matching MCP tool (`search_symbol`,
 returns for the same arguments, and the Health page runs the same read-only
 CLI commands the extension runs (`daemon status`, `lang list --json`, ...).
 Graph queries go to the repository's running daemon, as `travsr status` does;
-with no daemon running they read the index directly (writable only if it has
-migrations pending, as for the CLI) and the page says so.
+with no daemon running they read the index directly, read-only, and the page
+says so. `travsr ui` never writes the index: one that needs a schema upgrade is
+reported with the command to run (`travsr init`) instead of being migrated.
 The pages are read-only: where the extension has an action button (Start
 daemon, Reindex, Install analyzer), the page copies the command to run instead.
 "Open in editor" links open the file in VS Code when it is installed.

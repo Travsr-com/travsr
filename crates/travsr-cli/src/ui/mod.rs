@@ -3,8 +3,9 @@
 //! A small HTTP server in the CLI, not on the daemon: the daemon stays a
 //! loopback IPC endpoint and gains no network surface. Every answer comes
 //! through the same route the CLI uses ([`daemon_client::try_query`], falling
-//! back to a direct open when no daemon is running: read-only, or writable
-//! when migrations are pending, as in the CLI), and every graph answer
+//! back to a direct open when no daemon is running; unlike the CLI's, that
+//! open is always read-only, and an index needing migration is reported, not
+//! migrated), and every graph answer
 //! is an MCP tool's own text via [`travsr_mcp::browse_tool_call`], so the page
 //! and an agent asking the same question see the same result.
 //!
