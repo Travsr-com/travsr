@@ -6,7 +6,9 @@
 //! sensitive and does not need daemon-warm state to be useful.
 
 use anyhow::Context as _;
-use travsr_mcp::query::{explain_query, ExplainDisposition, ExplainLeg, ExplainReport};
+use travsr_mcp::query::{
+    explain_query, ExplainDisposition, ExplainLeg, ExplainReport, ExplainToken,
+};
 
 use crate::daemon_client;
 use crate::repo::find_git_root;
@@ -17,6 +19,35 @@ pub enum OutputFormat {
     Text,
     /// Machine-readable JSON — emits the full ExplainReport
     Json,
+}
+
+/// #540: how many of a token's matches reached the anchor set.
+fn anchor_note(t: &ExplainToken) -> Option<String> {
+    // #540: only a token that reached the anchor stage can lose matches to
+    // capacity. A token below `anchor_emit_cut` is suppressed before the
+    // loop and emits nothing at all; its absence is a relevance decision,
+    // so claiming "cut on capacity, not relevance" there states the exact
+    // opposite of what happened. Same class of error as the earlier "add a
+    // distinguishing term" line: a note that is right in one case and
+    // actively wrong in another.
+    //
+    // An unresolved token is carried by no symbol, so nothing was cut. For a
+    // compound token `symbol_freq` counts the symbols carrying its rarest
+    // word (`CoreNode` -> `core`, 615), only a bound on those carrying it.
+    if !(t.is_anchor_emit && t.resolved && t.symbol_freq > t.anchors_emitted) {
+        return None;
+    }
+    let (names, cut) = if travsr_core::ident::segments(&t.token).len() > 1 {
+        ("names at most", "up to ")
+    } else {
+        ("names", "")
+    };
+    Some(format!(
+        "{names} {} symbols, {} became anchors, {cut}{} did not reach the anchor set",
+        t.symbol_freq,
+        t.anchors_emitted,
+        t.symbol_freq - t.anchors_emitted
+    ))
 }
 
 fn print_leg(name: &str, leg: Option<&ExplainLeg>) {
@@ -145,20 +176,8 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
                 .map(|s| format!("  top_node={s}"))
                 .unwrap_or_default()
         );
-        // #540: only a token that reached the anchor stage can lose matches to
-        // capacity. A token below `anchor_emit_cut` is suppressed before the
-        // loop and emits nothing at all — its absence is a relevance decision,
-        // so claiming "cut on capacity, not relevance" there states the exact
-        // opposite of what happened. Same class of error as the earlier "add a
-        // distinguishing term" line: a note that is right in one case and
-        // actively wrong in another.
-        if t.is_anchor_emit && t.symbol_freq > t.anchors_emitted {
-            println!(
-                "      note: names {} symbols, {} became anchors, {} did not reach the anchor set",
-                t.symbol_freq,
-                t.anchors_emitted,
-                t.symbol_freq - t.anchors_emitted
-            );
+        if let Some(note) = anchor_note(t) {
+            println!("      note: {note}");
         }
     }
 
@@ -176,4 +195,44 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
     print_disposition("fts-only (embeddings disabled)", &report.fts_only);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(token: &str, freq: usize, resolved: bool, anchors: usize) -> ExplainToken {
+        ExplainToken {
+            token: token.to_string(),
+            symbol_freq: freq,
+            idf_w: 0.3,
+            resolved,
+            is_anchor_emit: true,
+            top_node_signature: None,
+            anchors_emitted: anchors,
+        }
+    }
+
+    /// One word: its frequency is the count of symbols carrying it (#540).
+    #[test]
+    fn a_one_word_token_reports_its_exact_count() {
+        assert_eq!(
+            anchor_note(&token("sqlite", 168, true, 3)).as_deref(),
+            Some("names 168 symbols, 3 became anchors, 165 did not reach the anchor set")
+        );
+    }
+
+    /// `CoreNode` read "names 615 symbols" while none carried it: 615 is how
+    /// many carry its rarest word, `core`, only a bound on the compound.
+    #[test]
+    fn a_compound_token_reports_its_count_as_a_bound() {
+        let note = anchor_note(&token("CoreNode", 615, true, 0)).unwrap_or_default();
+        assert!(note.contains("at most 615"), "{note}");
+    }
+
+    /// A token nothing carries names no symbols, so nothing was cut.
+    #[test]
+    fn an_unresolved_token_has_no_note() {
+        assert_eq!(anchor_note(&token("FooNode", 1, false, 0)), None);
+    }
 }

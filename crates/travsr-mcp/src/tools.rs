@@ -1632,7 +1632,11 @@ pub(crate) fn resolve_reference_targets(
 /// graph under the original. One bounded text search over the indexed files,
 /// run only when the name has no definition of its own; an original that
 /// resolves to no definition (a cast like `x as u32`) is dropped.
-fn resolve_alias(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Vec<CoreNode> {
+pub(crate) fn resolve_alias(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> Vec<CoreNode> {
     if symbol.is_empty() || !symbol.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return Vec::new();
     }
@@ -8666,7 +8670,18 @@ fn get_context_body(
     // total minus what the docs section already measured and clamped — a
     // docs-free query has `doc_tokens == 0`, so this is byte-identical to the
     // pre-Phase-2 call.
-    let selected = knapsack(items, token_budget.saturating_sub(doc_tokens));
+    //
+    // #991 rule 1 decides inclusion, not just order: a definition named by the
+    // whole query is budgeted first. Its PPR value can be the lowest in the set
+    // (a leaf type with few edges), so a single knapsack over PPR dropped it
+    // while its neighbours filled the budget.
+    let code_budget = token_budget.saturating_sub(doc_tokens);
+    let (named, rest): (Vec<_>, Vec<_>) = items
+        .into_iter()
+        .partition(|(n, _)| crate::seed::is_named_by(n, query.trim()));
+    let mut selected = knapsack(named, code_budget);
+    let named_tokens: usize = selected.iter().map(token_cost).sum();
+    selected.extend(knapsack(rest, code_budget.saturating_sub(named_tokens)));
     let n_nodes = selected.len();
     let total_tokens: usize = selected.iter().map(token_cost).sum();
 
@@ -8687,7 +8702,13 @@ fn get_context_body(
     // rendered lines are ordered/headed. Gated behind the flag; and collapsed to a
     // flat list for small N (≤4), where per-section headers cost more than they save.
     let group_output = crate::seed::match_source_grouping_enabled() && n_nodes > 4;
-    let entry_meta = |id: NodeId| -> (crate::seed::MatchSource, f32) {
+    let entry_meta = |n: &CoreNode| -> (crate::seed::MatchSource, f32) {
+        // #991 rule 1, as in `ask`: a node whose own name is the whole query
+        // leads the exact section, a test fn included, whatever its score.
+        if crate::seed::is_named_by(n, query.trim()) {
+            return (crate::seed::MatchSource::Exact, f32::INFINITY);
+        }
+        let id = n.id;
         let is_exact = matches!(
             seed_source_map.get(&id),
             Some(crate::seed::SeedSource::Exact)
@@ -8882,7 +8903,7 @@ fn get_context_body(
                             .copied()
                             .unwrap_or(NodeRole::Context)
                             .label();
-                        let (ms, score) = entry_meta(n.id);
+                        let (ms, score) = entry_meta(n);
                         let line = format_node_line(
                             n,
                             role,
@@ -8934,7 +8955,7 @@ fn get_context_body(
                 .copied()
                 .unwrap_or(NodeRole::Context)
                 .label();
-            let (ms, score) = entry_meta(n.id);
+            let (ms, score) = entry_meta(n);
             let header = format_node_line(
                 n,
                 role,
@@ -9013,7 +9034,7 @@ fn get_context_body(
                     .copied()
                     .unwrap_or(NodeRole::Context)
                     .label();
-                let (ms, score) = entry_meta(n.id);
+                let (ms, score) = entry_meta(n);
                 let line = format_node_line(
                     n,
                     role,
@@ -16243,6 +16264,112 @@ mod snippet_tests {
         assert!(
             result.contains("[via: seed · exact-name]"),
             "direct exact match must be labelled [via: seed · exact-name]: {result}"
+        );
+    }
+
+    /// #991 rule 1 on `get_context`: a test fn named by the whole query leads
+    /// the result instead of rendering in the tests section below the rest.
+    #[test]
+    fn get_context_bare_identifier_puts_the_named_node_first() {
+        use travsr_core::EdgeKind;
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut test_fn = make_fn_node_with_pkg("t.ts", "fn:frob_handles_empty", 1, 3);
+        test_fn.test_role = travsr_core::TestRole::EntryPoint;
+        let frob = make_fn_node_with_pkg("f.ts", "fn:frob", 1, 3);
+        let mut nodes = vec![test_fn.clone(), frob.clone()];
+        let mut edges = vec![(test_fn.id, frob.id, EdgeKind::RefCall)];
+        for dep in ["handles_a", "handles_b", "handles_c", "handles_d"] {
+            let d = make_fn_node_with_pkg(&format!("{dep}.ts"), &format!("fn:{dep}"), 1, 3);
+            edges.push((frob.id, d.id, EdgeKind::Depends));
+            nodes.push(d);
+        }
+        let store = make_store_with_edges(&nodes, &edges);
+        let result = get_context_body(
+            &store,
+            "frob_handles_empty",
+            4096,
+            &OpenFilter,
+            false,
+            None,
+            None,
+        );
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let first = result
+            .lines()
+            .find(|l| l.contains(" — "))
+            .unwrap_or_default();
+        assert!(first.starts_with("fn:frob_handles_empty "), "{result}");
+    }
+
+    /// #991 rule 1 on `get_context`: an `impl` shares its type's name and, owning
+    /// the methods, precedes the type in knapsack order; the type still leads.
+    #[test]
+    fn get_context_bare_type_name_leads_its_own_impl() {
+        use travsr_core::EdgeKind;
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let node = |sig: &str, kind: &str| {
+            CoreNode::new(VName::new("corpus", "", "frob.rs", "rust", sig), kind)
+                .with_line(1)
+                .with_end_line(3)
+        };
+        let imp = node("impl:Frob", "impl");
+        let ty = node("struct:Frob", "struct");
+        let mut nodes = vec![imp.clone()];
+        let mut edges = Vec::new();
+        for m in ["open", "close", "read", "write"] {
+            let method = node(&format!("method:Frob.{m}"), "method");
+            edges.push((imp.id, method.id, EdgeKind::DefinesBinding));
+            nodes.push(method);
+        }
+        nodes.push(ty);
+        let store = make_store_with_edges(&nodes, &edges);
+        let result = get_context_body(&store, "Frob", 4096, &OpenFilter, false, None, None);
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let first = result
+            .lines()
+            .find(|l| l.contains(" — "))
+            .unwrap_or_default();
+        assert!(first.starts_with("struct:Frob "), "{result}");
+    }
+
+    /// #991 rule 1 under a tight budget: the type has no edges, so its PPR value
+    /// is the lowest and the knapsack filled the budget with its impl and
+    /// methods instead (`get_context("Config", 400)` showed no `Config`).
+    #[test]
+    fn get_context_bare_type_name_survives_a_tight_budget() {
+        use travsr_core::EdgeKind;
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let node = |sig: &str, kind: &str| {
+            CoreNode::new(VName::new("corpus", "", "frob.rs", "rust", sig), kind)
+                .with_line(1)
+                .with_end_line(3)
+        };
+        let imp = node("impl:Frob", "impl");
+        let ty = node("struct:Frob", "struct");
+        let mut nodes = vec![imp.clone()];
+        let mut edges = Vec::new();
+        for m in ["open", "close", "read", "write"] {
+            let method = node(&format!("method:Frob.{m}"), "method");
+            edges.push((imp.id, method.id, EdgeKind::DefinesBinding));
+            nodes.push(method);
+        }
+        nodes.push(ty.clone());
+        let store = make_store_with_edges(&nodes, &edges);
+        let budget = 2 * travsr_retrieval::token_cost(&ty);
+        let result = get_context_body(&store, "Frob", budget, &OpenFilter, false, None, None);
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        assert!(
+            result.lines().any(|l| l.starts_with("struct:Frob ")),
+            "{result}"
         );
     }
 

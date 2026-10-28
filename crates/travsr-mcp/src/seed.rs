@@ -730,6 +730,14 @@ pub(crate) fn match_source(is_primary_seed: bool, is_exact_source: bool) -> Matc
     }
 }
 
+/// #991: whether `n` is the definition literally named `name` (case-sensitive).
+/// An `impl` or an import carries the same leaf as the type but is not it.
+pub(crate) fn is_named_by(n: &CoreNode, name: &str) -> bool {
+    n.kind != "impl"
+        && n.kind != "import"
+        && travsr_core::ident::leaf_of(&n.vname.signature) == name
+}
+
 /// Precedence of a [`SeedSource`] when a node is reached by several seeds. Exact
 /// (literal-name / FTS) is the most trustworthy, then embedding-KNN, then
 /// fuzzy-lexical. The strongest source decides both the node's displayed
@@ -2357,6 +2365,10 @@ pub(crate) fn build_seed_set(
     // uniqueness-gated correction and the g1 subject-share test, not the reranker.
     let mut corrected_anchor_ids: std::collections::HashSet<NodeId> =
         std::collections::HashSet::new();
+    // Nodes whose own name is an emitting token but which the #463 reorder kept out
+    // of the anchor cap (a type behind its own impl/methods). A node here that
+    // still seeds through another leg is classified Exact, not Lexical.
+    let mut named_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
 
     // Boundary predicate reused for both the direct token and a #709 correction:
     // a token counts as resolved only when it appears as a whole word segment (or
@@ -2432,6 +2444,7 @@ pub(crate) fn build_seed_set(
         // measured, not the unindexed typo) and, being deliberate and unique, is
         // always emitted as an anchor below, the cross-encoder reranker is the
         // precision backstop. Only fires on the exact-miss cold branch.
+        let mut alias_freq: Option<usize> = None;
         let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) = if has_direct {
             (direct_nodes, token.clone(), false)
         } else if let Some(fix) = corrections.get(token) {
@@ -2442,18 +2455,43 @@ pub(crate) fn build_seed_set(
                 (direct_nodes, token.clone(), false)
             }
         } else {
-            (direct_nodes, token.clone(), false)
+            // A bare name that exists only as an `as` alias (`Node as CoreNode`)
+            // anchors its original, as `find_references` resolves it. Parsers
+            // index the original name, so nothing else can ground it. Only for a
+            // single-token query: the lookup is a git grep. The impl/import of
+            // the original share its name but are not it (#991). The alias names
+            // only these definitions, so that count is its frequency: measured by
+            // the original (`Node`, ~700 symbols) it read as generic and abstained,
+            // and the cross-encoder cannot rate a name the definition never spells.
+            let aliased: Vec<CoreNode> = if n_content == 1 {
+                crate::tools::resolve_alias(store, token, None)
+                    .into_iter()
+                    .filter(|n| n.kind != "impl" && n.kind != "import")
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            match aliased.first() {
+                Some(orig) => {
+                    let name = travsr_core::ident::leaf_of(&orig.vname.signature).to_string();
+                    alias_freq = Some(aliased.len());
+                    (aliased, name, false)
+                }
+                None => (direct_nodes, token.clone(), false),
+            }
         };
 
         // #478: absent from the vocabulary (unknown token, or < 3 bytes so
         // never indexed) is treated as maximally generic, matching the
         // previous `unwrap_or(n_total)` failure behaviour. A token we cannot
         // measure must never be *promoted* to a rare anchor.
-        let freq = store
-            .symbol_frequency(&resolve_token)
-            .ok()
-            .flatten()
-            .unwrap_or(n_total);
+        let freq = alias_freq.unwrap_or_else(|| {
+            store
+                .symbol_frequency(&resolve_token)
+                .ok()
+                .flatten()
+                .unwrap_or(n_total)
+        });
         let boundary_matched: Vec<&CoreNode> = exact_nodes
             .iter()
             .filter(|n| boundary(&resolve_token, n))
@@ -2479,9 +2517,16 @@ pub(crate) fn build_seed_set(
         // signature-only predicate to match that gate exactly (a path-only match
         // is not an anchor — #478). Borrows from `exact_nodes` (no clone): the
         // pool lives only within this loop iteration.
+        //
+        // Anchor noise is dropped here for the same reason: in-src test helpers
+        // named `node` (functions, so reordered first) filled every slot and
+        // were then all rejected, starving `struct:Node`.
         let anchor_pool: Vec<&CoreNode> = exact_nodes
             .iter()
-            .filter(|n| travsr_core::ident::contains_token(&resolve_token, &n.vname.signature))
+            .filter(|n| {
+                travsr_core::ident::contains_token(&resolve_token, &n.vname.signature)
+                    && !is_anchor_noise(n)
+            })
             .collect();
 
         // #709: the corrected anchor deliberately bypasses the *budget* gates
@@ -2626,6 +2671,16 @@ pub(crate) fn build_seed_set(
                 specific_token_anchor_ids.insert(node.id);
             }
         }
+        named_ids.extend(
+            anchor_pool
+                .iter()
+                .filter(|n| {
+                    is_named_by(n, &resolve_token)
+                        && !is_anchor_noise(n)
+                        && filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))
+                })
+                .map(|n| n.id),
+        );
 
         // #540: the measured count, after every drop the loop applies.
         terms[term_idx].anchors_emitted = added_for_this_token;
@@ -2850,7 +2905,7 @@ pub(crate) fn build_seed_set(
                 .max(knn_w.unwrap_or(0.0))
                 .max(rrf_score * 0.5); // fallback: 50% of RRF score when weight unknown
 
-            let source = if anchor_w.is_some() {
+            let source = if anchor_w.is_some() || named_ids.contains(&node_id) {
                 SeedSource::Exact
             } else if knn_w.is_some() {
                 SeedSource::Knn
@@ -6080,6 +6135,119 @@ mod tests {
             seed_ids.contains(&ui.id),
             "the exact `class:UI` match must seed and not be starved by \
              substring-noise methods; seeds present: {seed_ids:?}"
+        );
+    }
+
+    /// `ask CoreNode` abstained: `CoreNode` exists only as `Node as CoreNode`,
+    /// and parsers index the original name, so no token resolved. `references`
+    /// already follows the alias; the seed set must too.
+    #[test]
+    fn build_seed_set_anchors_the_original_of_an_import_alias() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(repo.path().join("travsr-mcp/src")).unwrap();
+        std::fs::write(
+            repo.path().join("travsr-mcp/src/seed.rs"),
+            "use travsr_core::{Node as CoreNode, NodeId};\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+
+        let path = "travsr-core/src/lib.rs";
+        let ty = Node::new(
+            VName::new("corpus", "", path, "rust", "struct:Node"),
+            "struct",
+        );
+        let imp = Node::new(VName::new("corpus", "", path, "rust", "impl:Node"), "impl");
+        store.put_node(&ty).unwrap();
+        store.put_node(&imp).unwrap();
+        // The original name is common, as `Node` is in travsr (~700 symbols), so
+        // measured by it the alias read as generic and abstained.
+        for i in 0..400 {
+            let sig = format!("fn:node_helper_{i}");
+            store
+                .put_node(&Node::new(
+                    VName::new("corpus", "", "other/src/lib.rs", "rust", &sig),
+                    "function",
+                ))
+                .unwrap();
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "CoreNode",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            seed_set.terms[0].top_node,
+            Some(ty.id),
+            "{:?}",
+            seed_set.terms
+        );
+        assert!(seed_set.seeds.iter().any(|s| s.node == ty.id));
+        assert_ne!(
+            seed_set.confidence,
+            Confidence::None,
+            "{:?}",
+            seed_set.terms
+        );
+    }
+
+    /// `ask Node` never seeded `struct:Node`: in-src test helpers named `node`
+    /// (functions, so reordered ahead of the struct) filled the anchor slots
+    /// and were then all dropped as anchor noise.
+    #[test]
+    fn build_seed_set_type_not_starved_by_test_helper_noise() {
+        use travsr_core::{Node, TestRole, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let target = Node::new(
+            VName::new("corpus", "", "core/src/lib.rs", "rust", "struct:Node"),
+            "struct",
+        );
+        store.put_node(&target).unwrap();
+        for path in ["a/src/lib.rs", "b/src/lib.rs", "c/src/lib.rs"] {
+            let mut helper = Node::new(
+                VName::new("corpus", "", path, "rust", "fn:node"),
+                "function",
+            );
+            helper.test_role = TestRole::Support;
+            store.put_node(&helper).unwrap();
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "Node",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        // The struct is the only non-noise candidate, so one emitted anchor is it.
+        // Asserted on the anchor stage: in this tiny store the lexical leg seeds
+        // the struct anyway, which it does not on the real repo.
+        assert_eq!(
+            seed_set.terms[0].anchors_emitted, 1,
+            "`struct:Node` must anchor and not be starved by test-helper \
+             `fn:node` noise"
         );
     }
 

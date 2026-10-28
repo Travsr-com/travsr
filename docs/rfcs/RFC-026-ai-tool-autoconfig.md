@@ -153,6 +153,15 @@ installed application, `docs` = vendor documentation.
 | Codex | `.codex/` or `AGENTS.md` | **note only** `~/.codex/config.toml` or `.codex/config.toml` → `[mcp_servers.travsr]` | TOML, not written by us | `AGENTS.md` managed block | docs |
 | Windsurf | `.windsurf/` (else `~/.codeium/windsurf/`) | **note only** `~/.codeium/windsurf/mcp_config.json` → `mcpServers` | `{command, args}` | `.windsurf/rules/travsr.md` (preferred over legacy `.windsurfrules`) | docs |
 | Zed | `.zed/` | `.zed/settings.json` → `context_servers.travsr` | flat `{command, args, env?}` | first existing of Zed's instruction list, else `.rules` | docs |
+| OpenCode | `opencode.json`, `opencode.jsonc`, `.opencode/` (or `~/.config/opencode`, detection only) | first existing of `opencode.jsonc`, `opencode.json`, else create `opencode.json` → `mcp.travsr` | `{"type":"local", "command":[abs-binary, "mcp", "--stdio"], "enabled":true}` | none | docs ([config](https://opencode.ai/docs/config), [mcp-servers](https://opencode.ai/docs/mcp-servers)); file precedence unverified |
+| Kilo Code | `kilo.json`, `kilo.jsonc`, `.kilo/` (or `~/.config/kilo`, detection only) | first existing of `kilo.jsonc`, `kilo.json`, `.kilo/kilo.jsonc`, `.kilo/kilo.json`, else create `kilo.json` → `mcp.travsr` | same as OpenCode | none | docs ([using-mcp-in-cli](https://kilo.ai/docs/features/mcp/using-mcp-in-cli)); file precedence unverified |
+
+OpenCode and Kilo configs are JSONC in practice (comments, trailing commas), so
+they are edited as text rather than parsed and re-serialised: only the
+`mcp.travsr` member is spliced in or cut out, every comment is kept, and the edit
+is dropped if the result does not parse to the original plus that one member.
+Their command is always an absolute path, and the global config directories are
+detection signals only, never written.
 
 Zed's server shape was left as an open question in the first draft (flat
 `{command,args}` versus nested `{command:{path,args}}`). It is **flat**. The
