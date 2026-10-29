@@ -5202,13 +5202,29 @@ pub fn get_subsystem_brief(
         let ext_count =
             |id: &travsr_core::NodeId| ext.and_then(|m| m.get(id)).copied().unwrap_or(0);
         let is_root = |id: &travsr_core::NodeId| !called_within.contains(id);
+        // A Cargo build script and an examples/ binary are call-graph roots that
+        // call things, so the root arm below would headline their `main` as a
+        // component entry (build.rs even outranking the real src/main.rs). They
+        // are build-time and demo code, not a subsystem entry point, and nothing
+        // in the graph calls them, so they only ever qualify via the root arm.
+        // Exclude them there; an entry with a genuine outside caller still stands.
+        let is_build_or_example = |id: &travsr_core::NodeId| {
+            let p = &by_id[id].vname.path;
+            p == "build.rs"
+                || p.ends_with("/build.rs")
+                || p.starts_with("examples/")
+                || p.contains("/examples/")
+        };
         // Candidate entries: reached from outside, or an in-component root that
         // itself calls out. Pure data nodes and leaves that are never called and
         // call nothing are neither, and drop out.
         let mut cand: Vec<travsr_core::NodeId> = members
             .iter()
             .copied()
-            .filter(|id| ext_count(id) > 0 || (is_root(id) && calls.contains_key(id)))
+            .filter(|id| {
+                ext_count(id) > 0
+                    || (is_root(id) && calls.contains_key(id) && !is_build_or_example(id))
+            })
             .collect();
         if cand.is_empty() {
             // Fully cyclic with no external entry: fall back to the old proxy so
@@ -14550,13 +14566,21 @@ mod tests {
         use travsr_core::EdgeKind;
         let cli_main = make_node("crates/cli/src/main.rs", "fn:main");
         let cli_work = make_node("crates/cli/src/work.rs", "fn:do_work");
+        // A build script is a call-graph root that calls things, but it is not a
+        // subsystem entry and must never headline the crate over src/main.rs.
+        let cli_build = make_node("crates/cli/build.rs", "fn:main");
+        let cli_gen = make_node("crates/cli/src/gen.rs", "fn:codegen");
         let tool_main = make_node("crates/tool/src/main.rs", "fn:main");
         let tool_step = make_node("crates/tool/src/step.rs", "fn:step");
         let edges = vec![
             (cli_main.id, cli_work.id, EdgeKind::RefCall),
+            (cli_build.id, cli_gen.id, EdgeKind::RefCall),
             (tool_main.id, tool_step.id, EdgeKind::RefCall),
         ];
-        let store = make_store(&[cli_main, cli_work, tool_main, tool_step], &edges);
+        let store = make_store(
+            &[cli_main, cli_work, cli_build, cli_gen, tool_main, tool_step],
+            &edges,
+        );
 
         // Binary crate: nothing calls into it, but `main` is a call-graph root.
         let by_comp = get_subsystem_brief(&store, "", "crates/cli", "", 3, 6, 8_000);
@@ -14567,6 +14591,17 @@ mod tests {
         assert!(
             by_comp.contains("- main - crates/cli/src/main.rs"),
             "its main must be the entry:\n{by_comp}"
+        );
+        let cli_entry = by_comp
+            .split("## Entry")
+            .nth(1)
+            .unwrap_or_else(|| panic!("entry section:\n{by_comp}"))
+            .split("## Called from")
+            .next()
+            .unwrap();
+        assert!(
+            !cli_entry.contains("build.rs"),
+            "a build script must not be surfaced as a component entry:\n{cli_entry}"
         );
 
         // Path-qualified entry picks the tool's main, not the cli's.
