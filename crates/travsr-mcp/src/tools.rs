@@ -5230,8 +5230,10 @@ pub fn get_subsystem_brief(
         let out_degree = |id: &travsr_core::NodeId| calls.get(id).map(|v| v.len()).unwrap_or(0);
         // Roots first; then a named entry (`main`) so a binary crate headlines
         // its real main over build.rs's; then the biggest driver, so a daemon
-        // headlines its run loop; then outside demand, reach, and path (which is
-        // unique per definition and keeps the order deterministic).
+        // headlines its run loop; then outside demand, reach, and finally path
+        // then signature. Path alone is not unique (two symbols share a file) and
+        // signature alone is not either (two `main`s), so both are needed to keep
+        // the order deterministic across the arbitrary member iteration order.
         cand.sort_by(|a, b| {
             is_root(b)
                 .cmp(&is_root(a))
@@ -5243,6 +5245,7 @@ pub fn get_subsystem_brief(
                 .then_with(|| ext_count(b).cmp(&ext_count(a)))
                 .then_with(|| reach.get(b).unwrap_or(&0).cmp(reach.get(a).unwrap_or(&0)))
                 .then_with(|| by_id[a].vname.path.cmp(&by_id[b].vname.path))
+                .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
         });
         cand.truncate(4);
         cand
