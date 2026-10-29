@@ -5160,26 +5160,133 @@ pub fn get_subsystem_brief(
         return wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)));
     }
 
-    // Roots: a named symbol, or the component's most-called-into entry points.
+    // Roots: a named symbol, or the component's entry points. An entry point is a
+    // symbol reached from OUTSIDE the component, or a call-graph root inside it (no
+    // in-component caller) that still calls something, e.g. a `main` or a run loop.
+    // Ranking a root ahead of a merely popular helper is what surfaces `Daemon.run`
+    // over setup helpers, and letting a root stand in for an outside caller is what
+    // lets a binary crate like travsr-cli, which nothing calls into, be traced at
+    // all (#1046).
     let roots: Vec<travsr_core::NodeId> = if !component.is_empty() {
-        match external.get(component) {
-            Some(m) => ranked(m).into_iter().take(4).map(|(id, _)| id).collect(),
-            None => {
-                let known: Vec<&str> = external.keys().map(|s| s.as_str()).take(12).collect();
-                return sanitize_for_mcp(&format!(
-                    "no component '{component}' is called from outside. Components with entry \
-                     points: {}",
-                    known.join(", ")
-                ));
-            }
-        }
-    } else {
-        let want = simple_symbol(entry);
-        let mut hit: Vec<travsr_core::NodeId> = by_id
+        let members: Vec<travsr_core::NodeId> = by_id
             .values()
-            .filter(|n| n.vname.signature == entry)
+            .filter(|n| subsystem_component_of(&n.vname.path) == *component)
             .map(|n| n.id)
             .collect();
+        if members.is_empty() {
+            let mut known: Vec<String> = by_id
+                .values()
+                .map(|n| subsystem_component_of(&n.vname.path))
+                .collect();
+            known.sort();
+            known.dedup();
+            known.truncate(12);
+            return sanitize_for_mcp(&format!(
+                "no component '{component}' in the graph. Components: {}",
+                known.join(", ")
+            ));
+        }
+        // A member called by another member of the SAME component is not a root.
+        let mut called_within: HashSet<travsr_core::NodeId> = HashSet::new();
+        for (src, dsts) in &calls {
+            if subsystem_component_of(&by_id[src].vname.path) != *component {
+                continue;
+            }
+            for dst in dsts {
+                if subsystem_component_of(&by_id[dst].vname.path) == *component {
+                    called_within.insert(*dst);
+                }
+            }
+        }
+        let ext = external.get(component);
+        let ext_count =
+            |id: &travsr_core::NodeId| ext.and_then(|m| m.get(id)).copied().unwrap_or(0);
+        let is_root = |id: &travsr_core::NodeId| !called_within.contains(id);
+        // A Cargo build script and an examples/ binary are call-graph roots that
+        // call things, so the root arm below would headline their `main` as a
+        // component entry (build.rs even outranking the real src/main.rs). They
+        // are build-time and demo code, not a subsystem entry point, and nothing
+        // in the graph calls them, so they only ever qualify via the root arm.
+        // Exclude them there; an entry with a genuine outside caller still stands.
+        let is_build_or_example = |id: &travsr_core::NodeId| {
+            let p = &by_id[id].vname.path;
+            p == "build.rs"
+                || p.ends_with("/build.rs")
+                || p.starts_with("examples/")
+                || p.contains("/examples/")
+        };
+        // Candidate entries: reached from outside, or an in-component root that
+        // itself calls out. Pure data nodes and leaves that are never called and
+        // call nothing are neither, and drop out.
+        let mut cand: Vec<travsr_core::NodeId> = members
+            .iter()
+            .copied()
+            .filter(|id| {
+                ext_count(id) > 0
+                    || (is_root(id) && calls.contains_key(id) && !is_build_or_example(id))
+            })
+            .collect();
+        if cand.is_empty() {
+            // Fully cyclic with no external entry: fall back to the old proxy so
+            // the brief still has somewhere to start.
+            match ext {
+                Some(m) => cand = ranked(m).into_iter().map(|(id, _)| id).collect(),
+                None => {
+                    return sanitize_for_mcp(&format!(
+                        "component '{component}' has no traceable entry point: no symbol in it \
+                         is called from outside or is a call-graph root."
+                    ));
+                }
+            }
+        }
+        // How many members this symbol calls: a proxy for how much of the
+        // component it drives. The run loop drives a daemon; a `main` barely calls
+        // anything itself. Ranking a root by external-caller count alone buried
+        // `Daemon.run` (called once) under popular API like `LogTail` (#1046).
+        let out_degree = |id: &travsr_core::NodeId| calls.get(id).map(|v| v.len()).unwrap_or(0);
+        // Roots first; then a named entry (`main`) so a binary crate headlines
+        // its real main over build.rs's; then the biggest driver, so a daemon
+        // headlines its run loop; then outside demand, reach, and finally path
+        // then signature. Path alone is not unique (two symbols share a file) and
+        // signature alone is not either (two `main`s), so both are needed to keep
+        // the order deterministic across the arbitrary member iteration order.
+        cand.sort_by(|a, b| {
+            is_root(b)
+                .cmp(&is_root(a))
+                .then_with(|| {
+                    is_entry_point_signature(&by_id[b].vname.signature)
+                        .cmp(&is_entry_point_signature(&by_id[a].vname.signature))
+                })
+                .then_with(|| out_degree(b).cmp(&out_degree(a)))
+                .then_with(|| ext_count(b).cmp(&ext_count(a)))
+                .then_with(|| reach.get(b).unwrap_or(&0).cmp(reach.get(a).unwrap_or(&0)))
+                .then_with(|| by_id[a].vname.path.cmp(&by_id[b].vname.path))
+                .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+        });
+        cand.truncate(4);
+        cand
+    } else {
+        let want = simple_symbol(entry);
+        // A path-qualified id, exactly as get_graph_json emits it
+        // ("crates/foo/src/main.rs:fn:main"), picks one definition out of the many
+        // that share a bare name like `main` (#1046). Only tried when the entry
+        // looks like a path, so a bare signature never pays for the formatting.
+        let mut hit: Vec<travsr_core::NodeId> = if entry.contains('/') {
+            by_id
+                .values()
+                .filter(|n| format!("{}:{}", n.vname.path, n.vname.signature) == entry)
+                .map(|n| n.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if hit.is_empty() {
+            hit = by_id
+                .values()
+                .filter(|n| n.vname.signature == entry)
+                .map(|n| n.id)
+                .collect();
+        }
         if hit.is_empty() {
             hit = by_id
                 .values()
@@ -5239,7 +5346,19 @@ pub fn get_subsystem_brief(
                 });
             };
             by_reach(&mut crosses);
-            by_reach(&mut internal);
+            // Same-component callees were ranked by global reach, which promotes
+            // ubiquitous leaf helpers (validate_mcp_arg, reach 29) over the actual
+            // stages of the flow (build_seed_set, reach 4) and cut the stages at the
+            // width limit (#1046). A stage fans out; a leaf helper does not. Rank by
+            // out-degree so the width budget is spent on the pipeline, not on shared
+            // utilities. Cross-component calls are never cut, so they keep reach order.
+            let out_degree = |id: &travsr_core::NodeId| calls.get(id).map(|v| v.len()).unwrap_or(0);
+            internal.sort_by(|a, b| {
+                out_degree(b)
+                    .cmp(&out_degree(a))
+                    .then_with(|| reach.get(b).unwrap_or(&0).cmp(reach.get(a).unwrap_or(&0)))
+                    .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+            });
             internal.truncate(width);
             // `seen` is global to the walk, so gating the record on it dropped a
             // second call into an already-visited symbol. The spine is a tree and
@@ -14397,6 +14516,156 @@ mod tests {
         assert!(
             called_from.contains("sibling") && called_from.contains("outsider"),
             "entry mode lists every caller: {called_from}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_component_entry_is_a_root_not_a_popular_helper() {
+        // #1046: component entries were ranked by how often something outside
+        // called them, so a daemon's run loop (called once, from the CLI) lost to
+        // setup helpers the CLI calls directly. A call-graph root ranks first now.
+        use travsr_core::EdgeKind;
+        let run_loop = make_node("crates/app/src/run.rs", "fn:run_loop");
+        let helper = make_node("crates/app/src/util.rs", "fn:helper");
+        let driver1 = make_node("crates/cli/src/a.rs", "fn:driver1");
+        let driver2 = make_node("crates/cli/src/b.rs", "fn:driver2");
+        let edges = vec![
+            // run_loop: one external caller, calls the helper internally -> a root.
+            (driver1.id, run_loop.id, EdgeKind::RefCall),
+            (run_loop.id, helper.id, EdgeKind::RefCall),
+            // helper: more external callers than run_loop, but called from within
+            // the component too, so it is not a root.
+            (driver1.id, helper.id, EdgeKind::RefCall),
+            (driver2.id, helper.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[run_loop, helper, driver1, driver2], &edges);
+        let out = get_subsystem_brief(&store, "", "crates/app", "", 3, 6, 8_000);
+        let entry = out
+            .split("## Entry")
+            .nth(1)
+            .unwrap_or_else(|| panic!("entry section:\n{out}"))
+            .split("## Called from")
+            .next()
+            .unwrap();
+        let run_at = entry.find("run_loop");
+        let help_at = entry.find("helper");
+        assert!(run_at.is_some(), "the run loop must be an entry:\n{out}");
+        assert!(
+            help_at.is_none() || run_at < help_at,
+            "a root must rank ahead of a more-called helper:\n{entry}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_traces_a_binary_crate_and_a_path_qualified_entry() {
+        // #1046: a binary crate is never called, so "called from outside" found no
+        // entry and the component could not be traced; and `main` could not be
+        // picked out of the many like it without a path. Both are fixed: a
+        // call-graph root stands in for the missing outside caller, and a
+        // path-qualified id selects one definition.
+        use travsr_core::EdgeKind;
+        let cli_main = make_node("crates/cli/src/main.rs", "fn:main");
+        let cli_work = make_node("crates/cli/src/work.rs", "fn:do_work");
+        // A build script is a call-graph root that calls things, but it is not a
+        // subsystem entry and must never headline the crate over src/main.rs.
+        let cli_build = make_node("crates/cli/build.rs", "fn:main");
+        let cli_gen = make_node("crates/cli/src/gen.rs", "fn:codegen");
+        let tool_main = make_node("crates/tool/src/main.rs", "fn:main");
+        let tool_step = make_node("crates/tool/src/step.rs", "fn:step");
+        let edges = vec![
+            (cli_main.id, cli_work.id, EdgeKind::RefCall),
+            (cli_build.id, cli_gen.id, EdgeKind::RefCall),
+            (tool_main.id, tool_step.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(
+            &[cli_main, cli_work, cli_build, cli_gen, tool_main, tool_step],
+            &edges,
+        );
+
+        // Binary crate: nothing calls into it, but `main` is a call-graph root.
+        let by_comp = get_subsystem_brief(&store, "", "crates/cli", "", 3, 6, 8_000);
+        assert!(
+            by_comp.contains("SUBSYSTEM BRIEF: crates/cli"),
+            "a binary crate must be traceable:\n{by_comp}"
+        );
+        assert!(
+            by_comp.contains("- main - crates/cli/src/main.rs"),
+            "its main must be the entry:\n{by_comp}"
+        );
+        let cli_entry = by_comp
+            .split("## Entry")
+            .nth(1)
+            .unwrap_or_else(|| panic!("entry section:\n{by_comp}"))
+            .split("## Called from")
+            .next()
+            .unwrap();
+        assert!(
+            !cli_entry.contains("build.rs"),
+            "a build script must not be surfaced as a component entry:\n{cli_entry}"
+        );
+
+        // Path-qualified entry picks the tool's main, not the cli's.
+        let by_path = get_subsystem_brief(
+            &store,
+            "crates/tool/src/main.rs:fn:main",
+            "",
+            "",
+            3,
+            6,
+            8_000,
+        );
+        assert!(
+            by_path.contains("crates/tool/src/main.rs"),
+            "the path-qualified id must resolve to that definition:\n{by_path}"
+        );
+        assert!(
+            !by_path.contains("crates/cli/src/main.rs"),
+            "it must not resolve to the other main:\n{by_path}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_keeps_a_fanning_stage_over_a_popular_leaf() {
+        // #1046: same-component callees were cut by global reach, so a pipeline
+        // stage (build_seed_set, reach 4, out-degree 58) lost its slot to a leaf
+        // helper (validate_mcp_arg, reach 29, out-degree 1). Rank by out-degree so
+        // the stage survives a tight width.
+        use travsr_core::EdgeKind;
+        let body = make_node("crates/a/src/body.rs", "fn:body");
+        let stage = make_node("crates/a/src/stage.rs", "fn:stage");
+        let leaf = make_node("crates/a/src/util.rs", "fn:leaf");
+        let s1 = make_node("crates/a/src/s1.rs", "fn:s1");
+        let s2 = make_node("crates/a/src/s2.rs", "fn:s2");
+        let s3 = make_node("crates/a/src/s3.rs", "fn:s3");
+        let r1 = make_node("crates/a/src/r1.rs", "fn:r1");
+        let r2 = make_node("crates/a/src/r2.rs", "fn:r2");
+        let mut edges = vec![
+            (body.id, stage.id, EdgeKind::RefCall),
+            (body.id, leaf.id, EdgeKind::RefCall),
+            // stage fans out (high out-degree, low reach).
+            (stage.id, s1.id, EdgeKind::RefCall),
+            (stage.id, s2.id, EdgeKind::RefCall),
+            (stage.id, s3.id, EdgeKind::RefCall),
+        ];
+        // leaf is popular (high reach) but calls nothing (out-degree 0).
+        for r in [&r1, &r2] {
+            edges.push((r.id, leaf.id, EdgeKind::RefCall));
+        }
+        let store = make_store(&[body, stage, leaf, s1, s2, s3, r1, r2], &edges);
+        // width = 1 keeps a single same-component callee of body.
+        let out = get_subsystem_brief(&store, "fn:body", "", "", 2, 1, 8_000);
+        let spine = out
+            .split("## Call spine")
+            .nth(1)
+            .unwrap_or(&out)
+            .to_string();
+        assert!(
+            spine.contains("stage"),
+            "the fanning stage must win the width-1 slot:\n{out}"
+        );
+        assert!(
+            !spine.contains("- leaf "),
+            "the popular leaf must be the one cut:\n{spine}"
         );
     }
 
