@@ -4448,7 +4448,8 @@ pub fn get_architecture_brief(
         }
     }
 
-    // Component-to-component edges, weighted by distinct crossing file pairs.
+    // Component-to-component edges resolved from CODE, weighted by distinct
+    // crossing file pairs.
     let mut weight: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (src, dst) in &pairs {
         let a = subsystem_component_of(src);
@@ -4459,6 +4460,22 @@ pub fn get_architecture_brief(
         *weight.entry((a, b)).or_insert(0) += 1;
     }
 
+    // Dependencies DECLARED in a package manifest (Cargo.toml, ...). A crate used
+    // only through `use` imports, `pub use` re-exports or type-position mentions
+    // resolves no code edge, so travsr-error reported 3 dependents when its
+    // manifest consumers were 6 (#1047). These are a separate, deterministic edge
+    // kind: the brief shows the union of code and manifest edges, and marks where
+    // the two layers disagree.
+    let mut declared_edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for (src, dst) in store.declared_dep_pairs(provenance).unwrap_or_default() {
+        let a = subsystem_component_of(&src);
+        let b = subsystem_component_of(&dst);
+        if a == b || !files.contains_key(&a) || !files.contains_key(&b) {
+            continue;
+        }
+        declared_edges.insert((a, b));
+    }
+
     // Drop supporting directories, but only while that still leaves a graph. A
     // library's only internal consumers can BE its tests and examples, and an
     // empty diagram is worse than a noisy one.
@@ -4467,12 +4484,15 @@ pub fn get_architecture_brief(
         .filter(|c| !is_support_component(c))
         .cloned()
         .collect();
-    let product_edges = weight
-        .keys()
-        .filter(|(a, b)| !is_support_component(a) && !is_support_component(b))
-        .count();
+    let kept = |a: &str, b: &str| !is_support_component(a) && !is_support_component(b);
+    let product_edges = weight.keys().filter(|(a, b)| kept(a, b)).count()
+        + declared_edges
+            .iter()
+            .filter(|(a, b)| kept(a, b) && !weight.contains_key(&(a.clone(), b.clone())))
+            .count();
     let (names, view): (Vec<String>, &str) = if product.len() >= 2 && product_edges >= 1 {
-        weight.retain(|(a, b), _| !is_support_component(a) && !is_support_component(b));
+        weight.retain(|(a, b), _| kept(a, b));
+        declared_edges.retain(|(a, b)| kept(a, b));
         (product, "tests, benchmarks and docs excluded")
     } else {
         (
@@ -4484,9 +4504,16 @@ pub fn get_architecture_brief(
         return sanitize_for_mcp("no components: this index has no indexed source files.");
     }
 
+    // The dependency graph the brief reports is the UNION of resolved code edges
+    // and declared manifest edges, so a declared-only dependency is a first-class
+    // edge in the layering, cycle detection, dependent counts and "used by" lists
+    // rather than an invisible one.
+    let mut edge_set: BTreeSet<(String, String)> = weight.keys().cloned().collect();
+    edge_set.extend(declared_edges.iter().cloned());
+
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut in_deg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (a, b) in weight.keys() {
+    for (a, b) in &edge_set {
         adj.entry(a.clone()).or_default().push(b.clone());
         in_deg.entry(b.clone()).or_default().insert(a.clone());
     }
@@ -4500,7 +4527,7 @@ pub fn get_architecture_brief(
         }
     }
     let mut cond: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sccs.len()];
-    for (a, b) in weight.keys() {
+    for (a, b) in &edge_set {
         let (x, y) = (owner[a.as_str()], owner[b.as_str()]);
         if x != y {
             cond[x].insert(y);
@@ -4545,8 +4572,8 @@ pub fn get_architecture_brief(
         "## Shape\n- {} component{}, {} edge{}, {} layer{}\n- {}\n\n",
         names.len(),
         if names.len() == 1 { "" } else { "s" },
-        weight.len(),
-        if weight.len() == 1 { "" } else { "s" },
+        edge_set.len(),
+        if edge_set.len() == 1 { "" } else { "s" },
         max_layer + 1,
         if max_layer == 0 { "" } else { "s" },
         if cycles.is_empty() {
@@ -4560,7 +4587,7 @@ pub fn get_architecture_brief(
         }
     ));
 
-    if weight.is_empty() {
+    if edge_set.is_empty() {
         out.push_str(
             "## No dependencies resolved\nTravsr recorded no cross-component edges here. That \
              usually means full cross-file analysis has not run for this language, not that the \
@@ -4626,7 +4653,7 @@ pub fn get_architecture_brief(
         ranked.len()
     ));
     for c in ranked.iter().take(LIST_CAP) {
-        let deps = weight.keys().filter(|(a, _)| a == *c).count();
+        let deps = edge_set.iter().filter(|(a, _)| a == *c).count();
         out.push_str(&format!(
             "- {} | layer {} | {} dependent{} | depends on {} | {} files | {} symbols\n",
             c,
@@ -4641,17 +4668,33 @@ pub fn get_architecture_brief(
 
     out.push_str(&omitted(LIST_CAP, ranked.len(), "components"));
 
-    let mut ws: Vec<(&(String, String), &usize)> = weight.iter().collect();
-    ws.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    // Each edge is tagged with where it came from. A code edge keeps its
+    // file-pair weight; a manifest-only edge carries none (a declaration is a
+    // single fact, not a count of uses). Code edges sort first, heaviest first;
+    // manifest-only edges follow.
+    let mut es: Vec<(&String, &String, Option<usize>, bool)> = edge_set
+        .iter()
+        .map(|(a, b)| {
+            let w = weight.get(&(a.clone(), b.clone())).copied();
+            let decl = declared_edges.contains(&(a.clone(), b.clone()));
+            (a, b, w, decl)
+        })
+        .collect();
+    es.sort_by(|x, y| y.2.cmp(&x.2).then_with(|| (x.0, x.1).cmp(&(y.0, y.1))));
     out.push_str(&format!(
-        "\n## Dependency edges, heaviest first ({} of {}; weight = distinct file pairs crossing)\n",
-        ws.len().min(LIST_CAP),
-        ws.len()
+        "\n## Dependency edges, heaviest first ({} of {}; code weight = distinct file pairs \
+         crossing, manifest = declared in a package manifest)\n",
+        es.len().min(LIST_CAP),
+        es.len()
     ));
-    for ((a, b), w) in ws.iter().take(LIST_CAP) {
-        out.push_str(&format!("- {a} -> {b} ({w})\n"));
+    for (a, b, w, decl) in es.iter().take(LIST_CAP) {
+        match (w, decl) {
+            (Some(w), true) => out.push_str(&format!("- {a} -> {b} ({w}, code+manifest)\n")),
+            (Some(w), false) => out.push_str(&format!("- {a} -> {b} ({w}, code only)\n")),
+            (None, _) => out.push_str(&format!("- {a} -> {b} (manifest)\n")),
+        }
     }
-    out.push_str(&omitted(LIST_CAP, ws.len(), "edges"));
+    out.push_str(&omitted(LIST_CAP, es.len(), "edges"));
 
     out.push_str(&format!(
         "\n## What each component owns ({} of {})\n",
@@ -4702,7 +4745,11 @@ pub fn get_architecture_brief(
     }
     out.push_str(
         "\n## What this brief cannot tell you\n\
-         - a missing edge means the graph did not resolve it, not that it does not exist\n\
+         - edges are tagged by source: `code` is a resolved reference, `manifest` is a \
+           dependency declared in a package manifest but not seen resolved in code, \
+           `code+manifest` is both; a manifest edge includes dev- and build-dependencies\n\
+         - a missing edge means neither code nor a manifest resolved it, not that it does not \
+           exist\n\
          - type counts are references reaching a type or one of its members, so they rank by \
            use and undercount where analysis is incomplete\n\
          - nothing here states WHY a dependency exists\n",
@@ -14265,6 +14312,102 @@ mod tests {
             "counts must disagree with neither: expected {} components / {} edges:\n{brief}",
             components.len(),
             edges.len()
+        );
+    }
+
+    /// A synthetic workspace where `alpha`'s Cargo.toml declares `beta` but no
+    /// code edge resolves between them. `beta` must still be a dependency of
+    /// `alpha`, tagged as a manifest edge. #1047: travsr-error showed 3 dependents
+    /// because imports and `pub use` re-exports of it resolved no code edge, even
+    /// though three more crates declared it in Cargo.toml.
+    #[test]
+    fn architecture_brief_counts_a_manifest_declared_dependency() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        // alpha/Cargo.toml --external-dependency--> pkg:beta <--resolves-to--
+        // beta/Cargo.toml(crate:beta). No code edge alpha -> beta.
+        let a_manifest = make_node("crates/alpha/Cargo.toml", "crate:alpha");
+        let b_manifest = make_node("crates/beta/Cargo.toml", "crate:beta");
+        let pkg_beta = make_node("", "pkg:beta@*");
+        let store = make_store(
+            &[
+                a.clone(),
+                b.clone(),
+                a_manifest.clone(),
+                b_manifest.clone(),
+                pkg_beta.clone(),
+            ],
+            &[
+                (a_manifest.id, pkg_beta.id, EdgeKind::ExternalDependency),
+                (b_manifest.id, pkg_beta.id, EdgeKind::ResolvesTo),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("crates/alpha -&gt; crates/beta (manifest)"),
+            "a declared-only dependency must appear tagged `manifest`:\n{out}"
+        );
+        assert!(
+            out.contains("crates/beta | layer 0 | 1 dependent"),
+            "beta must count alpha as a dependent through the manifest edge:\n{out}"
+        );
+        assert!(
+            out.contains("used by: crates/alpha"),
+            "beta's `used by` must list alpha:\n{out}"
+        );
+    }
+
+    /// When a dependency is both declared in the manifest and resolved in code,
+    /// the edge is tagged `code+manifest` and keeps its file-pair weight.
+    #[test]
+    fn architecture_brief_marks_an_edge_seen_in_code_and_manifest() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let a_manifest = make_node("crates/alpha/Cargo.toml", "crate:alpha");
+        let b_manifest = make_node("crates/beta/Cargo.toml", "crate:beta");
+        let pkg_beta = make_node("", "pkg:beta@*");
+        let store = make_store(
+            &[
+                a.clone(),
+                b.clone(),
+                a_manifest.clone(),
+                b_manifest.clone(),
+                pkg_beta.clone(),
+            ],
+            &[
+                // Resolved in code AND declared in the manifest.
+                (a.id, b.id, EdgeKind::RefCall),
+                (a_manifest.id, pkg_beta.id, EdgeKind::ExternalDependency),
+                (b_manifest.id, pkg_beta.id, EdgeKind::ResolvesTo),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("crates/alpha -&gt; crates/beta (1, code+manifest)"),
+            "an edge seen both ways must be tagged `code+manifest`:\n{out}"
+        );
+        // The union must not double-count: one edge, not two.
+        assert!(
+            out.contains("1 edge,"),
+            "code and manifest for the same pair are one edge:\n{out}"
+        );
+    }
+
+    /// A reference resolved in code but NOT declared in any manifest (for example
+    /// a dev-dependency used only from a test, or an analyzer's cross-directory
+    /// edge) is tagged `code only`, so the two layers can be told apart.
+    #[test]
+    fn architecture_brief_marks_an_edge_seen_only_in_code() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("crates/alpha -&gt; crates/beta (1, code only)"),
+            "an unmatched code edge must be tagged `code only`:\n{out}"
         );
     }
 

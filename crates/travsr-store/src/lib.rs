@@ -4940,6 +4940,79 @@ LIMIT ?4",
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// Cross-component dependencies **declared in a package manifest**, as
+    /// `(consumer_manifest_path, provider_manifest_path)` pairs.
+    ///
+    /// Phase A already records a manifest dependency as
+    /// `consumer_manifest --external-dependency--> pkg:<name>@<ver>`, and a local
+    /// package records `provider_manifest(crate:<name>) --resolves-to-->
+    /// pkg:<name>@<ver>` into the *same* package-identity node (see
+    /// `data_format::cargo_package_node`). Joining the two on that shared node
+    /// resolves a declared dependency to the local package that provides it,
+    /// without any per-language logic here.
+    ///
+    /// Only dependencies that resolve to a LOCAL provider are returned: a
+    /// third-party package's `crate:` node carries an empty path, so
+    /// `n_prov.path <> ''` drops it. This is the manifest counterpart to
+    /// [`resolved_dep_pairs`], which sees only code-resolved edges and therefore
+    /// misses a crate that is declared but used only through imports,
+    /// `pub use` re-exports or type-position mentions.
+    ///
+    /// `provenance` filters with the same grammar as [`resolved_dep_pairs`]: both
+    /// the `external-dependency` and the `resolves-to` edge behind a pair must
+    /// pass, so a caller asking for one provenance is never handed a pair that
+    /// rests on another. An unrecognised value matches nothing.
+    pub fn declared_dep_pairs(
+        &self,
+        provenance: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, String)>> {
+            let (pred_dep, pred_res, bind_exact) = match provenance {
+                "" => ("", "", false),
+                "ratified" => (
+                    " AND e_dep.provenance <> 'live'",
+                    " AND e_res.provenance <> 'live'",
+                    false,
+                ),
+                _ => (
+                    " AND e_dep.provenance = ?1",
+                    " AND e_res.provenance = ?1",
+                    true,
+                ),
+            };
+            let sql = format!(
+                "SELECT DISTINCT n_con.path AS src, n_prov.path AS dst
+                     FROM edges e_dep
+                     JOIN nodes n_con ON n_con.id = e_dep.src
+                     JOIN edges e_res
+                         ON e_res.dst = e_dep.dst AND e_res.kind = 'resolves-to'
+                     JOIN nodes n_prov ON n_prov.id = e_res.src
+                     WHERE e_dep.kind = 'external-dependency'
+                       AND n_prov.signature LIKE 'crate:%'
+                       AND n_con.path <> '' AND n_prov.path <> ''
+                       AND n_con.path <> n_prov.path{pred_dep}{pred_res}"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("preparing declared_dep_pairs query")?;
+            let map_row =
+                |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            let rows = if bind_exact {
+                stmt.query_map([provenance], map_row)
+            } else {
+                stmt.query_map([], map_row)
+            }
+            .context("executing declared_dep_pairs query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding declared_dep_pairs row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// True when at least one `ref/call` edge exists anywhere in the graph — i.e.
     /// Phase B (SCIP/LSIF semantic analysis) has produced call-graph data. Used to
     /// disclose degraded state in the repo map. `false` on query error (safe:
@@ -17587,6 +17660,88 @@ mod tests {
         assert!(
             typo.is_empty(),
             "unknown filter must match nothing: {typo:?}"
+        );
+    }
+
+    #[test]
+    fn declared_dep_pairs_resolves_manifest_deps_to_local_providers() {
+        // A manifest dependency is `consumer_manifest --external-dependency-->
+        // pkg:<name>` and a local provider is `provider_manifest(crate:<name>)
+        // --resolves-to--> pkg:<name>`, both pointing at the same package node.
+        // The join must pair consumer with provider, and must NOT pair a
+        // third-party dependency (whose provider node carries no path).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let con = Node::new(
+            VName::new("", "", "crates/x/Cargo.toml", "toml", "crate:x"),
+            "package",
+        );
+        // Shared package-identity node both edges point at.
+        let pkg_y = Node::new(
+            VName::new("crates.io", "", "", "toml", "pkg:y@*"),
+            "package",
+        );
+        let prov_y = Node::new(
+            VName::new("", "", "crates/y/Cargo.toml", "toml", "crate:y"),
+            "package",
+        );
+        // A third-party dependency: its provider node has no path, so it is not
+        // a local component and must be dropped.
+        let pkg_serde = Node::new(
+            VName::new("crates.io", "", "", "toml", "pkg:serde@1"),
+            "package",
+        );
+        let prov_serde = Node::new(
+            VName::new("crates.io", "", "", "toml", "crate:serde"),
+            "package",
+        );
+        for n in [&con, &pkg_y, &prov_y, &pkg_serde, &prov_serde] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(con.id, pkg_y.id, EdgeKind::ExternalDependency))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(prov_y.id, pkg_y.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                con.id,
+                pkg_serde.id,
+                EdgeKind::ExternalDependency,
+            ))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                prov_serde.id,
+                pkg_serde.id,
+                EdgeKind::ResolvesTo,
+            ))
+            .unwrap();
+
+        let pairs = store.declared_dep_pairs("").unwrap();
+        assert_eq!(
+            pairs,
+            vec![(
+                "crates/x/Cargo.toml".to_string(),
+                "crates/y/Cargo.toml".to_string()
+            )],
+            "must pair consumer with its local provider and drop third-party deps"
+        );
+
+        // Manifest edges are tree-sitter provenance, so `ratified` (non-live)
+        // keeps them and an unrecognised filter matches nothing.
+        assert_eq!(
+            store.declared_dep_pairs("ratified").unwrap().len(),
+            1,
+            "ratified must keep the non-live manifest edge"
+        );
+        assert!(
+            store.declared_dep_pairs("live").unwrap().is_empty(),
+            "a live-only filter must drop the tree-sitter manifest edge"
+        );
+        assert!(
+            store.declared_dep_pairs("ratifed").unwrap().is_empty(),
+            "an unknown filter must match nothing"
         );
     }
 
