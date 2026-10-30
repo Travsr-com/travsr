@@ -45,6 +45,95 @@ pub fn run(store: &mut SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The running binary's on-disk fingerprint when the stdio server started:
+/// absolute path, last-modified time, and byte length. Captured once (#1049) so
+/// a later tool call can notice that `target/release/travsr` was rebuilt
+/// underneath a long-lived `travsr mcp --stdio`, which otherwise keeps serving
+/// the old tool code against the current graph with no signal.
+///
+/// The path string is remembered here, not re-derived from `current_exe()` per
+/// call: after a rebuild renames a fresh binary over this path, `current_exe()`
+/// on Linux resolves `/proc/self/exe` to "<path> (deleted)" for the now-unlinked
+/// image, and `metadata` on that fails. Re-`stat`ing the captured path instead
+/// sees the NEW file that now lives there, which is the comparison we want.
+///
+/// `None` (path or metadata unreadable at startup) disables the check: the
+/// server then never emits a false "stale" note. Never armed on the SSE path,
+/// whose process is replaced on redeploy, so the note is stdio-only.
+static STARTUP_EXE: std::sync::OnceLock<Option<ExeFingerprint>> = std::sync::OnceLock::new();
+
+#[derive(Clone)]
+struct ExeFingerprint {
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    len: u64,
+}
+
+fn read_exe_fingerprint() -> Option<ExeFingerprint> {
+    let path = std::env::current_exe().ok()?;
+    let md = std::fs::metadata(&path).ok()?;
+    Some(ExeFingerprint {
+        path,
+        mtime: md.modified().ok()?,
+        len: md.len(),
+    })
+}
+
+/// Record the running binary's on-disk fingerprint. Called once from
+/// `serve_stdio` / `serve_stdio_global` before the event loop, so the baseline
+/// is the image the server was launched with, not whatever is on disk by the
+/// time the first tool call arrives.
+pub(crate) fn record_startup_exe() {
+    let _ = STARTUP_EXE.get_or_init(read_exe_fingerprint);
+}
+
+/// Whether an on-disk binary now `(mtime, len)` is a different build than the one
+/// recorded at startup. A newer mtime is the primary signal (a relink always
+/// writes a fresh file, so its timestamp advances); a changed length is a
+/// secondary one that also catches a same-second rebuild.
+fn build_changed(start: (std::time::SystemTime, u64), now: (std::time::SystemTime, u64)) -> bool {
+    now.0 > start.0 || now.1 != start.1
+}
+
+/// The stale-build note, or `None` when the check was never armed (SSE, or a
+/// startup read that failed), the current metadata is unreadable, or the build
+/// is unchanged.
+fn stale_build_note() -> Option<&'static str> {
+    let start = STARTUP_EXE.get()?.as_ref()?;
+    let md = std::fs::metadata(&start.path).ok()?;
+    let now = (md.modified().ok()?, md.len());
+    build_changed((start.mtime, start.len), now).then_some(
+        "[note: this MCP server is running an older build than the travsr binary on disk; \
+         reconnect the MCP server to pick up the new build]",
+    )
+}
+
+/// Place the stale-build note (when the binary was rebuilt under this long-lived
+/// server) inside the `<travsr-data>` envelope the tool already produced, on its
+/// own line before the closing tag — the same spot the Phase-B and HEAD-drift
+/// notes sit, so every envelope-aware client already drops it from its result
+/// rows and the envelope stays structurally intact. A tool whose body is raw
+/// JSON for renderers (`get_graph_json`) has no envelope to land in, so it is
+/// left untouched rather than have `JSON.parse` trip on the prose.
+fn with_stale_build_note(text: String) -> String {
+    match stale_build_note() {
+        Some(note) => place_note_in_envelope(text, note),
+        None => text,
+    }
+}
+
+/// Insert `note` on its own line just before the envelope's closing tag. A body
+/// with no `</travsr-data>` suffix (raw JSON from `get_graph_json`) is returned
+/// unchanged so its `JSON.parse` never trips on the prose. Split out from
+/// [`with_stale_build_note`] so the placement is testable without the
+/// process-global startup fingerprint.
+fn place_note_in_envelope(text: String, note: &str) -> String {
+    match text.strip_suffix("</travsr-data>") {
+        Some(head) => format!("{}\n{note}\n</travsr-data>", head.trim_end_matches('\n')),
+        None => text,
+    }
+}
+
 /// Capabilities advertised in the `initialize` response. The `prompts`
 /// capability is only declared when `mcp-sampling` is enabled, so that a
 /// spec-compliant client can discover and call the `prompts/*` endpoints that
@@ -490,7 +579,7 @@ fn handle_tool_call(
     );
     ok_response(
         id,
-        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+        serde_json::json!({ "content": [{ "type": "text", "text": with_stale_build_note(text) }] }),
     )
 }
 
@@ -1160,7 +1249,7 @@ fn handle_tool_call_global(
     );
     ok_response(
         id,
-        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+        serde_json::json!({ "content": [{ "type": "text", "text": with_stale_build_note(text) }] }),
     )
 }
 
@@ -1464,6 +1553,40 @@ fn handle_prompts_get(id: serde_json::Value, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1049: the rebuilt-binary comparator. A newer mtime or a changed length
+    /// is "rebuilt"; an unchanged file, or an older on-disk mtime (clock skew)
+    /// at the same length, is not.
+    #[test]
+    fn build_changed_flags_a_newer_or_resized_binary() {
+        let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(!build_changed((t0, 100), (t0, 100)), "unchanged");
+        assert!(build_changed((t0, 100), (t1, 100)), "later mtime");
+        assert!(build_changed((t0, 100), (t0, 120)), "same-second, resized");
+        assert!(
+            !build_changed((t1, 100), (t0, 100)),
+            "older on disk, same len"
+        );
+    }
+
+    /// The note lands inside the envelope, on its own line before the close, so
+    /// the envelope stays intact; a raw-JSON body (no envelope) is left alone.
+    #[test]
+    fn stale_note_placement_preserves_the_envelope_and_skips_json() {
+        let note = "[note: stale]";
+        let place = |t: &str| place_note_in_envelope(t.to_string(), note);
+        assert_eq!(
+            place("<travsr-data>\nrow\n</travsr-data>"),
+            "<travsr-data>\nrow\n[note: stale]\n</travsr-data>"
+        );
+        assert_eq!(
+            place("<travsr-data></travsr-data>"),
+            "<travsr-data>\n[note: stale]\n</travsr-data>"
+        );
+        // get_graph_json returns raw JSON, which has no envelope to land in.
+        assert_eq!(place("{\"nodes\":[]}"), "{\"nodes\":[]}");
+    }
 
     const ALL_TOOLS: &[&str] = &[
         "get_dependencies",
