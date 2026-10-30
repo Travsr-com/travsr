@@ -2077,6 +2077,37 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// #1050: whether `line` at `path` falls inside a node classified as test
+    /// code (`test_role != None`) in `corpus`. A textual `find_pattern` hit uses
+    /// this to tag a match `[test]` so a line inside `mod tests` or a `#[test]`
+    /// function is not cited as production code.
+    ///
+    /// True when ANY node whose span `[line, end_line]` contains `line` is a
+    /// test — a match inside a test function is covered by both the function
+    /// (`EntryPoint`) and the enclosing test module (`Support`), and either one
+    /// is enough. Scoped to one `corpus` because the store can hold several
+    /// (dependency graphs) that share repo-relative paths. Uses the
+    /// `idx_nodes_corpus_path` index.
+    pub fn line_in_test(&self, corpus: &str, path: &str, line: u32) -> Result<bool, StoreError> {
+        (|| -> AnyResult<bool> {
+            let hit: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 \
+                       AND line IS NOT NULL AND end_line IS NOT NULL \
+                       AND line <= ?3 AND end_line >= ?3 \
+                       AND test_role != 0 LIMIT 1",
+                    params![corpus, path, line as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("line_in_test: query")?;
+            Ok(hit.is_some())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// #478: word-segmented `(sig_words, path_words)` currently indexed for `id`
     /// (`nodes_fts_words_map`). `None` when absent. Test/diagnostic accessor.
     pub fn fts_words_entry(&self, id: NodeId) -> Result<Option<(String, String)>, StoreError> {
@@ -11108,6 +11139,46 @@ mod tests {
             None,
             "deriving a root from any database location invents a confident \
              wrong answer, which is worse than none"
+        );
+    }
+
+    #[test]
+    fn line_in_test_reports_a_span_containing_a_test_node() {
+        // #1050: find_pattern tags a hit `[test]` from this. A line is "in a
+        // test" when ANY node whose [line, end_line] span contains it is test
+        // code — the match need not land on the test's own declaration line.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let test_fn = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:it_works"),
+            "function",
+        )
+        .with_line(10)
+        .with_end_line(20)
+        .with_test_role(travsr_core::TestRole::EntryPoint);
+        let prod_fn = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:charge"),
+            "function",
+        )
+        .with_line(30)
+        .with_end_line(40);
+        store.put_node(&test_fn).unwrap();
+        store.put_node(&prod_fn).unwrap();
+
+        assert!(
+            store.line_in_test("c", "src/lib.rs", 15).unwrap(),
+            "a line inside the test fn's body is in a test"
+        );
+        assert!(
+            !store.line_in_test("c", "src/lib.rs", 35).unwrap(),
+            "a line inside the production fn is not in a test"
+        );
+        assert!(
+            !store.line_in_test("c", "src/lib.rs", 100).unwrap(),
+            "a line inside no node is not in a test"
+        );
+        assert!(
+            !store.line_in_test("other", "src/lib.rs", 15).unwrap(),
+            "the same path in another corpus must not match"
         );
     }
 

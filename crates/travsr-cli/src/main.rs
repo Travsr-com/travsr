@@ -283,6 +283,9 @@ enum Command {
         /// Treat pattern as a literal string instead of a regular expression.
         #[arg(long)]
         fixed: bool,
+        /// Show this many source lines after each match (git grep -A), capped at 10.
+        #[arg(long, short = 'A', default_value_t = 0)]
+        context: u32,
         /// Output format: text (default) or json.
         #[arg(long, value_enum, default_value = "text")]
         format: pattern::OutputFormat,
@@ -1517,8 +1520,9 @@ async fn run(cli: Cli) -> Result<()> {
             pattern,
             scope,
             fixed,
+            context,
             format,
-        } => pattern::run(&pattern, scope, fixed, format)?,
+        } => pattern::run(&pattern, scope, fixed, context, format)?,
         Command::Graph {
             query,
             path,
