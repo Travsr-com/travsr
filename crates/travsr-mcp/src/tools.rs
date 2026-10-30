@@ -2569,6 +2569,60 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
     store.resolve_repo_root()
 }
 
+/// #1048: the repo-relative, forward-slash paths git tracks, or `None` when the
+/// tracked set cannot be determined (no repo_root in meta, git absent, or a
+/// non-git / cloud/SSE context). `None` means "do not reorder" — callers fail
+/// open to the prior ordering rather than guessing.
+///
+/// Used so name lookups prefer committed code over untracked, non-ignored
+/// scratch files (`bench/`, `DOC/`) that init and the watcher index while they
+/// are being edited. Precedent: `query::pending_refs_in_edited_files` already
+/// shells out to git from this crate.
+fn tracked_rel_paths(store: &SqliteStore) -> Option<std::collections::HashSet<String>> {
+    let root = resolve_repo_root(store)?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let set: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // An empty set means git ran but tracks nothing (fresh repo) — read as
+    // "unknown" so a bare checkout does not relabel every indexed file untracked.
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+/// Stably reorder `nodes` so definitions in git-tracked files come before those
+/// in untracked files, preserving each group's existing order. No-op when the
+/// tracked set is unknown. Returns whether any untracked node was present, so a
+/// caller can note that untracked (not-yet-committed) results are included.
+fn prefer_tracked_nodes(
+    nodes: &mut [CoreNode],
+    tracked: &Option<std::collections::HashSet<String>>,
+) -> bool {
+    let Some(tracked) = tracked else {
+        return false;
+    };
+    let any_untracked = nodes.iter().any(|n| !tracked.contains(&n.vname.path));
+    if any_untracked {
+        // slice::sort_by_key is stable, so this only lifts tracked nodes above
+        // untracked ones without disturbing order within either group.
+        nodes.sort_by_key(|n| !tracked.contains(&n.vname.path));
+    }
+    any_untracked
+}
+
 /// Textual search: `git grep` over the repo's text files, minus the paths the
 /// walker hard-skips, the paths an ignore file excludes, and known-binary
 /// formats. Deliberately WIDER than the graph's own file set: a shell script, a
@@ -5903,7 +5957,7 @@ fn search_symbol_raw(
     // Language tokens like "c", "go", "dart" are short and common identifiers;
     // stripping them from the query then filtering by language produces false
     // "no matches" for queries like "C parser" or "go routine".
-    let nodes = if nodes.is_empty() && lang_filter.is_some() {
+    let mut nodes = if nodes.is_empty() && lang_filter.is_some() {
         match store.search_nodes_fuzzy_filtered(name, None, exact) {
             Ok(n) => n,
             Err(_) => nodes,
@@ -5912,9 +5966,18 @@ fn search_symbol_raw(
         nodes
     };
 
-    let lines: Vec<String> = nodes
+    // #1048: list committed code before untracked, non-ignored scratch files
+    // (`bench/`, `DOC/`) that init and the watcher index while they are edited,
+    // so a real definition is never buried under spike-script copies.
+    let tracked = tracked_rel_paths(store);
+    prefer_tracked_nodes(&mut nodes, &tracked);
+
+    let shown = &nodes[..nodes.len().min(MAX_SEARCH_RESULTS)];
+    let shown_untracked = tracked
+        .as_ref()
+        .is_some_and(|t| shown.iter().any(|n| !t.contains(&n.vname.path)));
+    let lines: Vec<String> = shown
         .iter()
-        .take(MAX_SEARCH_RESULTS)
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
             format!(
@@ -5925,7 +5988,14 @@ fn search_symbol_raw(
             )
         })
         .collect();
-    (nodes.len(), lines.join("\n"))
+    let mut body = lines.join("\n");
+    if shown_untracked {
+        body.push_str(
+            "\n[note: some results are in untracked (not-yet-committed) files, \
+             listed after tracked ones; they leave the graph at the next commit.]",
+        );
+    }
+    (nodes.len(), body)
 }
 
 /// Global variant of `search_symbol`.
@@ -15501,6 +15571,11 @@ fn get_snippets_body(
         }
     };
 
+    // #1048: committed code before untracked, non-ignored scratch files, so a
+    // bare name resolves to the real definition rather than a spike-script copy.
+    // Computed once and reused for every token's resolution below.
+    let tracked = tracked_rel_paths(store);
+
     // Parse every token into its resolution tier.  Tokens in the same request
     // may use different forms (nodeId, full header, path:line, bare sig).
     let tokens = parse_symbol_tokens(symbols_arg);
@@ -15557,7 +15632,10 @@ fn get_snippets_body(
             // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
             SymbolToken::BareSig(sig) => {
-                let nodes = resolve_symbol_nodes(store, sig, None);
+                let mut nodes = resolve_symbol_nodes(store, sig, None);
+                // Reorder before the cap so a tracked definition is never the
+                // one dropped when more than MAX_SIGNATURE_MATCHES names match.
+                prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
             }
         }
@@ -15573,6 +15651,9 @@ fn get_snippets_body(
     let mut parts: Vec<String> = Vec::new();
     let mut tokens_used: usize = 0;
     let mut n_with_snippet: usize = 0;
+    // #1048: set when an included definition lives in an untracked file, so the
+    // answer flags that a not-yet-committed copy is among the results.
+    let mut shown_untracked = false;
     // One hash per file, not per symbol: a request routinely names several
     // symbols from the same file (that is how #895 was found).
     let mut drift_cache: HashMap<String, bool> = HashMap::new();
@@ -15659,6 +15740,11 @@ fn get_snippets_body(
         } else {
             header
         };
+        if let Some(t) = &tracked {
+            if !t.contains(&node.vname.path) {
+                shown_untracked = true;
+            }
+        }
         parts.push(block);
     }
 
@@ -15671,8 +15757,14 @@ fn get_snippets_body(
         &body,
         (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
     );
+    let untracked_note = if shown_untracked {
+        "\n[note: a definition shown is in an untracked (not-yet-committed) file; \
+         it leaves the graph at the next commit.]"
+    } else {
+        ""
+    };
     format!(
-        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]",
+        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]{untracked_note}",
         parts.len()
     )
 }

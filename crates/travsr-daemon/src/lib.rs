@@ -5891,6 +5891,84 @@ pub fn reconcile_tracked_tree(
     Ok((dirty, paths.len()))
 }
 
+/// #1048: at a commit, remove every file git no longer tracks, even one still
+/// present on disk.
+///
+/// init and the watcher index untracked, non-ignored files so they are
+/// queryable while being edited, but a commit is where the graph reconciles to
+/// git's tracked set: a file the commit did not add (still untracked) leaves
+/// here. Without this, scratch files (`bench/`, `DOC/`) accumulate forever,
+/// shadow real symbols in name lookups, and sit in the live lane as "edits not
+/// yet committed" that no commit can ever clear.
+///
+/// Distinct from [`SqliteStore::reconcile`]'s ghost prune, which deliberately
+/// spares files present on disk (it targets files *deleted* from disk); this
+/// one deletes present-but-untracked files. Hard-guarded: an empty or failed
+/// `git ls-files` is read as "unknown", never "nothing is tracked", so a git
+/// hiccup can never wipe the graph. The mass-delete ceiling is a second
+/// backstop against a tree where most of the graph reads as untracked.
+///
+/// Returns the Tier-0 callers the deletes left dirty, to be re-resolved.
+fn prune_untracked_files(repo_root: &Path, store: &mut SqliteStore) -> travsr_core::DirtySet {
+    let mut dirty = travsr_core::DirtySet::default();
+    let tracked_abs = match tracked_files_from_git(repo_root) {
+        Ok(v) if !v.is_empty() => v,
+        // Not a git repo, git failed, or an empty tree: prune nothing. Indexing
+        // everything is the pre-#1048 behavior and the safe default here.
+        _ => return dirty,
+    };
+    // Match the stored VName key format exactly — relative to repo_root, forward
+    // slashes — the way `reconcile_tracked_tree` does, or a present file reads as
+    // untracked. Windows load-bearing.
+    let tracked: std::collections::HashSet<String> = tracked_abs
+        .iter()
+        .map(|p| {
+            p.strip_prefix(repo_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    let db_paths: std::collections::HashSet<String> = match store.get_all_file_hashes() {
+        Ok(h) => h.into_keys().collect(),
+        Err(e) => {
+            tracing::warn!(err = %e, "prune_untracked: reading file hashes failed, pruning nothing");
+            return dirty;
+        }
+    };
+    let untracked: Vec<String> = db_paths.difference(&tracked).cloned().collect();
+    if untracked.is_empty() {
+        return dirty;
+    }
+    // Same mass-delete circuit breaker as `SqliteStore::reconcile`.
+    let policy = travsr_core::SafetyPolicy::default();
+    let ceiling = std::cmp::max(
+        policy.mass_delete_ceiling_min,
+        (db_paths.len() as f64 * policy.mass_delete_ceiling_pct) as usize,
+    );
+    if untracked.len() > ceiling {
+        tracing::error!(
+            untracked = untracked.len(),
+            ceiling,
+            "prune_untracked: more untracked files than the ceiling, deleting nothing"
+        );
+        return dirty;
+    }
+    let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
+    for path in &untracked {
+        match store.delete_file(&corpus, path) {
+            Ok(callers) => dirty.extend(callers),
+            Err(e) => tracing::warn!(path = %path, err = %e, "prune_untracked: delete_file failed"),
+        }
+    }
+    tracing::info!(
+        event = "commit.prune.untracked",
+        pruned = untracked.len(),
+        "removed files git no longer tracks"
+    );
+    dirty
+}
+
 /// RFC-027 #813 P2: per-file changed-definition committed occurrences, keyed by
 /// repo-relative path, as [`reindex_files_reporting`] returns them for the save
 /// path to stash.
@@ -13843,6 +13921,86 @@ mod tests {
         );
     }
 
+    /// #1048: an untracked file that is still present on disk must leave the
+    /// graph at a commit. This is the case `reconcile`'s ghost prune
+    /// deliberately spares (its TOCTOU guard skips present files), so
+    /// `prune_untracked_files` has to delete it on the strength of git not
+    /// tracking it, without touching the file on disk.
+    #[test]
+    fn prune_untracked_files_removes_present_but_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        git_init(tmp.path());
+        std::fs::write(tmp.path().join("kept.ts"), "export class Kept { go() {} }").unwrap();
+        git_commit_all(tmp.path(), "tracked file");
+
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        // An untracked scratch file the watcher would have indexed: present on
+        // disk, never `git add`ed.
+        let scratch = tmp.path().join("scratch.ts");
+        std::fs::write(&scratch, "export class Scratch { go() {} }").unwrap();
+        reindex_files(
+            &[tmp.path().join("kept.ts"), scratch.clone()],
+            tmp.path(),
+            &mut store,
+        )
+        .unwrap();
+
+        let hashes = store.get_all_file_hashes().unwrap();
+        assert!(hashes.contains_key("kept.ts"), "tracked file indexed");
+        assert!(
+            hashes.contains_key("scratch.ts"),
+            "untracked file is indexed until a commit prunes it"
+        );
+
+        prune_untracked_files(tmp.path(), &mut store);
+
+        let hashes = store.get_all_file_hashes().unwrap();
+        assert!(
+            hashes.contains_key("kept.ts"),
+            "the tracked file must stay indexed"
+        );
+        assert!(
+            !hashes.contains_key("scratch.ts"),
+            "a present-but-untracked file must be pruned: {:?}",
+            hashes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            scratch.exists(),
+            "the prune removes graph nodes only, never the file on disk"
+        );
+    }
+
+    /// #1048 safety: an empty or unavailable `git ls-files` must be read as
+    /// "unknown", never "nothing is tracked" — otherwise a git hiccup would
+    /// delete the whole graph. In a non-git directory the prune is a no-op.
+    #[test]
+    fn prune_untracked_files_is_a_noop_without_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let mut store =
+            travsr_store::SqliteStore::open(&tmp.path().join(".travsr/graph.db")).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+
+        std::fs::write(tmp.path().join("a.ts"), "export class A { go() {} }").unwrap();
+        reindex_files(&[tmp.path().join("a.ts")], tmp.path(), &mut store).unwrap();
+        assert!(store.get_all_file_hashes().unwrap().contains_key("a.ts"));
+
+        prune_untracked_files(tmp.path(), &mut store);
+
+        assert!(
+            store.get_all_file_hashes().unwrap().contains_key("a.ts"),
+            "without a git tracked set the prune must delete nothing"
+        );
+    }
+
     /// #645 WS-A: a file the drift DELETED (present in the graph, gone from the
     /// tracked-at-HEAD set) must have its nodes pruned by the reconcile, not
     /// left as a ghost from the discarded commit. This is the issue's exact
@@ -16454,13 +16612,20 @@ fn handle_control_message(
             let ignore = watcher::build_ignore_matcher(repo_root);
             paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-            let dirty = match reindex_files(&paths, repo_root, &mut s) {
+            let mut dirty = match reindex_files(&paths, repo_root, &mut s) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(err=%e, "control reindex failed");
                     return (ControlResponse::err(e.to_string()), false);
                 }
             };
+            // #1048: reconcile the graph to git's tracked set — drop files this
+            // commit did not add (still untracked). Kept on the commit path, not
+            // the save path, so an untracked file stays queryable while being
+            // edited and only leaves the graph at the next commit. Runs
+            // independent of the commit's delta, so a commit that touched only
+            // tracked files still clears accumulated scratch files.
+            dirty.extend(prune_untracked_files(repo_root, &mut s));
             // Stamp last_commit unconditionally, independent of whether any
             // file actually changed — mirrors the init_repo fix (PR #207) for
             // the same any_changed-suppression regression: a commit whose
