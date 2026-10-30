@@ -3561,7 +3561,13 @@ fn run_git_grep(
             pending_sep = true;
             continue;
         }
-        let is_context = !group_path.is_empty()
+        // Only when `-A` was passed does git emit context lines (and the `--`
+        // separators that reset `group_path` between files). At context=0 there
+        // are none, so every non-separator line is a match line; skipping the
+        // prefix test keeps a sibling path like `LICENSE-APACHE` (which git
+        // sorts right after `LICENSE`) from being mistaken for after-context.
+        let is_context = context > 0
+            && !group_path.is_empty()
             && line.starts_with(group_path.as_str())
             && line.as_bytes().get(group_path.len()) == Some(&b'-');
         if is_context {
@@ -21182,6 +21188,47 @@ mod snippet_tests {
         assert!(
             !out.contains("ignored/dep.rs"),
             "a gitignored file with no `!` rule is not in the graph and must not appear: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_counts_a_hyphen_prefixed_sibling_path_at_context_zero() {
+        // #1050 regression: at context=0 git emits no `--` separators, so the
+        // group walk never resets between files. A file whose path is a strict
+        // prefix of the next, split by '-' (the classic LICENSE / LICENSE-APACHE
+        // pair, which git sorts in that order), must not be mistaken for an
+        // after-context line of the first and dropped from the match count.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("LICENSE"), "Apache License\n").unwrap();
+        std::fs::write(root.join("LICENSE-APACHE"), "Apache License\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "License", None, false, 0);
+        if !out.contains("LICENSE") {
+            return; // git unavailable in this sandbox
+        }
+        assert!(
+            out.contains("LICENSE-APACHE:1:"),
+            "the sibling file's match line must render as a match, not context: {out}"
+        );
+        assert!(
+            out.contains("2 match(es)"),
+            "both files must be counted; the sibling is not an after-context line: {out}"
         );
     }
 
