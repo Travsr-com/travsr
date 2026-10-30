@@ -2578,7 +2578,12 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
 /// scratch files (`bench/`, `DOC/`) that init and the watcher index while they
 /// are being edited. Precedent: `query::pending_refs_in_edited_files` already
 /// shells out to git from this crate.
-fn tracked_rel_paths(store: &SqliteStore) -> Option<std::collections::HashSet<String>> {
+/// The git-tracked path set paired with the repo root it was taken from. The
+/// root is kept so [`is_untracked_scratch`] can confirm an untracked path is a
+/// real file on disk.
+type TrackedSet = (std::collections::HashSet<String>, PathBuf);
+
+fn tracked_rel_paths(store: &SqliteStore) -> Option<TrackedSet> {
     let root = resolve_repo_root(store)?;
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -2599,27 +2604,39 @@ fn tracked_rel_paths(store: &SqliteStore) -> Option<std::collections::HashSet<St
     if set.is_empty() {
         None
     } else {
-        Some(set)
+        Some((set, root))
     }
 }
 
+/// A node path counts as untracked *scratch* only when git does not track it AND
+/// it is a real file on disk. The on-disk check excludes paths git never lists
+/// yet that are not editable files: synthetic VName paths (`<cgo_synthetic>/…`,
+/// RFC-005) and directory-keyed package nodes (e.g. Go `go-pkg`). Without it
+/// those would be mislabelled not-yet-committed and sorted below real results.
+fn is_untracked_scratch(path: &str, tracked: &TrackedSet) -> bool {
+    let (set, root) = tracked;
+    !set.contains(path) && root.join(path).is_file()
+}
+
 /// Stably reorder `nodes` so definitions in git-tracked files come before those
-/// in untracked files, preserving each group's existing order. No-op when the
-/// tracked set is unknown. Returns whether any untracked node was present, so a
-/// caller can note that untracked (not-yet-committed) results are included.
-fn prefer_tracked_nodes(
-    nodes: &mut [CoreNode],
-    tracked: &Option<std::collections::HashSet<String>>,
-) -> bool {
+/// in untracked scratch files (see [`is_untracked_scratch`]), preserving each
+/// group's existing order. No-op when the tracked set is unknown. Returns
+/// whether any untracked node was present, so a caller can note that untracked
+/// (not-yet-committed) results are included.
+fn prefer_tracked_nodes(nodes: &mut [CoreNode], tracked: &Option<TrackedSet>) -> bool {
     let Some(tracked) = tracked else {
         return false;
     };
-    let any_untracked = nodes.iter().any(|n| !tracked.contains(&n.vname.path));
-    if any_untracked {
-        // slice::sort_by_key is stable, so this only lifts tracked nodes above
-        // untracked ones without disturbing order within either group.
-        nodes.sort_by_key(|n| !tracked.contains(&n.vname.path));
-    }
+    // sort_by_cached_key is stable and computes the key exactly once per node,
+    // so the on-disk check in is_untracked_scratch runs once each (not O(n log n))
+    // while tracked (false) nodes are lifted above untracked (true) ones without
+    // disturbing order within either group.
+    let mut any_untracked = false;
+    nodes.sort_by_cached_key(|n| {
+        let untracked = is_untracked_scratch(&n.vname.path, tracked);
+        any_untracked |= untracked;
+        untracked
+    });
     any_untracked
 }
 
@@ -5975,7 +5992,7 @@ fn search_symbol_raw(
     let shown = &nodes[..nodes.len().min(MAX_SEARCH_RESULTS)];
     let shown_untracked = tracked
         .as_ref()
-        .is_some_and(|t| shown.iter().any(|n| !t.contains(&n.vname.path)));
+        .is_some_and(|t| shown.iter().any(|n| is_untracked_scratch(&n.vname.path, t)));
     let lines: Vec<String> = shown
         .iter()
         .map(|n| {
@@ -15741,7 +15758,7 @@ fn get_snippets_body(
             header
         };
         if let Some(t) = &tracked {
-            if !t.contains(&node.vname.path) {
+            if is_untracked_scratch(&node.vname.path, t) {
                 shown_untracked = true;
             }
         }
@@ -15900,17 +15917,25 @@ mod snippet_tests {
     /// node the cap drops.
     #[test]
     fn prefer_tracked_nodes_lifts_tracked_before_the_signature_cap() {
+        // The untracked classification requires the scratch copies to be real
+        // files on disk, so stage them under a tempdir repo root.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("DOC/spike")).unwrap();
+        for f in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(tmp.path().join("DOC/spike").join(f), "x").unwrap();
+        }
         let mut nodes = vec![
             make_fn_node("DOC/spike/a.ts", "fn:rerank", 1, 2),
             make_fn_node("DOC/spike/b.ts", "fn:rerank", 1, 2),
             make_fn_node("DOC/spike/c.ts", "fn:rerank", 1, 2),
             make_fn_node("crates/travsr-mcp/src/rerank.rs", "fn:rerank", 1, 2),
         ];
-        let tracked: Option<std::collections::HashSet<String>> = Some(
+        let tracked: Option<TrackedSet> = Some((
             ["crates/travsr-mcp/src/rerank.rs".to_string()]
                 .into_iter()
                 .collect(),
-        );
+            tmp.path().to_path_buf(),
+        ));
 
         let any_untracked = prefer_tracked_nodes(&mut nodes, &tracked);
 
@@ -15937,11 +15962,38 @@ mod snippet_tests {
         );
     }
 
+    /// #1048 follow-up: paths git never lists but that are not editable files —
+    /// synthetic VName paths (`<cgo_synthetic>/…`) and directory-keyed package
+    /// nodes — must NOT be classified untracked, so they are neither sorted down
+    /// nor flagged not-yet-committed.
+    #[test]
+    fn prefer_tracked_nodes_ignores_synthetic_and_non_file_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut nodes = vec![
+            make_fn_node("<cgo_synthetic>/main.go", "fn:helper", 1, 2),
+            make_fn_node("crates/foo/src/lib.rs", "fn:helper", 1, 2),
+        ];
+        let tracked: Option<TrackedSet> = Some((
+            ["crates/foo/src/lib.rs".to_string()].into_iter().collect(),
+            tmp.path().to_path_buf(),
+        ));
+
+        // The synthetic path is not tracked and not a file on disk, so it is not
+        // untracked scratch: no reorder, no note, order preserved.
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &tracked),
+            "a synthetic / non-file path is not untracked scratch"
+        );
+        assert_eq!(nodes[0].vname.path, "<cgo_synthetic>/main.go");
+        assert_eq!(nodes[1].vname.path, "crates/foo/src/lib.rs");
+    }
+
     /// #1048: with no tracked set (no-git / cloud/SSE) or when nothing is
     /// untracked, the reorder is a no-op that preserves order and reports no
     /// untracked result — the fail-open path.
     #[test]
     fn prefer_tracked_nodes_is_a_noop_when_tracked_unknown_or_all_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut nodes = vec![
             make_fn_node("a.ts", "fn:x", 1, 2),
             make_fn_node("b.ts", "fn:x", 1, 2),
@@ -15954,12 +16006,16 @@ mod snippet_tests {
         assert_eq!(nodes[0].vname.path, "a.ts");
         assert_eq!(nodes[1].vname.path, "b.ts");
 
-        let all_tracked: std::collections::HashSet<String> =
+        // All paths tracked: the tracked-set membership short-circuits before any
+        // disk check, so no untracked node and no reorder.
+        let all_tracked: Option<TrackedSet> = Some((
             ["a.ts".to_string(), "b.ts".to_string()]
                 .into_iter()
-                .collect();
+                .collect(),
+            tmp.path().to_path_buf(),
+        ));
         assert!(
-            !prefer_tracked_nodes(&mut nodes, &Some(all_tracked)),
+            !prefer_tracked_nodes(&mut nodes, &all_tracked),
             "no untracked node means no reorder and no note"
         );
         assert_eq!(nodes[0].vname.path, "a.ts");
