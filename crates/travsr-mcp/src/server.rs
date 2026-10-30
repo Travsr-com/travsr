@@ -103,8 +103,8 @@ fn stale_build_note() -> Option<&'static str> {
     let md = std::fs::metadata(&start.path).ok()?;
     let now = (md.modified().ok()?, md.len());
     build_changed((start.mtime, start.len), now).then_some(
-        "[note: this MCP server is running an older build than the travsr binary on disk; \
-         reconnect the MCP server to pick up the new build]",
+        "[note: this MCP server is running a different build than the travsr binary on disk; \
+         reconnect the MCP server to pick up the build on disk]",
     )
 }
 
