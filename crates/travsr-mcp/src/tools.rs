@@ -2569,6 +2569,77 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
     store.resolve_repo_root()
 }
 
+/// #1048: the repo-relative, forward-slash paths git tracks, or `None` when the
+/// tracked set cannot be determined (no repo_root in meta, git absent, or a
+/// non-git / cloud/SSE context). `None` means "do not reorder" — callers fail
+/// open to the prior ordering rather than guessing.
+///
+/// Used so name lookups prefer committed code over untracked, non-ignored
+/// scratch files (`bench/`, `DOC/`) that init and the watcher index while they
+/// are being edited. Precedent: `query::pending_refs_in_edited_files` already
+/// shells out to git from this crate.
+/// The git-tracked path set paired with the repo root it was taken from. The
+/// root is kept so [`is_untracked_scratch`] can confirm an untracked path is a
+/// real file on disk.
+type TrackedSet = (std::collections::HashSet<String>, PathBuf);
+
+fn tracked_rel_paths(store: &SqliteStore) -> Option<TrackedSet> {
+    let root = resolve_repo_root(store)?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let set: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // An empty set means git ran but tracks nothing (fresh repo) — read as
+    // "unknown" so a bare checkout does not relabel every indexed file untracked.
+    if set.is_empty() {
+        None
+    } else {
+        Some((set, root))
+    }
+}
+
+/// A node path counts as untracked *scratch* only when git does not track it AND
+/// it is a real file on disk. The on-disk check excludes paths git never lists
+/// yet that are not editable files: synthetic VName paths (`<cgo_synthetic>/…`,
+/// RFC-005) and directory-keyed package nodes (e.g. Go `go-pkg`). Without it
+/// those would be mislabelled not-yet-committed and sorted below real results.
+fn is_untracked_scratch(path: &str, tracked: &TrackedSet) -> bool {
+    let (set, root) = tracked;
+    !set.contains(path) && root.join(path).is_file()
+}
+
+/// Stably reorder `nodes` so definitions in git-tracked files come before those
+/// in untracked scratch files (see [`is_untracked_scratch`]), preserving each
+/// group's existing order. No-op when the tracked set is unknown. Returns
+/// whether any untracked node was present, so a caller can note that untracked
+/// (not-yet-committed) results are included.
+fn prefer_tracked_nodes(nodes: &mut [CoreNode], tracked: &Option<TrackedSet>) -> bool {
+    let Some(tracked) = tracked else {
+        return false;
+    };
+    // sort_by_cached_key is stable and computes the key exactly once per node,
+    // so the on-disk check in is_untracked_scratch runs once each (not O(n log n))
+    // while tracked (false) nodes are lifted above untracked (true) ones without
+    // disturbing order within either group.
+    let mut any_untracked = false;
+    nodes.sort_by_cached_key(|n| {
+        let untracked = is_untracked_scratch(&n.vname.path, tracked);
+        any_untracked |= untracked;
+        untracked
+    });
+    any_untracked
+}
+
 /// Textual search: `git grep` over the repo's text files, minus the paths the
 /// walker hard-skips, the paths an ignore file excludes, and known-binary
 /// formats. Deliberately WIDER than the graph's own file set: a shell script, a
@@ -5903,7 +5974,7 @@ fn search_symbol_raw(
     // Language tokens like "c", "go", "dart" are short and common identifiers;
     // stripping them from the query then filtering by language produces false
     // "no matches" for queries like "C parser" or "go routine".
-    let nodes = if nodes.is_empty() && lang_filter.is_some() {
+    let mut nodes = if nodes.is_empty() && lang_filter.is_some() {
         match store.search_nodes_fuzzy_filtered(name, None, exact) {
             Ok(n) => n,
             Err(_) => nodes,
@@ -5912,9 +5983,18 @@ fn search_symbol_raw(
         nodes
     };
 
-    let lines: Vec<String> = nodes
+    // #1048: list committed code before untracked, non-ignored scratch files
+    // (`bench/`, `DOC/`) that init and the watcher index while they are edited,
+    // so a real definition is never buried under spike-script copies.
+    let tracked = tracked_rel_paths(store);
+    prefer_tracked_nodes(&mut nodes, &tracked);
+
+    let shown = &nodes[..nodes.len().min(MAX_SEARCH_RESULTS)];
+    let shown_untracked = tracked
+        .as_ref()
+        .is_some_and(|t| shown.iter().any(|n| is_untracked_scratch(&n.vname.path, t)));
+    let lines: Vec<String> = shown
         .iter()
-        .take(MAX_SEARCH_RESULTS)
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
             format!(
@@ -5925,7 +6005,14 @@ fn search_symbol_raw(
             )
         })
         .collect();
-    (nodes.len(), lines.join("\n"))
+    let mut body = lines.join("\n");
+    if shown_untracked {
+        body.push_str(
+            "\n[note: some results are in untracked (not-yet-committed) files, \
+             listed after tracked ones; they leave the graph at the next commit.]",
+        );
+    }
+    (nodes.len(), body)
 }
 
 /// Global variant of `search_symbol`.
@@ -15501,6 +15588,11 @@ fn get_snippets_body(
         }
     };
 
+    // #1048: committed code before untracked, non-ignored scratch files, so a
+    // bare name resolves to the real definition rather than a spike-script copy.
+    // Computed once and reused for every token's resolution below.
+    let tracked = tracked_rel_paths(store);
+
     // Parse every token into its resolution tier.  Tokens in the same request
     // may use different forms (nodeId, full header, path:line, bare sig).
     let tokens = parse_symbol_tokens(symbols_arg);
@@ -15557,7 +15649,10 @@ fn get_snippets_body(
             // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
             SymbolToken::BareSig(sig) => {
-                let nodes = resolve_symbol_nodes(store, sig, None);
+                let mut nodes = resolve_symbol_nodes(store, sig, None);
+                // Reorder before the cap so a tracked definition is never the
+                // one dropped when more than MAX_SIGNATURE_MATCHES names match.
+                prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
             }
         }
@@ -15573,6 +15668,9 @@ fn get_snippets_body(
     let mut parts: Vec<String> = Vec::new();
     let mut tokens_used: usize = 0;
     let mut n_with_snippet: usize = 0;
+    // #1048: set when an included definition lives in an untracked file, so the
+    // answer flags that a not-yet-committed copy is among the results.
+    let mut shown_untracked = false;
     // One hash per file, not per symbol: a request routinely names several
     // symbols from the same file (that is how #895 was found).
     let mut drift_cache: HashMap<String, bool> = HashMap::new();
@@ -15659,6 +15757,11 @@ fn get_snippets_body(
         } else {
             header
         };
+        if let Some(t) = &tracked {
+            if is_untracked_scratch(&node.vname.path, t) {
+                shown_untracked = true;
+            }
+        }
         parts.push(block);
     }
 
@@ -15671,8 +15774,14 @@ fn get_snippets_body(
         &body,
         (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
     );
+    let untracked_note = if shown_untracked {
+        "\n[note: a definition shown is in an untracked (not-yet-committed) file; \
+         it leaves the graph at the next commit.]"
+    } else {
+        ""
+    };
     format!(
-        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]",
+        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]{untracked_note}",
         parts.len()
     )
 }
@@ -15800,6 +15909,117 @@ mod snippet_tests {
         )
         .with_line(line)
         .with_end_line(end_line)
+    }
+
+    /// #1048: the reorder must lift a tracked definition above untracked
+    /// scratch copies *before* `get_snippets_body` applies the
+    /// `MAX_SIGNATURE_MATCHES` cap — otherwise the tracked def is exactly the
+    /// node the cap drops.
+    #[test]
+    fn prefer_tracked_nodes_lifts_tracked_before_the_signature_cap() {
+        // The untracked classification requires the scratch copies to be real
+        // files on disk, so stage them under a tempdir repo root.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("DOC/spike")).unwrap();
+        for f in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(tmp.path().join("DOC/spike").join(f), "x").unwrap();
+        }
+        let mut nodes = vec![
+            make_fn_node("DOC/spike/a.ts", "fn:rerank", 1, 2),
+            make_fn_node("DOC/spike/b.ts", "fn:rerank", 1, 2),
+            make_fn_node("DOC/spike/c.ts", "fn:rerank", 1, 2),
+            make_fn_node("crates/travsr-mcp/src/rerank.rs", "fn:rerank", 1, 2),
+        ];
+        let tracked: Option<TrackedSet> = Some((
+            ["crates/travsr-mcp/src/rerank.rs".to_string()]
+                .into_iter()
+                .collect(),
+            tmp.path().to_path_buf(),
+        ));
+
+        let any_untracked = prefer_tracked_nodes(&mut nodes, &tracked);
+
+        assert!(any_untracked, "the untracked scratch copies were present");
+        assert_eq!(
+            nodes[0].vname.path, "crates/travsr-mcp/src/rerank.rs",
+            "the tracked def must be lifted to the front"
+        );
+        // Within the untracked group the original order is preserved (stable).
+        let untracked_order: Vec<&str> = nodes[1..].iter().map(|n| n.vname.path.as_str()).collect();
+        assert_eq!(
+            untracked_order,
+            ["DOC/spike/a.ts", "DOC/spike/b.ts", "DOC/spike/c.ts"]
+        );
+        // The cap get_snippets_body applies next must now keep the tracked def.
+        let kept: Vec<&str> = nodes
+            .iter()
+            .take(MAX_SIGNATURE_MATCHES)
+            .map(|n| n.vname.path.as_str())
+            .collect();
+        assert!(
+            kept.contains(&"crates/travsr-mcp/src/rerank.rs"),
+            "reorder-before-cap must not drop the tracked def: {kept:?}"
+        );
+    }
+
+    /// #1048 follow-up: paths git never lists but that are not editable files —
+    /// synthetic VName paths (`<cgo_synthetic>/…`) and directory-keyed package
+    /// nodes — must NOT be classified untracked, so they are neither sorted down
+    /// nor flagged not-yet-committed.
+    #[test]
+    fn prefer_tracked_nodes_ignores_synthetic_and_non_file_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut nodes = vec![
+            make_fn_node("<cgo_synthetic>/main.go", "fn:helper", 1, 2),
+            make_fn_node("crates/foo/src/lib.rs", "fn:helper", 1, 2),
+        ];
+        let tracked: Option<TrackedSet> = Some((
+            ["crates/foo/src/lib.rs".to_string()].into_iter().collect(),
+            tmp.path().to_path_buf(),
+        ));
+
+        // The synthetic path is not tracked and not a file on disk, so it is not
+        // untracked scratch: no reorder, no note, order preserved.
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &tracked),
+            "a synthetic / non-file path is not untracked scratch"
+        );
+        assert_eq!(nodes[0].vname.path, "<cgo_synthetic>/main.go");
+        assert_eq!(nodes[1].vname.path, "crates/foo/src/lib.rs");
+    }
+
+    /// #1048: with no tracked set (no-git / cloud/SSE) or when nothing is
+    /// untracked, the reorder is a no-op that preserves order and reports no
+    /// untracked result — the fail-open path.
+    #[test]
+    fn prefer_tracked_nodes_is_a_noop_when_tracked_unknown_or_all_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut nodes = vec![
+            make_fn_node("a.ts", "fn:x", 1, 2),
+            make_fn_node("b.ts", "fn:x", 1, 2),
+        ];
+
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &None),
+            "unknown set reorders nothing"
+        );
+        assert_eq!(nodes[0].vname.path, "a.ts");
+        assert_eq!(nodes[1].vname.path, "b.ts");
+
+        // All paths tracked: the tracked-set membership short-circuits before any
+        // disk check, so no untracked node and no reorder.
+        let all_tracked: Option<TrackedSet> = Some((
+            ["a.ts".to_string(), "b.ts".to_string()]
+                .into_iter()
+                .collect(),
+            tmp.path().to_path_buf(),
+        ));
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &all_tracked),
+            "no untracked node means no reorder and no note"
+        );
+        assert_eq!(nodes[0].vname.path, "a.ts");
+        assert_eq!(nodes[1].vname.path, "b.ts");
     }
 
     // Unit tests for is_comment_line / skip_leading_comments / snippet_line_cap /
