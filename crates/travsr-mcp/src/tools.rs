@@ -1647,8 +1647,15 @@ pub(crate) fn resolve_alias(
     // definition, and git searches a fixed string about five times faster
     // (90 ms against 420 ms on a 3,000-file repo). `alias_originals` checks
     // each hit exactly.
-    let GrepOutcome::Matches(body) = run_git_grep(&repo_root, &format!("as {symbol}"), &[], true)
-    else {
+    let GrepOutcome::Matches(body) = run_git_grep(
+        store,
+        &repo_root,
+        &format!("as {symbol}"),
+        &[],
+        true,
+        0,
+        false,
+    ) else {
         return Vec::new();
     };
     // Each original with the import line that names its module.
@@ -2662,11 +2669,12 @@ pub fn find_pattern(
     pattern: &str,
     scope: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // Wrap with the larger find-output limit (not the 4 KiB scalar cap) so a
     // capped 500-match list and its truncation notice survive intact.
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_pattern_body(store, pattern, scope, fixed),
+        &find_pattern_body(store, pattern, scope, fixed, context),
         FIND_OUTPUT_LIMIT,
     ))
 }
@@ -2687,11 +2695,12 @@ pub fn find_pattern_raw(
     pattern: &str,
     scope: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // #517 DD-4: zero matches stay the empty string here. `find_pattern_global`
     // (`collect_global`) skips a repo on `result.is_empty()` and the CLI prints
     // its own no-match line on it.
-    let body = find_pattern_body(store, pattern, scope, fixed);
+    let body = find_pattern_body(store, pattern, scope, fixed, context);
     if body == NO_MATCHES {
         String::new()
     } else {
@@ -2707,6 +2716,7 @@ fn find_pattern_body(
     pattern: &str,
     scope: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // #517 DD-7: the pattern argument gets its own validator — it is never
     // path-resolved, so the `../` / `%` guards in `validate_mcp_arg` only cost
@@ -2766,7 +2776,7 @@ fn find_pattern_body(
         }
     };
 
-    match run_git_grep(&repo_root, pattern, &pathspecs, fixed) {
+    match run_git_grep(store, &repo_root, pattern, &pathspecs, fixed, context, true) {
         GrepOutcome::Matches(body) => body,
         // #517 DD-4: `find_pattern_raw` turns this back into the empty string
         // its callers key on.
@@ -3253,12 +3263,22 @@ fn argv_chunks(files: &[String]) -> Vec<&[String]> {
 /// thing it exists to rule out. Both passes share a single [`GREP_TIMEOUT`]
 /// budget so the ceiling is per-call, not per-subprocess.
 fn run_git_grep(
+    store: &SqliteStore,
     repo_root: &std::path::Path,
     pattern: &str,
     pathspecs: &[String],
     fixed: bool,
+    context: u32,
+    tag_tests: bool,
 ) -> GrepOutcome {
     use std::process::Command;
+
+    // #1050: after-context, capped. `-A` only (not `-B`): a before-context line
+    // is printed as `path-line-text` and a repo path contains `-`, so it cannot
+    // be told apart from a match line's path; after-context keeps the match line
+    // first in each group, which the renderer below relies on.
+    const MAX_CONTEXT: u32 = 10;
+    let context = context.min(MAX_CONTEXT);
 
     let started = std::time::Instant::now();
     let remaining = || GREP_TIMEOUT.saturating_sub(started.elapsed());
@@ -3269,8 +3289,11 @@ fn run_git_grep(
         cmd.arg("--no-color")
             .arg("-n") // line numbers
             .arg("--column") // column numbers
-            .arg("-I") // skip binary files
-            .arg(format!("--threads={}", git_grep_thread_count()))
+            .arg("-I"); // skip binary files
+        if context > 0 {
+            cmd.arg("-A").arg(context.to_string());
+        }
+        cmd.arg(format!("--threads={}", git_grep_thread_count()))
             .arg(if fixed { "-F" } else { "-E" })
             .arg("-e")
             .arg(pattern)
@@ -3449,46 +3472,64 @@ fn run_git_grep(
             })
     };
 
-    // Each grep line is `path:line:col:text`, so the path is the prefix before
-    // the first ':'.
+    // A match line is `path:line:col:text`, so its path is the prefix before the
+    // first ':'. With `-A`, an after-context line is `path-line-text` and git
+    // splits regions with a bare `--` line. The walk below keeps each match with
+    // its context block: it counts and caps on match lines only (never mid-group
+    // in a way that would misreport the total), drops a whole group whose file
+    // the graph would never corroborate, and tags a match `[test]` when it lands
+    // inside test code (#1050).
     let travsrignore = build_travsrignore_matcher(repo_root);
-    let all: Vec<&str> = all
-        .iter()
-        .map(String::as_str)
-        .filter(|line| {
-            let Some(path) = line.split(':').next().filter(|p| !p.is_empty()) else {
-                return true;
-            };
-            let in_skip_dir = std::path::Path::new(path)
-                .components()
-                .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip));
-            if in_skip_dir {
-                return false;
-            }
-            if is_binary_ext(path) {
-                return false;
-            }
-            match &travsrignore {
-                Some(ig) => !ig
-                    .matched_path_or_any_parents(repo_root.join(path), false)
-                    .is_ignore(),
-                None => true,
-            }
-        })
-        .collect();
-    if all.is_empty() {
-        // The .travsrignore filter emptied a non-empty git-grep match set — the
-        // honest outcome is still "no matches", not an error (§4 W2 edge case).
-        return GrepOutcome::NoMatches;
-    }
+
+    // Three filters, all closing the same gap: git can see files the walker
+    // refuses to index, so a match from one would be a file `find_references`
+    // can never corroborate. (1) `SKIP_DIRS` is hard-excluded ahead of any
+    // ignore file; (2) `BINARY_EXTS` names formats git misclassifies as text;
+    // (3) `.travsrignore` excludes graph files git still tracks.
+    let file_is_excluded = |path: &str| -> bool {
+        if std::path::Path::new(path)
+            .components()
+            .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip))
+        {
+            return true;
+        }
+        if is_binary_ext(path) {
+            return true;
+        }
+        match &travsrignore {
+            Some(ig) => ig
+                .matched_path_or_any_parents(repo_root.join(path), false)
+                .is_ignore(),
+            None => false,
+        }
+    };
+
+    // #1050: tag a match `[test]` when its line is inside test code. Resolved
+    // once; fail-open — a missing corpus or a DB error yields no tag rather than
+    // a false one or a dropped match.
+    let corpus = if tag_tests {
+        store.get_meta("corpus").ok().flatten().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let line_is_test = |line: &str| -> bool {
+        if corpus.is_empty() {
+            return false;
+        }
+        let mut it = line.splitn(4, ':');
+        let Some(path) = it.next().filter(|p| !p.is_empty()) else {
+            return false;
+        };
+        let Some(line_no) = it.next().and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        store.line_in_test(&corpus, path, line_no).unwrap_or(false)
+    };
+
     // Per-match line-length cap: a single minified/generated line can be
     // hundreds of KB and would otherwise blow the output budget on its own.
     const MAX_MATCH_LINE: usize = 512;
-    let total = all.len();
-    let shown = total.min(MAX_PATTERN_MATCHES);
-    let mut lines: Vec<String> = Vec::with_capacity(shown + 1);
-    lines.push(format!("{total} match(es):"));
-    lines.extend(all.into_iter().take(MAX_PATTERN_MATCHES).map(|l| {
+    let truncate_line = |l: &str| -> String {
         if l.len() > MAX_MATCH_LINE {
             let mut cut = MAX_MATCH_LINE;
             while cut > 0 && !l.is_char_boundary(cut) {
@@ -3498,9 +3539,77 @@ fn run_git_grep(
         } else {
             l.to_string()
         }
-    }));
-    if total > shown {
-        lines.push(format!("[truncated: showing {shown} of {total} matches]"));
+    };
+
+    let mut rendered: Vec<String> = Vec::new();
+    let mut total_matches = 0usize;
+    let mut shown_matches = 0usize;
+    // Path of the group currently being emitted: it tells a context line
+    // (`{path}-…`) apart from the next match line (`{path}:…`) without
+    // re-parsing a hyphenated prefix the path itself may contain.
+    let mut group_path = String::new();
+    // Whether this group's lines are being dropped (excluded file, or past the
+    // match cap). Set on the match line, inherited by its context lines.
+    let mut suppress_group = false;
+    // A `--` from git not yet emitted; written only between two kept groups, so
+    // a dropped group leaves no dangling separator.
+    let mut pending_sep = false;
+
+    for line in &all {
+        if line == "--" {
+            group_path.clear();
+            pending_sep = true;
+            continue;
+        }
+        let is_context = !group_path.is_empty()
+            && line.starts_with(group_path.as_str())
+            && line.as_bytes().get(group_path.len()) == Some(&b'-');
+        if is_context {
+            if !suppress_group {
+                rendered.push(truncate_line(line));
+            }
+            continue;
+        }
+        // Match line: it opens (or reopens) a group.
+        let Some(path) = line.split(':').next().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        group_path = path.to_string();
+        if file_is_excluded(path) {
+            suppress_group = true;
+            continue;
+        }
+        total_matches += 1;
+        if shown_matches >= MAX_PATTERN_MATCHES {
+            // Counted for the truncation note, but neither it nor its context
+            // block is emitted.
+            suppress_group = true;
+            continue;
+        }
+        suppress_group = false;
+        shown_matches += 1;
+        if pending_sep && !rendered.is_empty() {
+            rendered.push("--".to_string());
+        }
+        pending_sep = false;
+        let tag = if line_is_test(line) { "[test] " } else { "" };
+        rendered.push(format!("{tag}{}", truncate_line(line)));
+    }
+
+    if total_matches == 0 {
+        // The skip-dir / binary / .travsrignore filter emptied a non-empty
+        // git-grep match set — the honest outcome is still "no matches", not an
+        // error (§4 W2 edge case).
+        return GrepOutcome::NoMatches;
+    }
+
+    let mut lines: Vec<String> = Vec::with_capacity(rendered.len() + 2);
+    lines.push(format!("{total_matches} match(es):"));
+    lines.append(&mut rendered);
+    if total_matches > shown_matches {
+        lines.push(format!(
+            "[truncated: showing {shown_matches} of {total_matches} matches]"
+        ));
     }
     GrepOutcome::Matches(lines.join("\n"))
 }
@@ -3512,6 +3621,7 @@ pub fn find_pattern_global(
     scope: Option<&str>,
     repo: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // #517 DD-7: same exemption as `find_pattern_raw` — see
     // `validate_mcp_pattern_arg`'s doc comment.
@@ -3532,7 +3642,7 @@ pub fn find_pattern_global(
     // would be a claim about a search that never ran.
     let mut searched = false;
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern_body(store, pattern, scope, fixed);
+        let result = find_pattern_body(store, pattern, scope, fixed, context);
         let result = if result == NO_MATCHES {
             searched = true;
             String::new()
@@ -20716,14 +20826,14 @@ mod snippet_tests {
         // Newline / NUL in the pattern must be rejected before any exec: the body
         // is empty, so only the empty envelope comes back (never a match list).
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "foo\nbar", None, false), empty);
-        assert_eq!(find_pattern(&store, "", None, false), empty);
+        assert_eq!(find_pattern(&store, "foo\nbar", None, false, 0), empty);
+        assert_eq!(find_pattern(&store, "", None, false, 0), empty);
     }
 
     #[test]
     fn find_pattern_without_repo_root_is_graceful() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         assert!(
             out.contains("run `travsr init`"),
             "expected init hint: {out}"
@@ -20737,9 +20847,12 @@ mod snippet_tests {
         // Absolute and parent-escaping scopes must be dropped before exec →
         // empty envelope, never a match list.
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "charge", Some("/etc"), false), empty);
         assert_eq!(
-            find_pattern(&store, "charge", Some("../secrets"), false),
+            find_pattern(&store, "charge", Some("/etc"), false, 0),
+            empty
+        );
+        assert_eq!(
+            find_pattern(&store, "charge", Some("../secrets"), false, 0),
             empty
         );
     }
@@ -20772,7 +20885,7 @@ mod snippet_tests {
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
         // Skip if git is unavailable in the sandbox (grep returns nothing).
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if out.contains("keep.rs") {
             assert!(
                 !out.contains("gen/skip.rs"),
@@ -20954,15 +21067,15 @@ mod snippet_tests {
     fn find_pattern_zero_matches_says_so() {
         let (_dir, store) = file_universe_fixture();
         // Skip if git is unavailable in the sandbox (grep returns nothing).
-        if !find_pattern(&store, "charge", None, false).contains("tracked.rs") {
+        if !find_pattern(&store, "charge", None, false, 0).contains("tracked.rs") {
             return;
         }
-        let out = find_pattern(&store, "zzz_no_such_text_qqq", None, true);
+        let out = find_pattern(&store, "zzz_no_such_text_qqq", None, true, 0);
         assert_eq!(out, "<travsr-data>\n[note: no matches]\n</travsr-data>");
         // The raw body keeps the empty-string contract the multi-repo
         // aggregator and the CLI key on.
         assert_eq!(
-            find_pattern_raw(&store, "zzz_no_such_text_qqq", None, true),
+            find_pattern_raw(&store, "zzz_no_such_text_qqq", None, true, 0),
             ""
         );
     }
@@ -20975,7 +21088,7 @@ mod snippet_tests {
         let db = dir.path().join("graph.db");
         drop(travsr_store::SqliteStore::open(&db).unwrap());
         let repos: HashMap<String, PathBuf> = [("/r".to_string(), db)].into_iter().collect();
-        let out = find_pattern_global(&repos, "a\nb", None, None, false);
+        let out = find_pattern_global(&repos, "a\nb", None, None, false, 0);
         assert_eq!(out, "<travsr-data></travsr-data>");
     }
 
@@ -21031,7 +21144,7 @@ mod snippet_tests {
         // without `--untracked` only ever sees the index, so every not-yet-added
         // file was a guaranteed false negative.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return; // git unavailable in this sandbox — nothing to assert
         }
@@ -21047,7 +21160,7 @@ mod snippet_tests {
         // so a `!` rule puts a gitignored subtree in the graph. git's own file
         // discovery can never reach it, at any flag combination.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return;
         }
@@ -21062,13 +21175,114 @@ mod snippet_tests {
         // The other direction: widening the search must not start returning
         // files the graph does not contain. `ignored/` has no `!` rule.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return;
         }
         assert!(
             !out.contains("ignored/dep.rs"),
             "a gitignored file with no `!` rule is not in the graph and must not appear: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_context_shows_lines_after_each_match() {
+        // #1050 gap 1: `-A` after-context. A context line is `path-line-text`
+        // (not counted as a match), and non-adjacent groups are split by `--`.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // Two matches, each with a distinct line right after it, a filler line
+        // between the groups so they do not merge.
+        std::fs::write(
+            root.join("f.rs"),
+            "let a = mark();\nAFTER_ONE\nfiller\nlet b = mark();\nAFTER_TWO\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "mark", None, false, 1);
+        if !out.contains("f.rs") {
+            return; // git unavailable in this sandbox — nothing to assert
+        }
+        assert!(
+            out.contains("f.rs-2-AFTER_ONE"),
+            "one line after the first match must show: {out}"
+        );
+        assert!(
+            out.contains("f.rs-5-AFTER_TWO"),
+            "one line after the second match must show: {out}"
+        );
+        assert!(
+            out.contains("2 match(es)"),
+            "context lines must not be counted as matches: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_tags_a_match_inside_a_test() {
+        // #1050 gap 2: a hit inside a node the graph classifies as test code is
+        // prefixed `[test]`; a hit outside any test node is not.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // mark() at line 1 (production) and line 4 (inside a test fn, lines 3..=5).
+        std::fs::write(
+            root.join("f.rs"),
+            "let a = mark();\nfn x() {}\nfn t() {\n    let b = mark();\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+        store.set_meta("corpus", "c").unwrap();
+        store
+            .put_node(
+                &travsr_core::Node::new(
+                    travsr_core::VName::new("c", "", "f.rs", "rust", "fn:t"),
+                    "function",
+                )
+                .with_line(3)
+                .with_end_line(5)
+                .with_test_role(travsr_core::TestRole::EntryPoint),
+            )
+            .unwrap();
+
+        let out = find_pattern(&store, "mark", None, false, 0);
+        if !out.contains("f.rs") {
+            return; // git unavailable in this sandbox — nothing to assert
+        }
+        assert!(
+            out.contains("[test] f.rs:4:"),
+            "the match inside the test fn must be tagged: {out}"
+        );
+        assert!(
+            !out.contains("[test] f.rs:1:"),
+            "the production match must not be tagged: {out}"
         );
     }
 
@@ -21106,7 +21320,7 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return; // git unavailable in this sandbox
         }
@@ -21148,7 +21362,7 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return; // git unavailable in this sandbox
         }
@@ -21168,7 +21382,7 @@ mod snippet_tests {
         // Pass 2 has to honor `scope` the same way git honors a pathspec,
         // otherwise scoping a search would widen it.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", Some("vendored"), false);
+        let out = find_pattern(&store, "charge", Some("vendored"), false, 0);
         if out.contains("tracked.rs") {
             panic!("scope was not applied at all: {out}");
         }
@@ -21346,7 +21560,7 @@ mod snippet_tests {
             .unwrap();
         // MAX_PATTERN_MATCHES caps the printed list, so assert on the total in
         // the header rather than on the truncated body.
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         assert_eq!(
             extract_match_count(&out),
             N,
@@ -21401,8 +21615,8 @@ mod snippet_tests {
     #[test]
     fn pattern_alternation_never_reduces_match_count() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\nlet beta = 2;\n");
-        let base = find_pattern(&store, "alpha", None, false);
-        let widened = find_pattern(&store, "alpha|zzznonexistent", None, false);
+        let base = find_pattern(&store, "alpha", None, false, 0);
+        let widened = find_pattern(&store, "alpha|zzznonexistent", None, false, 0);
         assert!(
             extract_match_count(&widened) >= extract_match_count(&base),
             "alternation must never reduce match count: base={base:?} widened={widened:?}"
@@ -21412,8 +21626,8 @@ mod snippet_tests {
     #[test]
     fn pattern_capture_group_matches_like_the_bare_literal() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
-        let bare = find_pattern(&store, "alpha", None, false);
-        let grouped = find_pattern(&store, "(alpha)", None, false);
+        let bare = find_pattern(&store, "alpha", None, false, 0);
+        let grouped = find_pattern(&store, "(alpha)", None, false, 0);
         assert_eq!(
             extract_match_count(&bare),
             extract_match_count(&grouped),
@@ -21424,7 +21638,7 @@ mod snippet_tests {
     #[test]
     fn pattern_escaped_paren_finds_call_sites() {
         let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
-        let out = find_pattern(&store, "alpha\\(", None, false);
+        let out = find_pattern(&store, "alpha\\(", None, false, 0);
         assert!(
             out.contains("alpha();"),
             "escaped paren must find the call site: {out}"
@@ -21434,7 +21648,7 @@ mod snippet_tests {
     #[test]
     fn pattern_reports_error_for_uncompilable_pattern() {
         let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
-        let out = find_pattern(&store, "alpha(", None, false);
+        let out = find_pattern(&store, "alpha(", None, false, 0);
         assert!(
             out.contains("pattern error"),
             "an unbalanced group must error, not return empty: {out}"
@@ -21452,7 +21666,7 @@ mod snippet_tests {
     #[test]
     fn pattern_fixed_mode_treats_metachars_literally() {
         let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
-        let out = find_pattern(&store, "alpha(", None, true);
+        let out = find_pattern(&store, "alpha(", None, true, 0);
         assert!(
             !out.contains("pattern error"),
             "--fixed must not attempt regex compilation: {out}"
@@ -21467,7 +21681,7 @@ mod snippet_tests {
     #[test]
     fn pattern_allows_percent_in_pattern() {
         let (_dir, store) = pattern_fixture("fix.rs", "let load = 100%;\n");
-        let out = find_pattern(&store, "100%", None, false);
+        let out = find_pattern(&store, "100%", None, false, 0);
         assert_eq!(
             extract_match_count(&out),
             1,
@@ -21481,8 +21695,8 @@ mod snippet_tests {
     fn pattern_still_rejects_nul_and_control_chars() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "foo\0bar", None, false), empty);
-        assert_eq!(find_pattern(&store, "foo\nbar", None, false), empty);
+        assert_eq!(find_pattern(&store, "foo\0bar", None, false, 0), empty);
+        assert_eq!(find_pattern(&store, "foo\nbar", None, false, 0), empty);
     }
 
     /// #517 DD-7 M1: the relaxed validator applies only to `pattern` — `scope`
@@ -21493,7 +21707,7 @@ mod snippet_tests {
         store.set_meta("repo_root", "/tmp/whatever").unwrap();
         let empty = "<travsr-data></travsr-data>";
         assert_eq!(
-            find_pattern(&store, "100%", Some("../etc"), false),
+            find_pattern(&store, "100%", Some("../etc"), false, 0),
             empty,
             "a percent-containing pattern must not smuggle a traversal scope past validation"
         );
@@ -21517,7 +21731,7 @@ mod snippet_tests {
             "src/../../etc",
         ] {
             assert_eq!(
-                find_pattern(&store, "alpha", Some(scope), false),
+                find_pattern(&store, "alpha", Some(scope), false, 0),
                 empty,
                 "scope {scope:?} must be rejected"
             );
@@ -21532,7 +21746,7 @@ mod snippet_tests {
             // Must not be rejected by the guard (a no-match result is fine —
             // rejection returns the empty envelope before git even runs, and
             // for the existing file the match must actually surface).
-            let out = find_pattern(&store, "alpha", Some(scope), false);
+            let out = find_pattern(&store, "alpha", Some(scope), false, 0);
             if scope == "src" || scope == "src/fix.rs" {
                 assert!(
                     out.contains("alpha"),
@@ -21552,7 +21766,7 @@ mod snippet_tests {
     #[test]
     fn pattern_advises_on_pcre_only_construct() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
-        let out = find_pattern(&store, "\\dalpha", None, false);
+        let out = find_pattern(&store, "\\dalpha", None, false, 0);
         assert!(
             out.contains("\\d"),
             "advisory must name the unsupported construct: {out}"
@@ -21629,7 +21843,7 @@ mod snippet_tests {
         #[cfg(not(windows))]
         let delim = ":";
         std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
-        let out = find_pattern_global(&repos, "alpha", None, None, false);
+        let out = find_pattern_global(&repos, "alpha", None, None, false, 0);
         std::env::remove_var("GIT_CEILING_DIRECTORIES");
         assert!(
             out.contains("[repo_bad] pattern error"),

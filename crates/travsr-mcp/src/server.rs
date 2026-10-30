@@ -361,7 +361,8 @@ fn handle_tool_call(
             let pattern = args["pattern"].as_str().unwrap_or("");
             let scope = args["scope"].as_str().filter(|s| !s.is_empty());
             let fixed = args["fixed"].as_bool().unwrap_or(false);
-            tools::find_pattern(store, pattern, scope, fixed)
+            let context = args["context"].as_u64().unwrap_or(0) as u32;
+            tools::find_pattern(store, pattern, scope, fixed, context)
         }
         "get_blast_radius" => {
             let file = args["file"].as_str().unwrap_or("");
@@ -634,13 +635,14 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Textual search (git grep) over the repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>).",
+                "description": "Textual search (git grep) over the repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>). A match inside test code is prefixed `[test]`. Set `context` to also show that many lines after each match.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "POSIX ERE pattern to search for (use fixed:true for a literal string)" },
                         "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
-                        "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" }
+                        "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" },
+                        "context": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Lines of source to show after each match (git grep -A), capped at 10. Default 0." }
                     },
                     "required": ["pattern"],
                     "additionalProperties": false
@@ -1098,6 +1100,7 @@ fn handle_tool_call_global(
             args["scope"].as_str().filter(|s| !s.is_empty()),
             repo_arg,
             args["fixed"].as_bool().unwrap_or(false),
+            args["context"].as_u64().unwrap_or(0) as u32,
         ),
         "get_blast_radius" => {
             let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
@@ -1311,13 +1314,14 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Textual search (git grep) over each repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
+                "description": "Textual search (git grep) over each repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). A match inside test code is prefixed `[test]`. Set `context` to also show that many lines after each match. Supply `repo` to scope; omit only to search across all repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "POSIX ERE pattern to search for (use fixed:true for a literal string)" },
                         "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
                         "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" },
+                        "context": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Lines of source to show after each match (git grep -A), capped at 10. Default 0." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["pattern"],
