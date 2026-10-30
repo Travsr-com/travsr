@@ -138,7 +138,7 @@ ctrlc            = { version = "3", features = ["termination"] }
 tracing-appender = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "7"
-toml        = "0.8"
+toml        = "1.1"
 yaml-rust2  = "0.13"
 quick-xml   = "0.41"
 windows-sys = { version = "0.61", features = [
