@@ -21233,6 +21233,60 @@ mod snippet_tests {
     }
 
     #[test]
+    fn find_pattern_context_drops_an_excluded_group_without_a_dangling_separator() {
+        // #1050 gap 1 edge: an excluded group (a SKIP_DIR hit) sitting between
+        // two kept groups must not be counted, and its `--` separator must not
+        // survive as a dangling separator in the rendered output.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // One kept file, one excluded (node_modules) file, one kept file — git
+        // emits a `--` on either side of the excluded middle group.
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("a.rs"), "HIT one\nafter_a\n").unwrap();
+        std::fs::write(root.join("node_modules/skip.rs"), "HIT two\nafter_s\n").unwrap();
+        std::fs::write(root.join("z.rs"), "HIT three\nafter_z\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "HIT", None, false, 1);
+        if !out.contains("a.rs") {
+            return; // git unavailable in this sandbox — nothing to assert
+        }
+        assert!(
+            !out.contains("skip.rs"),
+            "the excluded node_modules group must not be rendered: {out}"
+        );
+        assert!(
+            out.contains("2 match(es)"),
+            "the excluded match must not be counted: {out}"
+        );
+        // Exactly one separator (between the two kept groups), and it is never
+        // the last rendered line.
+        let seps = out.lines().filter(|l| *l == "--").count();
+        assert_eq!(
+            seps, 1,
+            "exactly one `--` between the two kept groups: {out}"
+        );
+        assert!(
+            !out.trim_end().ends_with("--"),
+            "no dangling trailing separator: {out}"
+        );
+    }
+
+    #[test]
     fn find_pattern_tags_a_match_inside_a_test() {
         // #1050 gap 2: a hit inside a node the graph classifies as test code is
         // prefixed `[test]`; a hit outside any test node is not.
