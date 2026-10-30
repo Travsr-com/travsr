@@ -15894,6 +15894,78 @@ mod snippet_tests {
         .with_end_line(end_line)
     }
 
+    /// #1048: the reorder must lift a tracked definition above untracked
+    /// scratch copies *before* `get_snippets_body` applies the
+    /// `MAX_SIGNATURE_MATCHES` cap — otherwise the tracked def is exactly the
+    /// node the cap drops.
+    #[test]
+    fn prefer_tracked_nodes_lifts_tracked_before_the_signature_cap() {
+        let mut nodes = vec![
+            make_fn_node("DOC/spike/a.ts", "fn:rerank", 1, 2),
+            make_fn_node("DOC/spike/b.ts", "fn:rerank", 1, 2),
+            make_fn_node("DOC/spike/c.ts", "fn:rerank", 1, 2),
+            make_fn_node("crates/travsr-mcp/src/rerank.rs", "fn:rerank", 1, 2),
+        ];
+        let tracked: Option<std::collections::HashSet<String>> = Some(
+            ["crates/travsr-mcp/src/rerank.rs".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        let any_untracked = prefer_tracked_nodes(&mut nodes, &tracked);
+
+        assert!(any_untracked, "the untracked scratch copies were present");
+        assert_eq!(
+            nodes[0].vname.path, "crates/travsr-mcp/src/rerank.rs",
+            "the tracked def must be lifted to the front"
+        );
+        // Within the untracked group the original order is preserved (stable).
+        let untracked_order: Vec<&str> = nodes[1..].iter().map(|n| n.vname.path.as_str()).collect();
+        assert_eq!(
+            untracked_order,
+            ["DOC/spike/a.ts", "DOC/spike/b.ts", "DOC/spike/c.ts"]
+        );
+        // The cap get_snippets_body applies next must now keep the tracked def.
+        let kept: Vec<&str> = nodes
+            .iter()
+            .take(MAX_SIGNATURE_MATCHES)
+            .map(|n| n.vname.path.as_str())
+            .collect();
+        assert!(
+            kept.contains(&"crates/travsr-mcp/src/rerank.rs"),
+            "reorder-before-cap must not drop the tracked def: {kept:?}"
+        );
+    }
+
+    /// #1048: with no tracked set (no-git / cloud/SSE) or when nothing is
+    /// untracked, the reorder is a no-op that preserves order and reports no
+    /// untracked result — the fail-open path.
+    #[test]
+    fn prefer_tracked_nodes_is_a_noop_when_tracked_unknown_or_all_tracked() {
+        let mut nodes = vec![
+            make_fn_node("a.ts", "fn:x", 1, 2),
+            make_fn_node("b.ts", "fn:x", 1, 2),
+        ];
+
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &None),
+            "unknown set reorders nothing"
+        );
+        assert_eq!(nodes[0].vname.path, "a.ts");
+        assert_eq!(nodes[1].vname.path, "b.ts");
+
+        let all_tracked: std::collections::HashSet<String> =
+            ["a.ts".to_string(), "b.ts".to_string()]
+                .into_iter()
+                .collect();
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &Some(all_tracked)),
+            "no untracked node means no reorder and no note"
+        );
+        assert_eq!(nodes[0].vname.path, "a.ts");
+        assert_eq!(nodes[1].vname.path, "b.ts");
+    }
+
     // Unit tests for is_comment_line / skip_leading_comments / snippet_line_cap /
     // snippet_for_node have moved to travsr-analysis/src/snippet.rs (RFC-017).
 

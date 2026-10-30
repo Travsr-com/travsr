@@ -5955,11 +5955,20 @@ fn prune_untracked_files(repo_root: &Path, store: &mut SqliteStore) -> travsr_co
         return dirty;
     }
     let corpus = store.get_meta("corpus").ok().flatten().unwrap_or_default();
-    for path in &untracked {
-        match store.delete_file(&corpus, path) {
-            Ok(callers) => dirty.extend(callers),
-            Err(e) => tracing::warn!(path = %path, err = %e, "prune_untracked: delete_file failed"),
+    // Batch the deletes and yield between batches so concurrent queries are not
+    // starved, mirroring `SqliteStore::reconcile`'s ghost prune. The ceiling
+    // above bounds `untracked`, but it can still be large on a big repo.
+    const BATCH: usize = 500;
+    for chunk in untracked.chunks(BATCH) {
+        for path in chunk {
+            match store.delete_file(&corpus, path) {
+                Ok(callers) => dirty.extend(callers),
+                Err(e) => {
+                    tracing::warn!(path = %path, err = %e, "prune_untracked: delete_file failed")
+                }
+            }
         }
+        std::thread::yield_now();
     }
     tracing::info!(
         event = "commit.prune.untracked",
