@@ -4347,6 +4347,12 @@ impl SqliteStore {
       WHEN signature = ?1 THEN 0
       WHEN kind = 'file' AND path = ?1 THEN 0
       WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
+      -- #1052: a member-qualified signature (`variant:Enum.Member`,
+      -- `method:Class.m`, scip `Type#member`) is a genuine name match on its
+      -- trailing `.Member`/`#member`, just like the `:`-scoped case above. Rank
+      -- it 10 so it is not buried at ELSE 40 under unrelated path-substring hits
+      -- and truncated away by the LIMIT before the caller's name filter runs.
+      WHEN signature LIKE '%.' || ?1 OR signature LIKE '%#' || ?1 THEN 10
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
       WHEN path LIKE '%/' || ?1 THEN 15
@@ -15665,6 +15671,41 @@ mod tests {
         let results = store.search_nodes_by_name("charge").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vname.signature, "fn:charge");
+    }
+
+    /// #1052 Repro C: a member-qualified name (`variant:Enum.Member`) is a real
+    /// name match on its trailing `.Member`, and must survive the search cap
+    /// even when hundreds of unrelated nodes match only because their *path*
+    /// contains the query as a substring (the `travsr-mcp` crate vs. the `Mcp`
+    /// variant). Before the rank fix the variant sat at ELSE-40 and was
+    /// truncated away by the LIMIT behind the path-substring flood.
+    #[test]
+    fn member_qualified_name_outranks_path_substring_flood() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // The variant, on a path that sorts AFTER the flood so only its rank can
+        // keep it in the window.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "zzz/cli/main.rs", "rust", "variant:Command.Mcp"),
+                "variant",
+            ))
+            .unwrap();
+        // Flood: more than the cap, each matching only via `path LIKE '%mcp%'`,
+        // on paths that sort before the variant's.
+        for i in 0..(NODE_NAME_SEARCH_LIMIT + 20) {
+            store
+                .put_node(&node_with_path(
+                    &format!("aaa/mcp/f{i}.rs"),
+                    &format!("fn:noise{i}"),
+                ))
+                .unwrap();
+        }
+        let hits = store.search_nodes_by_name("Mcp").unwrap();
+        assert!(
+            hits.iter()
+                .any(|n| n.vname.signature == "variant:Command.Mcp"),
+            "member-qualified variant was buried behind the path-substring flood"
+        );
     }
 
     /// Equal-rank matches must not be ordered by NodeId: it hashes the corpus,

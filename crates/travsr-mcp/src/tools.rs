@@ -15517,6 +15517,19 @@ enum SymbolToken<'a> {
     BareSig(&'a str),
 }
 
+/// The requested name a [`SymbolToken`] came from, for the `#1052` "no symbol
+/// matched" note. Echoes back what the caller can act on: the bare/full name
+/// for the two signature tiers, and the explicit `nodeId:`/`path:line` form for
+/// the coordinate tiers.
+fn token_display_name(tok: &SymbolToken<'_>) -> String {
+    match tok {
+        SymbolToken::NodeId(id) => format!("nodeId:{id}"),
+        SymbolToken::FullHeader { sig, .. } => (*sig).to_string(),
+        SymbolToken::PathLine { path, start, .. } => format!("{path}:{start}"),
+        SymbolToken::BareSig(sig) => (*sig).to_string(),
+    }
+}
+
 /// Split `symbols_arg` on newline / comma and classify each token into the
 /// appropriate [`SymbolToken`] resolution tier.
 ///
@@ -15693,6 +15706,7 @@ fn get_snippets_body(
     symbols_arg: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     // Read repo_root from meta — written by init_repo_with_progress.
     // Absent on indexes created before this feature; degrade gracefully.
@@ -15725,7 +15739,13 @@ fn get_snippets_body(
     // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
     // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
+    // #1052: names that resolved to zero nodes, so the answer can say which
+    // request produced nothing instead of dropping it without a trace. Tracked
+    // at resolution time (before the budget cap), so a name that resolved but
+    // was later trimmed for budget is never reported as unmatched.
+    let mut unmatched: Vec<String> = Vec::new();
     for tok in &tokens {
+        let before = resolved.len();
         match tok {
             // Tier 0: VS Code / internal callers pass the node's primary key.
             SymbolToken::NodeId(id) => match store.get_node(travsr_core::NodeId(*id)) {
@@ -15765,17 +15785,39 @@ fn get_snippets_body(
             // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
             SymbolToken::BareSig(sig) => {
-                let mut nodes = resolve_symbol_nodes(store, sig, None);
+                // #1052: honour the caller's `path` hint, same semantics as
+                // find_references: scope an overloaded bare name to a file,
+                // directory, or path fragment.
+                let mut nodes = resolve_symbol_nodes(store, sig, path);
                 // Reorder before the cap so a tracked definition is never the
                 // one dropped when more than MAX_SIGNATURE_MATCHES names match.
                 prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
             }
         }
+        // #1052: this token added nothing to the result set.
+        if resolved.len() == before {
+            unmatched.push(token_display_name(tok));
+        }
     }
 
     if resolved.is_empty() {
-        return "No symbols matching the provided names found in the graph.".to_string();
+        // #1052: name each token that matched nothing, rather than one generic
+        // line, so the caller can tell a typo from a missing symbol. Sanitised
+        // because a requested name is untrusted input.
+        let body = if unmatched.is_empty() {
+            "No symbols matching the provided names found in the graph.".to_string()
+        } else {
+            unmatched
+                .iter()
+                .map(|n| format!("[note: no symbol matched '{n}']"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        return sanitize_mcp_body_with_limit(
+            &body,
+            (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
+        );
     }
 
     // Accumulate blocks within budget.  All symbols are equally requested so
@@ -15885,7 +15927,13 @@ fn get_snippets_body(
         return "Token budget too small to include any symbols.".to_string();
     }
 
-    let body = parts.join("\n\n");
+    let mut body = parts.join("\n\n");
+    // #1052: append one note per requested name that resolved to nothing, inside
+    // the body so the untrusted names are sanitised with everything else (the
+    // ASCII footer below is added after sanitisation and must stay name-free).
+    for name in &unmatched {
+        body.push_str(&format!("\n\n[note: no symbol matched '{name}']"));
+    }
     let sanitized = sanitize_mcp_body_with_limit(
         &body,
         (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
@@ -15914,6 +15962,7 @@ pub fn get_snippets(
     symbols: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets rejected invalid arg: {reason}");
@@ -15925,7 +15974,7 @@ pub fn get_snippets(
     // Wrap-only here — like `get_context` — so the response honours `token_budget`
     // instead of being re-truncated to the 4 KiB scalar-output cap (which silently
     // dropped everything past ~6 symbols and cut off the summary footer).
-    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode))
+    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode, path))
 }
 
 pub(crate) fn get_snippets_raw(
@@ -15933,8 +15982,9 @@ pub(crate) fn get_snippets_raw(
     symbols: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
-    get_snippets_body(store, symbols, token_budget, mode)
+    get_snippets_body(store, symbols, token_budget, mode, path)
 }
 
 /// Global variant: searches across all registered repos (or a named one).
@@ -15944,6 +15994,7 @@ pub fn get_snippets_global(
     token_budget: usize,
     repo: Option<&str>,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets_global rejected invalid arg: {reason}");
@@ -15951,7 +16002,7 @@ pub fn get_snippets_global(
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_snippets_raw(store, symbols, budget, mode);
+        let result = get_snippets_raw(store, symbols, budget, mode, path);
         if result.is_empty() || single {
             result
         } else {
@@ -16185,7 +16236,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(result.contains("function hello()"), "snippet body missing");
         assert!(result.contains("return 'hi'"), "snippet content missing");
         assert!(
@@ -16214,6 +16265,7 @@ mod snippet_tests {
             "method:ClassA.enableSupportForFeatureX",
             2000,
             SnippetMode::Auto,
+            None,
         );
         assert!(
             exact.contains("enableSupportForFeatureX() {"),
@@ -16221,14 +16273,20 @@ mod snippet_tests {
         );
 
         // 2. Plain function name works
-        let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        let plain = get_snippets_body(
+            &store,
+            "enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
         assert!(
             plain.contains("enableSupportForFeatureX() {"),
             "plain function name failed"
         );
 
         // 3. Bare class name works
-        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
+        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto, None);
         assert!(class.contains("class ClassA"), "bare class name failed");
 
         // 4. Dotted symbol name works
@@ -16237,17 +16295,87 @@ mod snippet_tests {
             "ClassA.enableSupportForFeatureX",
             2000,
             SnippetMode::Auto,
+            None,
         );
         assert!(
             dotted.contains("enableSupportForFeatureX() {"),
             "dotted symbol name failed"
         );
 
-        // 5. Unknown symbol
-        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
+        // 5. Unknown symbol (#1052): named in a per-name note, not dropped.
+        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto, None);
         assert!(
-            unknown.contains("No symbols matching the provided names found in the graph."),
-            "unknown symbol failed"
+            unknown.contains("[note: no symbol matched 'unknownSymbol']"),
+            "unknown symbol failed: {unknown}"
+        );
+    }
+
+    /// #1052 Repro A: a name that resolves to nothing must be named in a note,
+    /// not silently dropped, and the resolvable name must still be returned.
+    #[test]
+    fn get_snippets_body_notes_each_unresolved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(
+            &store,
+            "fn:hello\nfn:does_not_exist",
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
+        assert!(
+            out.contains("function hello()"),
+            "resolved snippet missing: {out}"
+        );
+        assert!(
+            out.contains("[note: no symbol matched 'fn:does_not_exist']"),
+            "unmatched name not noted: {out}"
+        );
+        // The footer counts only names that produced a block.
+        assert!(
+            out.contains("1 symbols, 1 with snippets"),
+            "footer wrong: {out}"
+        );
+    }
+
+    /// #1052 Repro B: a `path` hint scopes an overloaded bare name to one file,
+    /// same semantics as find_references.
+    #[test]
+    fn get_snippets_body_path_hint_scopes_overloaded_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function dup() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/x.ts"),
+            "function dup() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:dup", 1, 3),
+                make_fn_node("b/x.ts", "fn:dup", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        let out = get_snippets_body(&store, "dup", 2000, SnippetMode::Full, Some("b/x.ts"));
+        assert!(out.contains("b/x.ts"), "path-pinned file missing: {out}");
+        assert!(!out.contains("a/x.ts"), "unscoped file leaked: {out}");
+        assert!(out.contains("return 2"), "wrong definition returned: {out}");
+        assert!(
+            out.contains("1 symbols"),
+            "should resolve exactly one: {out}"
         );
     }
 
@@ -16272,7 +16400,7 @@ mod snippet_tests {
         .with_end_line(31);
         let store = make_store_with_meta(&[class_node], dir.path());
 
-        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full);
+        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full, None);
         assert!(
             full.contains("last = true"),
             "full mode must include last line: {full}"
@@ -16282,7 +16410,7 @@ mod snippet_tests {
             "full mode must not be a skeleton: {full}"
         );
 
-        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto);
+        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto, None);
         assert!(
             auto.contains("[skeleton:") || !auto.contains("last = true"),
             "auto mode caps/skeletonises the oversized class: {auto}"
@@ -16300,7 +16428,7 @@ mod snippet_tests {
         let node = make_fn_node("s.ts", "fn:small", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton);
+        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton, None);
         assert!(
             skel.contains("[skeleton:"),
             "skeleton mode must render the AST summary even for a small fn: {skel}"
@@ -16313,7 +16441,7 @@ mod snippet_tests {
         let db_path = dir.path().join("graph.db");
         let store = SqliteStore::open(&db_path).unwrap();
         // No set_meta("repo_root") — simulates an old index.
-        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto, None);
         assert!(
             result.contains("travsr init"),
             "must prompt user to re-init: {result}"
@@ -16340,7 +16468,7 @@ mod snippet_tests {
         // Tight budget (5 tokens) — the first resolved symbol is always included
         // (so a single large definition is never dropped), but the second respects
         // the exhausted budget and must not appear.
-        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto);
+        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto, None);
         assert!(
             tight.contains("aaa"),
             "first symbol must always be included even under a tiny budget: {tight}"
@@ -16353,7 +16481,7 @@ mod snippet_tests {
         // Ordering budget (20 tokens) — enough for one symbol (header ~9 tokens +
         // 3-line snippet ~8 tokens = ~17 tokens) but not both. The first symbol
         // in request order ("aaa") must appear; the second ("bbb") must not.
-        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto);
+        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto, None);
         assert!(
             ordered.contains("aaa"),
             "first symbol must be included within budget: {ordered}"
@@ -16371,7 +16499,7 @@ mod snippet_tests {
         let node = make_fn_node("missing.ts", "fn:ghost", 1, 5);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto, None);
         // Should return metadata line without panic.
         assert!(
             result.contains("fn:ghost"),
@@ -16414,7 +16542,7 @@ mod snippet_tests {
             .put_file_hash("lib.ts", &sha256_hex_for_test(original.as_bytes()))
             .unwrap();
 
-        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             !fresh.contains("stale:"),
             "an unmodified file must not be flagged: {fresh}"
@@ -16425,7 +16553,7 @@ mod snippet_tests {
         // covers it.
         std::fs::write(&src, format!("// added\n// added\n{original}")).unwrap();
 
-        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             drifted.contains("stale:"),
             "a file edited since indexing must be disclosed, not answered \
@@ -16447,7 +16575,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full);
+        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full, None);
         assert!(
             out.contains("lib.ts:1-3"),
             "header must carry the path:start-end span: {out}"
@@ -16522,7 +16650,7 @@ mod snippet_tests {
         let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
         let store = make_store_with_meta(&[node_a, node_b], dir.path());
 
-        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full, None);
 
         // Both nodes must appear in the output.
         assert!(
@@ -16563,7 +16691,7 @@ mod snippet_tests {
 
         // Caller passes the full header with path — should resolve to a.ts only.
         let full_header = "fn:run (function) \u{2014} a.ts [package: mypkg]";
-        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full, None);
 
         assert!(
             result.contains("/* a */"),
@@ -16601,7 +16729,7 @@ mod snippet_tests {
             header.contains("a.ts:1"),
             "sanity: real header must carry the line locator: {header}"
         );
-        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full, None);
         assert!(
             result.contains("/* a */"),
             "must resolve a.ts from the real get_context header: {result}\nheader={header}"
@@ -16615,7 +16743,7 @@ mod snippet_tests {
         let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
         let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None, false);
         assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
-        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
+        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full, None);
         assert!(
             result_pkg.contains("/* a */") && !result_pkg.contains("/* b */"),
             "package-present header must also resolve a.ts only: {result_pkg}"
@@ -16754,7 +16882,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             result.contains("function hello()"),
             "snippet body missing: {result}"
@@ -16789,7 +16917,13 @@ mod snippet_tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let result = get_snippets_body(&store, "src/exact.ts:3-5", 2000, SnippetMode::Skeleton);
+        let result = get_snippets_body(
+            &store,
+            "src/exact.ts:3-5",
+            2000,
+            SnippetMode::Skeleton,
+            None,
+        );
 
         assert!(
             result.contains("line3"),
@@ -16821,7 +16955,7 @@ mod snippet_tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let out = get_snippets_body(&store, "src/win.ts:3", 2000, SnippetMode::Full);
+        let out = get_snippets_body(&store, "src/win.ts:3", 2000, SnippetMode::Full, None);
         assert!(
             out.contains("src/win.ts:3"),
             "header must cite the requested start line: {out}"
@@ -16853,7 +16987,13 @@ mod snippet_tests {
         assert_eq!(rows.len(), 1, "expected 1 node");
         let id = rows[0].id.0;
 
-        let result = get_snippets_body(&store, &format!("nodeId:{id}"), 2000, SnippetMode::Auto);
+        let result = get_snippets_body(
+            &store,
+            &format!("nodeId:{id}"),
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
         assert!(result.contains("return 99"), "snippet missing: {result}");
         assert!(result.contains("fn:direct"), "header missing: {result}");
     }
@@ -16876,7 +17016,7 @@ mod snippet_tests {
         }
         let store = make_store_with_meta(&nodes, dir.path());
 
-        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto, None);
 
         // Footer must report exactly MAX_SIGNATURE_MATCHES symbols resolved.
         assert!(
