@@ -15519,14 +15519,13 @@ enum SymbolToken<'a> {
 
 /// The requested name a [`SymbolToken`] came from, for the `#1052` "no symbol
 /// matched" note. Echoes back what the caller can act on: the bare name for a
-/// bare signature, the `sig — path` header the caller passed for a full header
-/// (keep the path: it disambiguates which overload/location was looked up and
-/// failed), and the explicit `nodeId:`/`path:line` form for the coordinate
-/// tiers.
+/// bare signature, the `sig (path)` form for a full header (keep the path: it
+/// disambiguates which overload/location was looked up and failed), and the
+/// explicit `nodeId:`/`path:line` form for the coordinate tiers.
 fn token_display_name(tok: &SymbolToken<'_>) -> String {
     match tok {
         SymbolToken::NodeId(id) => format!("nodeId:{id}"),
-        SymbolToken::FullHeader { sig, path } => format!("{sig} \u{2014} {path}"),
+        SymbolToken::FullHeader { sig, path } => format!("{sig} ({path})"),
         SymbolToken::PathLine { path, start, .. } => format!("{path}:{start}"),
         SymbolToken::BareSig(sig) => (*sig).to_string(),
     }
