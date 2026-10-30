@@ -909,7 +909,7 @@ pub fn tools_list() -> serde_json::Value {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected."
+                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected. With a single bare name the hint hard-scopes (as in find_references); with several, it is a per-name filter, so a name absent under the hint keeps its matches from elsewhere and the result notes that the hint was skipped for it."
                         },
                         "repo": {
                             "type": "string",
@@ -1468,7 +1468,7 @@ pub fn tools_list_global() -> serde_json::Value {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected."
+                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected. With a single bare name the hint hard-scopes (as in find_references); with several, it is a per-name filter, so a name absent under the hint keeps its matches from elsewhere and the result notes that the hint was skipped for it."
                         },
                         "repo": {
                             "type": "string",
