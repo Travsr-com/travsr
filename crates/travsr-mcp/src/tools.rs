@@ -15526,6 +15526,9 @@ fn token_display_name(tok: &SymbolToken<'_>) -> String {
     match tok {
         SymbolToken::NodeId(id) => format!("nodeId:{id}"),
         SymbolToken::FullHeader { sig, path } => format!("{sig} ({path})"),
+        // Unreachable from the sole caller (the generic "no symbol matched"
+        // note): a PathLine token always resolves to a synthetic node, so it
+        // never reaches that note. Kept only for match exhaustiveness.
         SymbolToken::PathLine { path, start, .. } => format!("{path}:{start}"),
         SymbolToken::BareSig(sig) => (*sig).to_string(),
     }
@@ -15732,6 +15735,17 @@ fn get_snippets_body(
         return String::new();
     }
 
+    // #1052: how many bare-name tokens the request carries. The shared `path`
+    // hint is hard-scoped only when it disambiguates a single bare name (parity
+    // with find_references); with several bare names it is a soft per-name
+    // filter, so a name living outside the hint keeps its unhinted matches.
+    // Counts BareSig only: a nodeId / path:line / full-header token is already
+    // path-pinned and never consults the hint, so it must not relax this rule.
+    let bare_sig_count = tokens
+        .iter()
+        .filter(|t| matches!(t, SymbolToken::BareSig(_)))
+        .count();
+
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
     // search_nodes_by_name (O(N) LIKE) is generally avoided for exact-match
@@ -15804,14 +15818,26 @@ fn get_snippets_body(
                 let existed = !nodes.is_empty();
                 let mut dropped_by_hint = false;
                 if let Some(p) = path {
-                    let any = nodes.iter().any(|n| path_hint_matches(&n.vname.path, p));
+                    // One `path_hint_matches` pass: the mask is reused for the
+                    // `any` test and the retain, since path_hint_matches
+                    // allocates per node and the old two-pass form did it twice.
+                    let keep: Vec<bool> = nodes
+                        .iter()
+                        .map(|n| path_hint_matches(&n.vname.path, p))
+                        .collect();
+                    let any = keep.iter().any(|&k| k);
                     // One `path` hint is shared by every name in a multi-name
                     // request, so a name living outside it keeps its unhinted
-                    // matches rather than being erased. A single-name request
-                    // keeps find_references' hard path-scoping, so its empty
-                    // hinted set stands.
-                    if any || tokens.len() == 1 {
-                        nodes.retain(|n| path_hint_matches(&n.vname.path, p));
+                    // matches rather than being erased. A request with a single
+                    // bare name keeps find_references' hard path-scoping, so its
+                    // empty hinted set stands.
+                    if any || bare_sig_count == 1 {
+                        let mut i = 0;
+                        nodes.retain(|_| {
+                            let k = keep[i];
+                            i += 1;
+                            k
+                        });
                         dropped_by_hint = !any && existed;
                     }
                 }
@@ -15980,6 +16006,11 @@ fn get_snippets_body(
     for note in &unmatched {
         body.push_str("\n\n");
         body.push_str(note);
+        // #1052: these notes are appended after the budget loop fixed
+        // tokens_used, so fold their cost in too or the footer's `~N tokens`
+        // understates the real payload for a budget-sensitive caller. Same
+        // per-block estimate the loop uses (`+ 1` covers the separator).
+        tokens_used += note.len() / TOKEN_CHARS_PER_TOKEN + 1;
     }
     let sanitized = sanitize_mcp_body_with_limit(
         &body,

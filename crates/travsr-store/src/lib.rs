@@ -4400,18 +4400,18 @@ FROM nodes";
     /// Exact/word-boundary/prefix match: drops the loose `ELSE 40` substring
     /// tier so short, common names don't drag in unrelated symbols (#453).
     ///
-    /// `.` and `#` are name-segment boundaries exactly as `:` is, so a
-    /// member-qualified signature (`variant:Command.Mcp`, `method:Class.m`, scip
-    /// `Type#member`) is a word-boundary match on its trailing member, matched
-    /// here so the exact leg can see it, in parity with the rank CASE in
-    /// `NAME_SEARCH_SELECT` (#1052). Without this the rank-10 member-leaf branch
-    /// there is dead on this path.
+    /// Deliberately does NOT treat `.`/`#` as boundaries. This is Leg A, the
+    /// precision anchor of the seed pipeline (`search_nodes_by_name_exact` ->
+    /// `fused_search_scored`), and a bare member leaf (`new`, `id`) must not
+    /// pull in every `method:X.new` / scip `Type#member` homonym in the corpus.
+    /// The #1052 member-qualified findability (`variant:Enum.Member`) is served
+    /// by the substring leg plus the rank-10 member branch in
+    /// `NAME_SEARCH_SELECT`, which `resolve_symbol_nodes` (get_snippets /
+    /// find_references / search_symbol) routes through; it never reaches here.
     const NAME_MATCH_BOUNDARY: &'static str = "(signature = ?1
    OR signature LIKE ?1 || ':%'
    OR signature LIKE '%:' || ?1
    OR signature LIKE '%:' || ?1 || ':%'
-   OR signature LIKE '%.' || ?1
-   OR signature LIKE '%#' || ?1
    OR signature LIKE ?1 || '%'
    OR path = ?1
    OR path LIKE '%/' || ?1)";
@@ -9740,17 +9740,20 @@ impl SqliteStore {
     /// #778: how many definition nodes are named *exactly* `token` — i.e.
     /// `token` is the leaf of their `kind:Qualified.leaf` signature
     /// (`class:UI` -> `UI`, `method:Widget.id` -> `id`), case-insensitively.
-    /// This matches the exact leg's raw-score-1.0 name semantics
-    /// (`search_nodes_by_name_exact`), so it is the same scale the anchor path
-    /// treats as an exact match — unlike a substring or a segment count.
+    /// This is a NAME count, not a substring or segment count: it mirrors how
+    /// the search legs treat a name — the rank-10 member branch in
+    /// `NAME_SEARCH_SELECT` scores a `.leaf`/`#leaf` hit as a real name match on
+    /// the substring/word legs that `symbol_frequency` grounds.
     ///
     /// The distinction that matters for the [`Self::symbol_frequency`] fallback:
-    /// `NAME_MATCH_BOUNDARY` also carries a prefix form (`id%` catches
-    /// `Identifier`), which over-counts and would inflate a unique name's
-    /// frequency. The three leaf clauses below (`'%:' || tok` for an unqualified
-    /// body, `'%.' || tok` for a qualified leaf, `'%#' || tok` for a scip
-    /// `Type#member` leaf — in parity with `NAME_MATCH_BOUNDARY` after #1052)
-    /// count exactly the nodes whose own name is the token, and nothing else.
+    /// a prefix form (`id%` catches `Identifier`) would over-count and inflate a
+    /// unique name's frequency, so it is excluded. The three leaf clauses below
+    /// (`'%:' || tok` for an unqualified body, `'%.' || tok` for a qualified
+    /// leaf, `'%#' || tok` for a scip `Type#member` leaf) count exactly the
+    /// nodes whose own name is the token, and nothing else. Counting the
+    /// qualified / scip leaves keeps a common member (`id`, `new`) from reading
+    /// as rare (#1052): under-counting floored IDF to specific and wrongly
+    /// anchored seed selection on it.
     ///
     /// Bounded by [`Self::LEAF_NAME_COUNT_CAP`]: only the rare/generic
     /// distinction (via the resulting IDF band) is used downstream, so the true
@@ -9782,8 +9785,8 @@ impl SqliteStore {
         let escaped = escape_like(token);
         // `'%:' || ?1` matches an unqualified body (`class:UI`); `'%.' || ?1` a
         // qualified leaf (`method:Widget.id`); `'%#' || ?1` a scip `Type#member`
-        // leaf — the same three member-leaf forms `NAME_MATCH_BOUNDARY` treats as
-        // an exact-leg match after #1052, so this count stays on that scale.
+        // leaf — the three member-leaf forms the rank CASE scores as a name
+        // match, so this frequency count stays on the same name scale.
         // Wrapped in a `LIMIT`-ed subquery so the scan stops after the cap is
         // reached.
         let sql = "SELECT count(*) FROM (\
@@ -15720,15 +15723,13 @@ mod tests {
         );
     }
 
-    /// #1052 follow-up: the exact/word-boundary path (`search_nodes_by_name_exact`,
-    /// Leg A of the seed pipeline) must treat `.`/`#` as name-segment boundaries
-    /// too, so a member-qualified definition is a word-boundary match on its
-    /// trailing member, in parity with the `:`-scoped case. Before the boundary
-    /// clause was added the member form matched the rank CASE but never the
-    /// boundary WHERE, so `variant:Command.Mcp` was invisible to a bare-`Mcp`
-    /// exact search and the rank-10 member branch was dead on this path.
+    /// #1052: the exact/word-boundary leg (`search_nodes_by_name_exact`, Leg A
+    /// of the seed pipeline) is the precision anchor and must NOT widen to
+    /// member leaves: a bare member name stays matched only through the
+    /// substring leg + rank CASE, not here, so Leg A can't flood with
+    /// `method:X.m` / scip `Type#member` homonyms of a common leaf.
     #[test]
-    fn exact_search_matches_member_qualified_name_on_boundary() {
+    fn exact_search_does_not_match_member_leaf() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         store
             .put_node(&Node::new(
@@ -15736,12 +15737,26 @@ mod tests {
                 "variant",
             ))
             .unwrap();
-        let hits = store.search_nodes_by_name_exact("Mcp").unwrap();
+        // Bare member leaf: only the substring leg should surface the variant.
+        let exact = store.search_nodes_by_name_exact("Mcp").unwrap();
         assert!(
-            hits.iter()
+            !exact
+                .iter()
                 .any(|n| n.vname.signature == "variant:Command.Mcp"),
-            "exact/boundary search missed the member-qualified variant: {:?}",
-            hits.iter().map(|n| &n.vname.signature).collect::<Vec<_>>()
+            "exact leg must not match a member leaf: {:?}",
+            exact.iter().map(|n| &n.vname.signature).collect::<Vec<_>>()
+        );
+        // The `:`-scoped exact form still resolves on the exact leg.
+        let scoped = store.search_nodes_by_name_exact("Command.Mcp").unwrap();
+        assert!(
+            scoped
+                .iter()
+                .any(|n| n.vname.signature == "variant:Command.Mcp"),
+            "exact leg lost the `:`-scoped qualified form: {:?}",
+            scoped
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
         );
     }
 

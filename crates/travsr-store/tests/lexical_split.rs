@@ -343,10 +343,10 @@ fn symbol_frequency_short_token_counts_qualified_members_as_generic() {
 
 #[test]
 fn symbol_frequency_short_token_counts_scip_member_leaf() {
-    // #1052: NAME_MATCH_BOUNDARY now treats a scip `Type#member` signature as an
-    // exact-leg match on its trailing `#member`, so exact_leaf_name_count (the
-    // short-token frequency fallback, which must stay on the exact leg's scale)
-    // must count the `#`-qualified leaf too. Without the `'%#' || tok` clause a
+    // #1052: the rank CASE scores a scip `Type#member` signature as a real name
+    // match on its trailing `#member`, so exact_leaf_name_count (the short-token
+    // frequency fallback that grounds name specificity for seed selection) must
+    // count the `#`-qualified leaf too. Without the `'%#' || tok` clause a
     // common scip member read as rare (Some(1)) and wrongly anchored seed
     // selection -- the exact inversion the fallback exists to prevent.
     let mut store = open();
