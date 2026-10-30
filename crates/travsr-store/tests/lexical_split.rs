@@ -342,6 +342,29 @@ fn symbol_frequency_short_token_counts_qualified_members_as_generic() {
 }
 
 #[test]
+fn symbol_frequency_short_token_counts_scip_member_leaf() {
+    // #1052: NAME_MATCH_BOUNDARY now treats a scip `Type#member` signature as an
+    // exact-leg match on its trailing `#member`, so exact_leaf_name_count (the
+    // short-token frequency fallback, which must stay on the exact leg's scale)
+    // must count the `#`-qualified leaf too. Without the `'%#' || tok` clause a
+    // common scip member read as rare (Some(1)) and wrongly anchored seed
+    // selection -- the exact inversion the fallback exists to prevent.
+    let mut store = open();
+    for i in 0..40 {
+        store
+            .put_node(&node(
+                &format!("pkg/widget_{i}.ts"),
+                &format!("scip:Widget{i}#id"),
+                "method",
+            ))
+            .unwrap();
+    }
+    // 40 scip members, all named exactly `id` at their `#`-leaf: counted, so the
+    // short token reads as generic rather than a fabricated rare anchor.
+    assert_eq!(store.symbol_frequency("id").unwrap(), Some(40));
+}
+
+#[test]
 fn symbol_frequency_short_token_saturates_at_cap() {
     // #778 PR #791 review follow-up: when a short leaf name is common enough to
     // hit LEAF_NAME_COUNT_CAP (4096), the LIMIT truncates the scan. The truncated

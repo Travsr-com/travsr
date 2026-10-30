@@ -15518,13 +15518,15 @@ enum SymbolToken<'a> {
 }
 
 /// The requested name a [`SymbolToken`] came from, for the `#1052` "no symbol
-/// matched" note. Echoes back what the caller can act on: the bare/full name
-/// for the two signature tiers, and the explicit `nodeId:`/`path:line` form for
-/// the coordinate tiers.
+/// matched" note. Echoes back what the caller can act on: the bare name for a
+/// bare signature, the `sig — path` header the caller passed for a full header
+/// (keep the path: it disambiguates which overload/location was looked up and
+/// failed), and the explicit `nodeId:`/`path:line` form for the coordinate
+/// tiers.
 fn token_display_name(tok: &SymbolToken<'_>) -> String {
     match tok {
         SymbolToken::NodeId(id) => format!("nodeId:{id}"),
-        SymbolToken::FullHeader { sig, .. } => (*sig).to_string(),
+        SymbolToken::FullHeader { sig, path } => format!("{sig} \u{2014} {path}"),
         SymbolToken::PathLine { path, start, .. } => format!("{path}:{start}"),
         SymbolToken::BareSig(sig) => (*sig).to_string(),
     }
@@ -15795,23 +15797,41 @@ fn get_snippets_body(
             SymbolToken::BareSig(sig) => {
                 // #1052: honour the caller's `path` hint, same semantics as
                 // find_references: scope an overloaded bare name to a file,
-                // directory, or path fragment.
-                let mut nodes = resolve_symbol_nodes(store, sig, path);
-                // The one `path` hint is shared by every name in a multi-name
-                // request, so a name that lives outside the hinted path would be
-                // filtered to nothing here and then mislabelled "no symbol
-                // matched". When more than one name was asked for and the hint
-                // leaves this one empty, fall back to its unhinted matches: the
-                // hint still disambiguates the names it fits without erasing the
-                // ones it does not. A single-name request keeps find_references'
-                // hard path-scoping.
-                if nodes.is_empty() && path.is_some() && tokens.len() > 1 {
-                    nodes = resolve_symbol_nodes(store, sig, None);
+                // directory, or path fragment. resolve_symbol_nodes applies the
+                // hint only as a final in-memory `retain` over the same DB
+                // lookups, so resolve once unhinted and filter here — a second
+                // resolve on a hinted miss would redo every DB tier for nothing.
+                let mut nodes = resolve_symbol_nodes(store, sig, None);
+                let existed = !nodes.is_empty();
+                let mut dropped_by_hint = false;
+                if let Some(p) = path {
+                    let any = nodes.iter().any(|n| path_hint_matches(&n.vname.path, p));
+                    // One `path` hint is shared by every name in a multi-name
+                    // request, so a name living outside it keeps its unhinted
+                    // matches rather than being erased. A single-name request
+                    // keeps find_references' hard path-scoping, so its empty
+                    // hinted set stands.
+                    if any || tokens.len() == 1 {
+                        nodes.retain(|n| path_hint_matches(&n.vname.path, p));
+                        dropped_by_hint = !any && existed;
+                    }
                 }
                 // Reorder before the cap so a tracked definition is never the
                 // one dropped when more than MAX_SIGNATURE_MATCHES names match.
                 prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+                // A single-name hint that filtered out every real match means
+                // "not under this path", not "nowhere": name the hint so a
+                // stale/off path is not read as a missing symbol. Genuine
+                // absence (no match even unhinted) falls through to the generic
+                // note below.
+                if resolved.len() == before && dropped_by_hint {
+                    unmatched.push(format!(
+                        "[note: no symbol matched '{sig}' under path hint \
+                         '{}'; it exists outside that path]",
+                        path.unwrap_or("")
+                    ));
+                }
             }
         }
         // #1052: this token added nothing to the result set, and no tier above
@@ -15822,6 +15842,14 @@ fn get_snippets_body(
                 token_display_name(tok)
             ));
         }
+    }
+
+    // #1052: a name repeated in the request (`foo,foo`) produces one identical
+    // note per occurrence; collapse duplicates so each unresolved name is
+    // reported once, preserving first-seen order.
+    if unmatched.len() > 1 {
+        let mut seen = std::collections::HashSet::new();
+        unmatched.retain(|n| seen.insert(n.clone()));
     }
 
     if resolved.is_empty() {
@@ -16437,6 +16465,69 @@ mod snippet_tests {
         assert!(
             !out.contains("no symbol matched 'bar'"),
             "a present name outside the hint must not be called missing: {out}"
+        );
+    }
+
+    /// #1052 review: a single-name request hard-scopes to the `path` hint (no
+    /// unhinted fallback). When the hint filters out a symbol that exists
+    /// elsewhere, the note must name the hint and say the symbol exists outside
+    /// it, not report a bare "no symbol matched" that reads as "does not exist".
+    /// A genuinely-absent name must still get the plain note (no false blame on
+    /// the path).
+    #[test]
+    fn get_snippets_body_single_name_hint_miss_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // foo exists only in a/x.ts; the hint pins b/y.ts.
+        let out = get_snippets_body(&store, "foo", 2000, SnippetMode::Full, Some("b/y.ts"));
+        assert!(
+            out.contains("under path hint 'b/y.ts'") && out.contains("exists outside that path"),
+            "hint-miss note must name the path and say it exists elsewhere: {out}"
+        );
+
+        // A name that exists nowhere keeps the plain note, with no path blame.
+        let out = get_snippets_body(&store, "ghost", 2000, SnippetMode::Full, Some("b/y.ts"));
+        assert!(
+            out.contains("[note: no symbol matched 'ghost']"),
+            "genuinely-absent name must get the plain note: {out}"
+        );
+        assert!(
+            !out.contains("under path hint"),
+            "a nowhere name must not blame the path: {out}"
+        );
+    }
+
+    /// #1052 review: a name repeated in the request yields identical notes; they
+    /// must collapse to one line, not one per occurrence.
+    #[test]
+    fn get_snippets_body_repeated_unresolved_name_noted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "ghost,ghost", 2000, SnippetMode::Auto, None);
+        assert_eq!(
+            out.matches("no symbol matched 'ghost'").count(),
+            1,
+            "duplicate unresolved-name notes not collapsed: {out}"
         );
     }
 

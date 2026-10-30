@@ -9747,9 +9747,10 @@ impl SqliteStore {
     /// The distinction that matters for the [`Self::symbol_frequency`] fallback:
     /// `NAME_MATCH_BOUNDARY` also carries a prefix form (`id%` catches
     /// `Identifier`), which over-counts and would inflate a unique name's
-    /// frequency. The two leaf clauses below (`'%:' || tok` for an unqualified
-    /// body, `'%.' || tok` for a qualified leaf) count exactly the nodes whose
-    /// own name is the token, and nothing else.
+    /// frequency. The three leaf clauses below (`'%:' || tok` for an unqualified
+    /// body, `'%.' || tok` for a qualified leaf, `'%#' || tok` for a scip
+    /// `Type#member` leaf — in parity with `NAME_MATCH_BOUNDARY` after #1052)
+    /// count exactly the nodes whose own name is the token, and nothing else.
     ///
     /// Bounded by [`Self::LEAF_NAME_COUNT_CAP`]: only the rare/generic
     /// distinction (via the resulting IDF band) is used downstream, so the true
@@ -9780,12 +9781,16 @@ impl SqliteStore {
         }
         let escaped = escape_like(token);
         // `'%:' || ?1` matches an unqualified body (`class:UI`); `'%.' || ?1` a
-        // qualified leaf (`method:Widget.id`). Wrapped in a `LIMIT`-ed subquery
-        // so the scan stops after the cap is reached.
+        // qualified leaf (`method:Widget.id`); `'%#' || ?1` a scip `Type#member`
+        // leaf — the same three member-leaf forms `NAME_MATCH_BOUNDARY` treats as
+        // an exact-leg match after #1052, so this count stays on that scale.
+        // Wrapped in a `LIMIT`-ed subquery so the scan stops after the cap is
+        // reached.
         let sql = "SELECT count(*) FROM (\
                      SELECT 1 FROM nodes \
                      WHERE (signature LIKE '%:' || ?1 ESCAPE '\\' \
-                         OR signature LIKE '%.' || ?1 ESCAPE '\\') \
+                         OR signature LIKE '%.' || ?1 ESCAPE '\\' \
+                         OR signature LIKE '%#' || ?1 ESCAPE '\\') \
                        AND kind != 'doc-chunk' \
                      LIMIT ?2)";
         let n: i64 = self
