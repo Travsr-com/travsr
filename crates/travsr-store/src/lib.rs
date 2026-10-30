@@ -4399,10 +4399,19 @@ FROM nodes";
 
     /// Exact/word-boundary/prefix match: drops the loose `ELSE 40` substring
     /// tier so short, common names don't drag in unrelated symbols (#453).
+    ///
+    /// `.` and `#` are name-segment boundaries exactly as `:` is, so a
+    /// member-qualified signature (`variant:Command.Mcp`, `method:Class.m`, scip
+    /// `Type#member`) is a word-boundary match on its trailing member, matched
+    /// here so the exact leg can see it, in parity with the rank CASE in
+    /// `NAME_SEARCH_SELECT` (#1052). Without this the rank-10 member-leaf branch
+    /// there is dead on this path.
     const NAME_MATCH_BOUNDARY: &'static str = "(signature = ?1
    OR signature LIKE ?1 || ':%'
    OR signature LIKE '%:' || ?1
    OR signature LIKE '%:' || ?1 || ':%'
+   OR signature LIKE '%.' || ?1
+   OR signature LIKE '%#' || ?1
    OR signature LIKE ?1 || '%'
    OR path = ?1
    OR path LIKE '%/' || ?1)";
@@ -9736,13 +9745,11 @@ impl SqliteStore {
     /// treats as an exact match — unlike a substring or a segment count.
     ///
     /// The distinction that matters for the [`Self::symbol_frequency`] fallback:
-    /// `NAME_MATCH_BOUNDARY`'s unqualified tail forms cannot see a qualified
-    /// member (`method:Widget.id` is invisible to a bare-`id` boundary match)
-    /// yet its prefix form over-counts (`id%` catches `Identifier`), so it both
-    /// fabricates rarity for a common member name and inflates a unique one.
-    /// The two leaf clauses below (`'%:' || tok` for an unqualified body,
-    /// `'%.' || tok` for a qualified leaf) count exactly the nodes whose own
-    /// name is the token, and nothing else.
+    /// `NAME_MATCH_BOUNDARY` also carries a prefix form (`id%` catches
+    /// `Identifier`), which over-counts and would inflate a unique name's
+    /// frequency. The two leaf clauses below (`'%:' || tok` for an unqualified
+    /// body, `'%.' || tok` for a qualified leaf) count exactly the nodes whose
+    /// own name is the token, and nothing else.
     ///
     /// Bounded by [`Self::LEAF_NAME_COUNT_CAP`]: only the rare/generic
     /// distinction (via the resulting IDF band) is used downstream, so the true
@@ -15705,6 +15712,31 @@ mod tests {
             hits.iter()
                 .any(|n| n.vname.signature == "variant:Command.Mcp"),
             "member-qualified variant was buried behind the path-substring flood"
+        );
+    }
+
+    /// #1052 follow-up: the exact/word-boundary path (`search_nodes_by_name_exact`,
+    /// Leg A of the seed pipeline) must treat `.`/`#` as name-segment boundaries
+    /// too, so a member-qualified definition is a word-boundary match on its
+    /// trailing member, in parity with the `:`-scoped case. Before the boundary
+    /// clause was added the member form matched the rank CASE but never the
+    /// boundary WHERE, so `variant:Command.Mcp` was invisible to a bare-`Mcp`
+    /// exact search and the rank-10 member branch was dead on this path.
+    #[test]
+    fn exact_search_matches_member_qualified_name_on_boundary() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "cli/main.rs", "rust", "variant:Command.Mcp"),
+                "variant",
+            ))
+            .unwrap();
+        let hits = store.search_nodes_by_name_exact("Mcp").unwrap();
+        assert!(
+            hits.iter()
+                .any(|n| n.vname.signature == "variant:Command.Mcp"),
+            "exact/boundary search missed the member-qualified variant: {:?}",
+            hits.iter().map(|n| &n.vname.signature).collect::<Vec<_>>()
         );
     }
 

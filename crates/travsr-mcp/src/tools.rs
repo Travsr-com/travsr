@@ -15739,18 +15739,26 @@ fn get_snippets_body(
     // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
     // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
-    // #1052: names that resolved to zero nodes, so the answer can say which
-    // request produced nothing instead of dropping it without a trace. Tracked
-    // at resolution time (before the budget cap), so a name that resolved but
-    // was later trimmed for budget is never reported as unmatched.
+    // #1052: one note line per requested name that produced no snippet, so the
+    // answer can say which request came back empty instead of dropping it
+    // without a trace. Each entry is the full, ready-to-emit `[note: ...]` line.
+    // Recorded at resolution time (before the budget cap), so a name that
+    // resolved but was later trimmed for budget is never reported here.
     let mut unmatched: Vec<String> = Vec::new();
     for tok in &tokens {
         let before = resolved.len();
+        let before_un = unmatched.len();
         match tok {
             // Tier 0: VS Code / internal callers pass the node's primary key.
             SymbolToken::NodeId(id) => match store.get_node(travsr_core::NodeId(*id)) {
                 Ok(Some(n)) if n.kind != "file" => resolved.push(n),
-                Ok(_) => {}
+                // The node exists but is a `file` container, which has no
+                // definition snippet. Say so, rather than letting the generic
+                // check below report a present node as "no symbol matched".
+                Ok(Some(_)) => unmatched.push(format!(
+                    "[note: 'nodeId:{id}' is a file, not a symbol with a snippet]"
+                )),
+                Ok(None) => {}
                 Err(e) => tracing::warn!("get_snippets nodeId:{id} lookup error: {e}"),
             },
 
@@ -15789,15 +15797,30 @@ fn get_snippets_body(
                 // find_references: scope an overloaded bare name to a file,
                 // directory, or path fragment.
                 let mut nodes = resolve_symbol_nodes(store, sig, path);
+                // The one `path` hint is shared by every name in a multi-name
+                // request, so a name that lives outside the hinted path would be
+                // filtered to nothing here and then mislabelled "no symbol
+                // matched". When more than one name was asked for and the hint
+                // leaves this one empty, fall back to its unhinted matches: the
+                // hint still disambiguates the names it fits without erasing the
+                // ones it does not. A single-name request keeps find_references'
+                // hard path-scoping.
+                if nodes.is_empty() && path.is_some() && tokens.len() > 1 {
+                    nodes = resolve_symbol_nodes(store, sig, None);
+                }
                 // Reorder before the cap so a tracked definition is never the
                 // one dropped when more than MAX_SIGNATURE_MATCHES names match.
                 prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
             }
         }
-        // #1052: this token added nothing to the result set.
-        if resolved.len() == before {
-            unmatched.push(token_display_name(tok));
+        // #1052: this token added nothing to the result set, and no tier above
+        // already recorded a more specific note for it (e.g. a file node).
+        if resolved.len() == before && unmatched.len() == before_un {
+            unmatched.push(format!(
+                "[note: no symbol matched '{}']",
+                token_display_name(tok)
+            ));
         }
     }
 
@@ -15808,11 +15831,7 @@ fn get_snippets_body(
         let body = if unmatched.is_empty() {
             "No symbols matching the provided names found in the graph.".to_string()
         } else {
-            unmatched
-                .iter()
-                .map(|n| format!("[note: no symbol matched '{n}']"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            unmatched.join("\n")
         };
         return sanitize_mcp_body_with_limit(
             &body,
@@ -15928,11 +15947,12 @@ fn get_snippets_body(
     }
 
     let mut body = parts.join("\n\n");
-    // #1052: append one note per requested name that resolved to nothing, inside
+    // #1052: append one note per requested name that produced no snippet, inside
     // the body so the untrusted names are sanitised with everything else (the
     // ASCII footer below is added after sanitisation and must stay name-free).
-    for name in &unmatched {
-        body.push_str(&format!("\n\n[note: no symbol matched '{name}']"));
+    for note in &unmatched {
+        body.push_str("\n\n");
+        body.push_str(note);
     }
     let sanitized = sanitize_mcp_body_with_limit(
         &body,
@@ -16376,6 +16396,93 @@ mod snippet_tests {
         assert!(
             out.contains("1 symbols"),
             "should resolve exactly one: {out}"
+        );
+    }
+
+    /// #1052: the single `path` hint is shared by every name in a multi-name
+    /// request. A name that lives outside the hinted path must still resolve
+    /// (fall back to its unhinted match) rather than be filtered out and then
+    /// reported "no symbol matched".
+    #[test]
+    fn get_snippets_body_path_hint_does_not_drop_names_outside_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // Hint pins to a/x.ts, where only foo lives; bar lives in b/y.ts and must
+        // survive via the unhinted fallback.
+        let out = get_snippets_body(&store, "foo\nbar", 2000, SnippetMode::Full, Some("a/x.ts"));
+        assert!(out.contains("return 1"), "hinted name foo missing: {out}");
+        assert!(
+            out.contains("return 2"),
+            "name outside the hint was dropped: {out}"
+        );
+        assert!(
+            !out.contains("no symbol matched 'bar'"),
+            "a present name outside the hint must not be called missing: {out}"
+        );
+    }
+
+    /// #1052: a `nodeId:` that resolves to a `file` container node exists but has
+    /// no definition snippet. It must be noted accurately, not reported as a
+    /// missing symbol (which misdescribes a present node).
+    #[test]
+    fn get_snippets_body_file_node_id_is_noted_not_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let file_node = CoreNode::new(
+            VName::new("corpus", "", "lib.ts", "typescript", "file:lib.ts"),
+            "file",
+        );
+        let store = make_store_with_meta(
+            &[make_fn_node("lib.ts", "fn:hello", 1, 3), file_node],
+            dir.path(),
+        );
+
+        // Resolve the file container node's id to pass it back as `nodeId:`.
+        let file_id = store
+            .search_nodes_by_name("file:lib.ts")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == "file")
+            .expect("a file container node exists")
+            .id;
+
+        let out = get_snippets_body(
+            &store,
+            &format!("nodeId:{}", file_id.0),
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
+        assert!(
+            out.contains("is a file, not a symbol"),
+            "file node should be noted accurately: {out}"
+        );
+        assert!(
+            !out.contains("no symbol matched"),
+            "a present file node must not be called missing: {out}"
         );
     }
 
