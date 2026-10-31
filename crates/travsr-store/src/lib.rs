@@ -4357,7 +4357,11 @@ impl SqliteStore {
       -- break the `path ASC` tie against a genuine `:`-scoped definition and
       -- push it out of the window. 11 keeps the member-leaf above the 20/40
       -- flood tiers (the #1052 win) while the `:`-scoped match always sorts first.
-      WHEN signature LIKE '%.' || ?1 OR signature LIKE '%#' || ?1 THEN 11
+      -- The leaf term here is `?2`: `?1` pre-escaped for LIKE and paired with
+      -- `ESCAPE '\\'`, so a `_`/`%` in a snake_case name (`get_context`) matches
+      -- literally and does not wildcard junk (`get1context`) into this protected
+      -- tier (parity with the `exact_leaf_name_count` member-leaf count).
+      WHEN signature LIKE '%.' || ?2 ESCAPE '\\' OR signature LIKE '%#' || ?2 ESCAPE '\\' THEN 11
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
       WHEN path LIKE '%/' || ?1 THEN 15
@@ -4460,6 +4464,22 @@ FROM nodes";
         name: &str,
         lang: Option<&str>,
     ) -> Result<Vec<Node>, StoreError> {
+        // `?2` is `name` with LIKE metacharacters escaped, bound for the
+        // member-leaf rank branch's `ESCAPE '\'` clauses in NAME_SEARCH_SELECT so
+        // a `_`/`%` in a snake_case name matches literally, not as a wildcard
+        // (parity with `exact_leaf_name_count`). `\` itself is escaped first. The
+        // other LIKE/equality branches keep the raw `?1`.
+        fn escape_like(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if matches!(c, '\\' | '%' | '_') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+        let escaped = escape_like(name);
         (|| -> AnyResult<Vec<Node>> {
             let mut sql =
                 String::with_capacity(Self::NAME_SEARCH_SELECT.len() + match_clause.len() + 96);
@@ -4468,7 +4488,9 @@ FROM nodes";
             sql.push_str(match_clause);
             sql.push_str("\n  AND kind != 'doc-chunk'");
             if lang.is_some() {
-                sql.push_str("\n  AND language = ?2");
+                // `?2` is the escaped leaf term (always bound); the language
+                // filter is `?3`.
+                sql.push_str("\n  AND language = ?3");
             }
             // Ties break on the name, not the NodeId: the id hashes the corpus
             // (the checkout's directory), so id order changed with it.
@@ -4478,8 +4500,8 @@ FROM nodes";
 
             let mut stmt = self.conn.prepare(&sql).context("preparing search query")?;
             let rows = match lang {
-                Some(l) => stmt.query_map(params![name, l], Self::map_search_row),
-                None => stmt.query_map(params![name], Self::map_search_row),
+                Some(l) => stmt.query_map(params![name, escaped, l], Self::map_search_row),
+                None => stmt.query_map(params![name, escaped], Self::map_search_row),
             }
             .context("executing search query")?;
 
@@ -15765,6 +15787,45 @@ mod tests {
         assert!(
             hits.iter().any(|n| n.vname.signature == "fn:id"),
             "`:`-scoped definition was buried behind the member-leaf flood"
+        );
+    }
+
+    #[test]
+    fn member_leaf_rank_matches_underscore_name_literally_not_as_wildcard() {
+        // #1076: the member-leaf rank branch binds the leaf term pre-escaped and
+        // paired with `ESCAPE '\'`, so a `_` in a snake_case name matches
+        // literally. Querying `get_context` must rank the genuine
+        // `method:Svc.get_context` leaf in the member tier (11) while an impostor
+        // `method:Svc.getXcontext` (a member-tier hit only if `_` is treated as a
+        // single-char wildcard) stays in the ELSE tier (40) and sorts after it.
+        // Both are admitted by the loose substring WHERE filter, so this asserts
+        // ranking, not membership; with an unescaped `_` both would rank 11 and
+        // the impostor (`X` < `_` on the signature tiebreak) would sort ahead.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "svc.rs", "rust", "method:Svc.get_context"),
+                "method",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "svc.rs", "rust", "method:Svc.getXcontext"),
+                "method",
+            ))
+            .unwrap();
+
+        let hits = store.search_nodes_by_name("get_context").unwrap();
+        let genuine = hits
+            .iter()
+            .position(|n| n.vname.signature == "method:Svc.get_context")
+            .expect("genuine `.get_context` leaf must match");
+        let impostor = hits
+            .iter()
+            .position(|n| n.vname.signature == "method:Svc.getXcontext");
+        assert!(
+            impostor.map_or(true, |imp| genuine < imp),
+            "underscore leaf must outrank the wildcard impostor: {hits:?}"
         );
     }
 

@@ -15744,14 +15744,20 @@ fn get_snippets_body(
     // #1076: count distinct names, not occurrences, so a name repeated in the
     // request (`foo,foo`) still reads as one bare name and keeps hard-scoping,
     // instead of being misread as multi-name and dropped into the soft filter.
-    let bare_sig_count = tokens
-        .iter()
-        .filter_map(|t| match t {
-            SymbolToken::BareSig(sig) => Some(*sig),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .len();
+    // Only the `path` hint branch below reads this, so compute it only when a
+    // hint is present; the common no-hint call then allocates nothing here.
+    let bare_sig_count = if path.is_some() {
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                SymbolToken::BareSig(sig) => Some(*sig),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    } else {
+        0
+    };
 
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
@@ -15761,11 +15767,15 @@ fn get_snippets_body(
     // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
     // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
-    // #1052: one note line per requested name that produced no snippet, so the
-    // answer can say which request came back empty instead of dropping it
-    // without a trace. Each entry is the full, ready-to-emit `[note: ...]` line.
-    // Recorded at resolution time (before the budget cap), so a name that
-    // resolved but was later trimmed for budget is never reported here.
+    // #1052: per-name notes appended after the snippet blocks, each a full,
+    // ready-to-emit `[note: ...]` line, so the answer can say which request came
+    // back empty instead of dropping it without a trace. Mostly one line per
+    // requested name that produced no snippet, but NOT only hard misses: #1076
+    // also records here the informational note for a multi-name request whose
+    // shared hint was skipped for a name that DID resolve elsewhere, so an entry
+    // is not a reliable "produced no snippet" signal. Recorded at resolution
+    // time (before the budget cap), so a name that resolved but was later
+    // trimmed for budget is never reported here.
     let mut unmatched: Vec<String> = Vec::new();
     for tok in &tokens {
         let before = resolved.len();
@@ -15900,15 +15910,30 @@ fn get_snippets_body(
     // kind + signature). This keeps genuinely distinct overloads (same name,
     // different file) and distinct `path:line` windows apart.
     if resolved.len() > 1 {
-        let mut seen = std::collections::HashSet::new();
-        resolved.retain(|n| {
-            seen.insert((
-                n.vname.path.clone(),
-                n.line,
-                n.end_line,
-                n.kind.clone(),
-                n.vname.signature.clone(),
-            ))
+        // Key the dedup on borrowed fields so a node is not cloned just to detect
+        // the (near-always absent) duplicate. `seen` is scoped so its borrow of
+        // `resolved` is released before the mutable `retain`, same one-pass-mask
+        // shape as the path-hint filter above.
+        let keep: Vec<bool> = {
+            let mut seen = std::collections::HashSet::new();
+            resolved
+                .iter()
+                .map(|n| {
+                    seen.insert((
+                        n.vname.path.as_str(),
+                        n.line,
+                        n.end_line,
+                        n.kind.as_str(),
+                        n.vname.signature.as_str(),
+                    ))
+                })
+                .collect()
+        };
+        let mut i = 0;
+        resolved.retain(|_| {
+            let k = keep[i];
+            i += 1;
+            k
         });
     }
 
@@ -16681,6 +16706,51 @@ mod snippet_tests {
         assert!(
             out.contains("'bar' is not under path hint 'a/x.ts'"),
             "multi-name hint miss must be noted: {out}"
+        );
+    }
+
+    /// #1076 review: get_snippets resolves a single bare name unhinted and
+    /// re-applies the `path` hint in its own scope (to get the per-node mask),
+    /// rather than letting `resolve_symbol_nodes` apply it. Both sides share
+    /// `path_hint_matches`, but guard the equivalence so a future change to the
+    /// resolve-side hint handling that get_snippets does not track is caught
+    /// here instead of silently breaking the `--path` parity the schema promises.
+    #[test]
+    fn get_snippets_body_single_name_hint_matches_resolve_symbol_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function dup() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/x.ts"),
+            "function dup() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:dup", 1, 3),
+                make_fn_node("b/x.ts", "fn:dup", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // resolve_symbol_nodes is the hint authority the find_references path uses.
+        let hinted = resolve_symbol_nodes(&store, "dup", Some("b/x.ts"));
+        assert_eq!(hinted.len(), 1, "fixture should pin exactly one def");
+        let want = hinted[0].vname.path.clone();
+
+        let out = get_snippets_body(&store, "dup", 2000, SnippetMode::Full, Some("b/x.ts"));
+        assert!(
+            out.contains(want.as_str()),
+            "get_snippets must include the path resolve_symbol_nodes kept ({want}): {out}"
+        );
+        assert!(
+            !out.contains("a/x.ts"),
+            "get_snippets must not include a path resolve_symbol_nodes excluded: {out}"
         );
     }
 
