@@ -350,24 +350,21 @@ fn active_layer<'a>(repo: Option<&'a str>, global: Option<&'a str>) -> ActiveLay
     }
 }
 
-fn cmd_list(json: bool) -> Result<()> {
+/// The `embed list --json` payload for `repo_root`. Shared with `travsr ui`,
+/// which answers the extension's Health page from it without starting a
+/// process.
+pub(crate) fn list_json(repo_root: Option<&Path>) -> String {
     // Same resolution `status` uses (repo config wins over the machine
     // default) so the two surfaces can never name different active models
     // (#482/#483).
-    let cwd = std::env::current_dir().ok();
-    let repo_root = cwd
-        .as_ref()
-        .and_then(|c| crate::repo::find_git_root(c).ok());
-    let repo_active_id = repo_root.and_then(|r| travsr_plugin_host::repo_backend_id(&r));
+    let repo_active_id = repo_root.and_then(travsr_plugin_host::repo_backend_id);
     let global_id = load_config().and_then(|c| c.active);
     let active = repo_active_id.clone().or(global_id.clone());
     let ActiveLayer {
         source: active_source,
-        overridden,
+        ..
     } = active_layer(repo_active_id.as_deref(), global_id.as_deref());
-
-    if json {
-        let entries: Vec<String> = embed_backends()
+    let entries: Vec<String> = embed_backends()
             .iter()
             .map(|b| {
                 let installed = model_files_installed(b);
@@ -395,9 +392,25 @@ fn cmd_list(json: bool) -> Result<()> {
                 )
             })
             .collect();
-        println!("[{}]", entries.join(",\n"));
+    format!("[{}]", entries.join(",\n"))
+}
+
+fn cmd_list(json: bool) -> Result<()> {
+    let cwd = std::env::current_dir().ok();
+    let repo_root = cwd
+        .as_ref()
+        .and_then(|c| crate::repo::find_git_root(c).ok());
+    if json {
+        println!("{}", list_json(repo_root.as_deref()));
         return Ok(());
     }
+    let repo_active_id = repo_root.and_then(|r| travsr_plugin_host::repo_backend_id(&r));
+    let global_id = load_config().and_then(|c| c.active);
+    let active = repo_active_id.clone().or(global_id.clone());
+    let ActiveLayer {
+        source: active_source,
+        overridden,
+    } = active_layer(repo_active_id.as_deref(), global_id.as_deref());
 
     println!(
         "{:<22} {:<5} {:<7} {:<5} {:<10} {:<8} STATUS",

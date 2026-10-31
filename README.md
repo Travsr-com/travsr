@@ -333,6 +333,7 @@ travsr mcp --stdio                   Start the MCP stdio server (single-repo, cw
 travsr mcp --stdio --global          Start the MCP stdio server (all registered repos)
 travsr mcp --stdio --db <path>       Start the MCP stdio server (explicit db path)
 travsr serve                         Serve MCP over HTTP/SSE with bearer-token auth (loopback by default)
+travsr ui                            Browse the graph in a web browser at http://localhost:7330 (--open, --port)
 travsr lang list                     Per-language analysis status, prerequisites, and this repo's state
 travsr lang status [language]        Alias of `lang list`; name a language to see only that row
 travsr lang install <language>       Set up full cross-file analysis for a language, and enable this repo
@@ -568,6 +569,53 @@ travsr graph --all --format json
   ]
 }
 ```
+
+### travsr ui
+
+Browse an indexed repository in your web browser, without an editor or an AI
+tool. Run it inside a repository you have run `travsr init` in:
+
+```bash
+travsr ui            # prints http://localhost:7330/
+travsr ui --open     # also opens it in your default browser
+travsr ui --port 0   # pick any free port
+```
+
+The pages are the VS Code extension's, for the current repository or any other
+registered one:
+
+- **Health:** the extension's Health page: verdict, metric tiles, daemon,
+  index freshness, sidecars, storage and integrity, languages, repositories,
+  recent activity and the daemon log with its filters.
+- **Graph:** the extension's graph view itself (repo map, symbol graph, blast
+  view, definition peek, DOT/JSON/PNG export).
+- **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's
+  panels of the same names.
+
+Every graph answer is the text the matching MCP tool (`search_symbol`,
+`get_callers`, `get_dependencies`, `get_blast_radius`, `get_graph_json`, ...)
+returns for the same arguments, and the Health page runs the same read-only
+CLI commands the extension runs (`daemon status`, `lang list --json`, ...).
+Graph queries go to the repository's running daemon, as `travsr status` does;
+with no daemon running they read the index directly, read-only, and the page
+says so. `travsr ui` never writes the index: one that needs a schema upgrade is
+reported with the command to run (`travsr init`) instead of being migrated.
+The pages are read-only: where the extension has an action button (Start
+daemon, Reindex, Install analyzer), the page copies the command to run instead.
+"Open in editor" links open the file in VS Code when it is installed.
+
+Open pages redraw themselves when the index changes (after a commit, a save
+the daemon picks up, or a `travsr init`), as the extension's panels do. The
+strip at the top says `live`, `index changing...` while a reindex is still
+writing, and `updating...` while the page redraws.
+
+**Security.** The server binds `127.0.0.1` and only answers requests addressed
+to a loopback name, so a web page on another site cannot reach it through DNS
+rebinding. It has no login: binding any other address needs
+`--host <ip> --allow-remote`, and anyone who can reach that port can then read
+the graph and the source of every indexed file (never a file outside the index,
+such as a gitignored `.env`). Stop it with Ctrl-C. If the port is taken, `travsr ui` says so and
+exits; pass `--port` to pick another.
 
 ---
 

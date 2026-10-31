@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<!-- The VS Code extension's graph webview (packages/travsr-vscode/src/graph.ts,
+     buildHtmlContent), with asset paths served by travsr ui. Keep the markup in
+     step with that template: graph.js looks every element up by id. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="/assets/graph.css">
+<link rel="stylesheet" href="/assets/nav.css">
+<link rel="icon" href="/assets/icon.png">
+<title>Travsr Graph</title>
+</head>
+<body class="vscode-dark">
+
+<!-- ── Top bar ─────────────────────────────────────────────────────────── -->
+<div id="topbar">
+  <div id="brand">
+    <span class="logo"><img src="/assets/icon.png" alt="" width="20" height="20"></span>
+    <span class="word">travsr</span>
+    <span class="vtag">graph</span>
+  </div>
+
+  <span id="searchWrap">
+    <input id="searchInput" type="text" placeholder="symbol name… (press / to focus)" autocomplete="off" autocorrect="off" spellcheck="false">
+  </span>
+
+  <div class="grp" id="grp-direction" aria-label="Direction">
+    <span class="grp-label">show</span>
+    <button class="btn" id="btn-callers" title="Callers only">← callers</button>
+    <button class="btn active" id="btn-both" title="Callers and dependencies">both</button>
+    <button class="btn" id="btn-deps" title="Dependencies only">deps →</button>
+  </div>
+
+  <div class="grp" id="grp-depth" aria-label="Depth">
+    <span class="grp-label">depth</span>
+    <input type="range" id="depthSlider" min="1" max="4" value="2"
+           aria-label="Traversal depth">
+    <span id="depthVal">2</span>
+  </div>
+
+  <div class="grp" id="grp-spread" aria-label="Spread">
+    <span class="grp-label">spread</span>
+    <input type="range" id="spreadSlider" min="1" max="5" step="0.1" value="1"
+           aria-label="Node spread multiplier" style="width:72px">
+    <span id="spreadVal">1×</span>
+  </div>
+
+  <div class="grp" id="grp-layout" aria-label="Layout">
+    <span class="grp-label">layout</span>
+    <button class="btn active" id="btn-flow" title="Semantic flow layout">⇄ flow</button>
+    <button class="btn" id="btn-rings" title="Concentric ring layout">◎ rings</button>
+  </div>
+
+  <div class="grp" id="grp-toggles" aria-label="Toggles">
+    <button class="btn active" id="btn-group" title="Group symbols by file">▣ files</button>
+    <button class="btn" id="btn-vars" title="Show exported variable nodes">x vars</button>
+    <button class="btn active-orange" id="btn-noise" title="Hide test and vendor nodes">⊘ noise</button>
+  </div>
+
+  <div class="grp" id="grp-edges" aria-label="Edge kinds">
+    <span class="grp-label">edges</span>
+    <span class="chip on" id="chip-calls" role="button" tabindex="0">calls</span>
+    <span class="chip on" id="chip-imports" role="button" tabindex="0">imports</span>
+  </div>
+
+  <div class="grp" id="grp-fx" aria-label="Effects">
+    <button class="btn active" id="btn-fx" title="Toggle visual effects">⚡ fx</button>
+    <button class="btn" id="btn-pulse" title="Replay bloom animation">⟳</button>
+  </div>
+
+  <div class="grp" aria-label="Exports">
+    <button class="btn" id="btn-dot" title="Copy graph as Graphviz DOT">⤓ DOT</button>
+    <button class="btn" id="btn-json" title="Save graph as JSON">⤓ JSON</button>
+    <button class="btn" id="btn-png" title="Save graph as PNG">PNG</button>
+    <button class="btn" id="btn-fit" title="Fit graph to window" aria-label="Fit to window">⛶</button>
+    <button class="btn" id="btn-search" title="Search nodes (⌘F)">⌕</button>
+  </div>
+</div>
+
+<!-- ── Breadcrumb nav (P3 repo-map LOD) ─────────────────────────────────── -->
+<nav id="breadcrumb" aria-label="Graph navigation level"></nav>
+
+<!-- ── Disambiguation bar (multiple implementations of same symbol) ─────── -->
+<div id="disambig-bar" role="navigation" aria-label="Implementation selector"></div>
+<div id="db-tip" role="tooltip" aria-hidden="true"></div>
+
+<div id="tip" role="tooltip" aria-hidden="true"></div>
+
+<!-- ── Blast bar ────────────────────────────────────────────────────────── -->
+<div id="blastbar" style="display:none" role="status" aria-live="polite">
+  <div class="blast-icon" aria-hidden="true">⊗</div>
+  <span>Blast radius of <strong id="blastName"></strong></span>
+  <span class="meta" id="blastMeta"></span>
+  <button class="btn" id="blastExit">✕ exit blast view</button>
+</div>
+
+<!-- ── Main canvas area ─────────────────────────────────────────────────── -->
+<div id="main">
+  <div id="fxAurora" aria-hidden="true">
+    <div class="blob b1"></div>
+    <div class="blob b2"></div>
+    <div class="blob b3"></div>
+  </div>
+  <canvas id="bgfx" aria-hidden="true"></canvas>
+  <div id="cy" role="application" aria-label="Code dependency graph"></div>
+
+  <div id="node-search" style="display:none" role="search" aria-label="Search nodes">
+    <input id="node-search-input" type="text" placeholder="Search nodes…" autocomplete="off" spellcheck="false">
+    <ul id="node-search-results" role="listbox"></ul>
+  </div>
+
+  <div id="tilemap" role="grid" aria-label="Repository package overview">
+    <canvas id="tilemap-edges" aria-hidden="true"></canvas>
+    <div id="tilemap-tiles"></div>
+  </div>
+  <div id="spotlight" aria-hidden="true"></div>
+  <div id="halo" aria-hidden="true"></div>
+
+  <div class="col-head" id="colCallers" aria-hidden="true">callers · hop −2 · −1</div>
+  <div class="col-head" id="colRoot"    aria-hidden="true">root</div>
+  <div class="col-head" id="colDeps"    aria-hidden="true">hop +1 · +2 · dependencies</div>
+
+  <div id="banner" role="status" aria-live="polite"></div>
+  <div id="hint" aria-live="polite"></div>
+
+  <div id="zoomCtl" aria-label="Zoom controls">
+    <button class="btn" id="btn-zoom-in" aria-label="Zoom in">＋</button>
+    <button class="btn" id="btn-zoom-out" aria-label="Zoom out">－</button>
+  </div>
+
+  <div id="minimapBox" aria-hidden="true">
+    <canvas id="minimap" width="176" height="106"></canvas>
+  </div>
+
+  <div id="peek" role="dialog" aria-label="Definition peek" aria-modal="false">
+    <div id="peekHead">
+      <span style="color:#86df86" aria-hidden="true">↗</span>
+      <span class="pk-path" id="peekPath"></span>
+      <span class="pk-note">peek · <kbd>Enter</kbd> opens editor</span>
+      <button class="pk-close" id="btn-peek-close" aria-label="Close peek panel">✕</button>
+    </div>
+    <div id="peekBody" role="region" aria-label="Source code preview"></div>
+    <div id="peekActions">
+      <button class="btn-action" id="peekJumpBtn">↗ Open in editor</button>
+    </div>
+  </div>
+
+  <div id="detail" role="complementary" aria-label="Node detail"></div>
+</div>
+
+<!-- ── Status bar ───────────────────────────────────────────────────────── -->
+<div id="statusbar" role="status" aria-live="polite">
+  <span id="fresh"><span class="dot-pulse" aria-hidden="true"></span><span id="freshText">connecting…</span></span>
+  <span id="statusGraph">—</span>
+  <span id="noiseBadge" style="display:none" aria-live="polite"></span>
+  <span id="diagBadge" style="display:none" aria-live="polite"></span>
+  <div class="legend" aria-label="Node type legend">
+    <span class="lg"><span class="dot ring" style="border-color:#86df86" aria-hidden="true"></span>function</span>
+    <span class="lg"><span class="dot ring" style="border-color:#fcd053" aria-hidden="true"></span>class · var</span>
+    <span class="lg"><span class="dot ring" style="border-color:#b3b3b3" aria-hidden="true"></span>file</span>
+    <span class="lg"><span class="dot ring" style="border-color:#e2d4ca" aria-hidden="true"></span>interface</span>
+  </div>
+</div>
+
+<script src="/assets/common.js"></script>
+<script src="/assets/graph-host.js"></script>
+<script src="/assets/cytoscape.min.js"></script>
+<script src="/assets/graph.js"></script>
+</body>
+</html>

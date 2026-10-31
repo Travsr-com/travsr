@@ -32,6 +32,7 @@ mod serve;
 mod sidecar_health;
 mod status;
 mod synonym;
+mod ui;
 
 use anyhow::{Context as _, Result};
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
@@ -377,6 +378,26 @@ enum Command {
         /// Directory containing tenant data subdirectories.
         #[arg(long)]
         tenants_dir: std::path::PathBuf,
+    },
+    /// Browse the code graph in a web browser: repo status, symbol search,
+    /// callers, dependencies, blast radius and the repo map. Read-only; serves
+    /// on this machine only unless --allow-remote is given.
+    Ui {
+        /// Address to bind on: an IP address, or localhost. Must be a
+        /// loopback address unless --allow-remote is also given.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port to serve on (0 picks a free one).
+        #[arg(long, default_value = "7330")]
+        port: u16,
+        /// Allow binding a non-loopback address. The page has no
+        /// authentication, so anyone who can reach the port can read the graph
+        /// and the source of every file in the index.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Open the page in the default browser once the server is up.
+        #[arg(long)]
+        open: bool,
     },
     /// Set up and manage full cross-file analysis per language.
     Lang {
@@ -1177,50 +1198,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                DaemonAction::Status => {
-                    match send_daemon_command(&repo_root, &travsr_ipc::ControlMessage::Status) {
-                        Ok(resp) => {
-                            let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
-                            println!("daemon: running [transport={transport}]");
-                            if let Some(msg) = resp.message {
-                                println!();
-                                println!("{msg}");
-                            }
-                        }
-                        // #685 review: a busy pipe or a timed-out exchange means
-                        // something IS listening on the control transport, so the
-                        // daemon is up, not starting and not absent. Only
-                        // transport-absent errors fall through to the repo-lock
-                        // starting/not-running classification below.
-                        Err(e) if transport_busy(&e) => {
-                            println!("daemon: running (control pipe busy, retry shortly)");
-                        }
-                        Err(e) if !transport_absent(&e) => {
-                            println!("daemon: running (not responding: {e:#})");
-                        }
-                        Err(_) => {
-                            // Socket not ready yet — the daemon may be alive but
-                            // still starting (store open, embed sidecar model
-                            // load, initial watcher scan; tens of seconds). The
-                            // liveness authority for that window is the repo-lock
-                            // flock, NOT the lock-file PID: on Windows the
-                            // daemon's exclusive flock makes the PID read fail
-                            // with a lock violation for its entire lifetime, so
-                            // the old PID fallback reported "not running" against
-                            // a live, still-starting daemon.
-                            if daemon_client::daemon_lock_held(&repo_root) {
-                                println!("daemon: starting (control socket not ready yet)");
-                            } else {
-                                match daemon_start_error(&repo_root) {
-                                    Some(r) => {
-                                        println!("daemon: not running (last start failed: {r})")
-                                    }
-                                    None => println!("daemon: not running"),
-                                }
-                            }
-                        }
-                    }
-                }
+                DaemonAction::Status => println!("{}", daemon_status_text(&repo_root)),
                 DaemonAction::Restart => {
                     // Deliver the stop through the daemon's startup window,
                     // exactly as `daemon stop` does. The old fire-and-forget
@@ -1664,6 +1642,12 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             serve::run(host, port, tenants_dir).await?;
         }
+        Command::Ui {
+            host,
+            port,
+            allow_remote,
+            open,
+        } => ui::run(host, port, allow_remote, open).await?,
         Command::Lang { action } => lang::run(action)?,
         Command::Synonym { action } => synonym::run(action)?,
         Command::Rerank { action } => rerank::run(action)?,
@@ -2295,6 +2279,49 @@ fn daemon_logs(
         // daemon that has stopped logging.
         out.flush()?;
         std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
+/// What `travsr daemon status` prints. A function so `travsr ui` can give the
+/// extension's Health page the same words without starting a process.
+pub(crate) fn daemon_status_text(repo_root: &std::path::Path) -> String {
+    match send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) {
+        Ok(resp) => {
+            let transport = if cfg!(windows) { "named_pipe" } else { "unix" };
+            let mut out = format!("daemon: running [transport={transport}]");
+            if let Some(msg) = resp.message {
+                out.push_str(&format!("\n\n{msg}"));
+            }
+            out
+        }
+        // #685 review: a busy pipe or a timed-out exchange means
+        // something IS listening on the control transport, so the
+        // daemon is up, not starting and not absent. Only
+        // transport-absent errors fall through to the repo-lock
+        // starting/not-running classification below.
+        Err(e) if transport_busy(&e) => {
+            "daemon: running (control pipe busy, retry shortly)".to_string()
+        }
+        Err(e) if !transport_absent(&e) => format!("daemon: running (not responding: {e:#})"),
+        Err(_) => {
+            // Socket not ready yet — the daemon may be alive but
+            // still starting (store open, embed sidecar model
+            // load, initial watcher scan; tens of seconds). The
+            // liveness authority for that window is the repo-lock
+            // flock, NOT the lock-file PID: on Windows the
+            // daemon's exclusive flock makes the PID read fail
+            // with a lock violation for its entire lifetime, so
+            // the old PID fallback reported "not running" against
+            // a live, still-starting daemon.
+            if daemon_client::daemon_lock_held(repo_root) {
+                "daemon: starting (control socket not ready yet)".to_string()
+            } else {
+                match daemon_start_error(repo_root) {
+                    Some(r) => format!("daemon: not running (last start failed: {r})"),
+                    None => "daemon: not running".to_string(),
+                }
+            }
+        }
     }
 }
 

@@ -319,6 +319,155 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// The read-only single-repo tools `travsr ui` (#1036) serves besides MCP:
+/// the ones the VS Code extension's Health, Graph, Callers, Dependencies,
+/// Blast radius and Repos pages call. Nothing here writes.
+///
+/// Both surfaces dispatch through [`browse_tool_text`], so the browser and an
+/// MCP client asking the same question get the same text by construction,
+/// not by keeping two copies of the argument defaults in step.
+pub const BROWSE_TOOLS: &[&str] = &[
+    "search_symbol",
+    "get_callers",
+    "get_dependencies",
+    "get_blast_radius",
+    "get_repo_map",
+    "get_graph_stats",
+    "get_graph_json",
+    "get_execution_path",
+    "get_lang_status",
+    "get_index_status",
+    "get_graph_health",
+    "repos_list",
+    "repo_languages",
+];
+
+/// The [`BROWSE_TOOLS`] that inspect the index rather than read the graph:
+/// they shell out to `git` (and `rustc`) or read the registry, so one can take
+/// as long as process start-up does on the machine. The daemon serves its
+/// control pipe one request at a time, so these are never served through it
+/// (its query dispatch refuses them) and `travsr ui` answers them from a
+/// read-only open instead. Routed through the daemon once, one kept it busy
+/// for ten minutes.
+pub const DIRECT_ONLY_TOOLS: &[&str] = &[
+    "get_index_status",
+    "get_graph_health",
+    "get_lang_status",
+    "repos_list",
+    "repo_languages",
+];
+
+/// Run one [`BROWSE_TOOLS`] tool on already-checked arguments. `None` for any
+/// other tool name.
+fn browse_tool_text(
+    store: &SqliteStore,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    Some(match tool_name {
+        "get_dependencies" => {
+            let file = args["file"].as_str().unwrap_or("");
+            let transitive = args["transitive"].as_bool().unwrap_or(false);
+            let depth = args["depth"].as_u64().unwrap_or(3).clamp(1, 10) as u32;
+            tools::get_dependencies(store, file, transitive, depth)
+        }
+        "get_callers" => {
+            let symbol = args["symbol"].as_str().unwrap_or("");
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::get_callers(store, symbol, path)
+        }
+        "get_blast_radius" => {
+            let file = args["file"].as_str().unwrap_or("");
+            let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
+                "semantic" => tools::AnalysisMode::Semantic,
+                _ => tools::AnalysisMode::TreeSitter,
+            };
+            let max_files = args["max_files"].as_u64().map(|n| n as usize);
+            tools::get_blast_radius(store, file, mode, max_files)
+        }
+        "search_symbol" => {
+            let name = args["name"].as_str().unwrap_or("");
+            let exact = args["exact"].as_bool().unwrap_or(false);
+            tools::search_symbol(store, name, exact)
+        }
+        "get_repo_map" => tools::get_repo_map(store),
+        "get_graph_stats" => tools::get_graph_stats(store),
+        "get_lang_status" => {
+            let file = args["file"].as_str().unwrap_or("");
+            tools::get_lang_status(store, file)
+        }
+        "get_execution_path" => {
+            let source = args["source"].as_str().unwrap_or("");
+            let sink = args["sink"].as_str().unwrap_or("");
+            tools::get_execution_path(store, source, sink)
+        }
+        "get_graph_json" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let direction = args["direction"].as_str().unwrap_or("both");
+            // McpClient sends Record<string,string> so depth arrives as a JSON
+            // string ("3"), not a number. Try numeric first for direct callers,
+            // then fall back to string parsing for the VS Code extension path.
+            let depth = args["depth"]
+                .as_u64()
+                .or_else(|| args["depth"].as_str().and_then(|s| s.parse::<u64>().ok()))
+                .unwrap_or(2)
+                .clamp(1, 4) as u8;
+            let kind_filter = args["kind_filter"].as_str().unwrap_or("");
+            // #318 O6: optional token budget (additive arg). 0 = unlimited,
+            // preserving pre-#318 behaviour when the arg is absent.
+            let token_budget = args["token_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .unwrap_or(0) as usize;
+            // #319 P3: LOD repo-map overview mode + package drill path_prefix.
+            let mode = args["mode"].as_str().unwrap_or("");
+            let path_prefix = args["path_prefix"].as_str().unwrap_or("");
+            // RFC-027 section 10: optional, and absent means "everything", so an
+            // existing caller keeps seeing the fresher graph unchanged.
+            let provenance = args["provenance"].as_str().unwrap_or("");
+            tools::get_graph_json(
+                store,
+                &tools::GraphJsonParams {
+                    query,
+                    direction,
+                    depth,
+                    kind_filter,
+                    token_budget,
+                    mode,
+                    path_prefix,
+                    provenance,
+                },
+            )
+        }
+        // VSCODE-247: the "Registered repos" webview's read half.
+        "repos_list" => tools::repos_list(),
+        "repo_languages" => tools::repo_languages(store),
+        // #636: read-only observability tools.
+        "get_index_status" => crate::observability::get_index_status(store),
+        "get_graph_health" => crate::observability::get_graph_health(store),
+        _ => return None,
+    })
+}
+
+/// Validate `args` against the stdio tool schema, then run a [`BROWSE_TOOLS`]
+/// tool exactly as `tools/call` would. `Err` carries the message an MCP client
+/// would see for the same bad call.
+pub fn browse_tool_call(
+    store: &SqliteStore,
+    tool_name: &str,
+    args: &serde_json::Value,
+) -> Result<String, String> {
+    if !BROWSE_TOOLS.contains(&tool_name) {
+        return Err(format!("unknown tool: {tool_name}"));
+    }
+    let args = check_tool_args(&tools_list(), tool_name, args)?;
+    Ok(browse_tool_text(store, tool_name, &args).unwrap_or_default())
+}
+
 fn handle_tool_call(
     store: &mut SqliteStore,
     id: serde_json::Value,
@@ -341,16 +490,8 @@ fn handle_tool_call(
     let _span = tracing::info_span!("mcp.tool_call", tool = tool_name, req = %id).entered();
     let started = std::time::Instant::now();
     let text = match tool_name {
-        "get_dependencies" => {
-            let file = args["file"].as_str().unwrap_or("");
-            let transitive = args["transitive"].as_bool().unwrap_or(false);
-            let depth = args["depth"].as_u64().unwrap_or(3).clamp(1, 10) as u32;
-            tools::get_dependencies(store, file, transitive, depth)
-        }
-        "get_callers" => {
-            let symbol = args["symbol"].as_str().unwrap_or("");
-            let path = args["path"].as_str().filter(|s| !s.is_empty());
-            tools::get_callers(store, symbol, path)
+        name if BROWSE_TOOLS.contains(&name) => {
+            browse_tool_text(store, name, args).unwrap_or_default()
         }
         "find_references" => {
             let symbol = args["symbol"].as_str().unwrap_or("");
@@ -363,15 +504,6 @@ fn handle_tool_call(
             let fixed = args["fixed"].as_bool().unwrap_or(false);
             let context = args["context"].as_u64().unwrap_or(0) as u32;
             tools::find_pattern(store, pattern, scope, fixed, context)
-        }
-        "get_blast_radius" => {
-            let file = args["file"].as_str().unwrap_or("");
-            let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
-                "semantic" => tools::AnalysisMode::Semantic,
-                _ => tools::AnalysisMode::TreeSitter,
-            };
-            let max_files = args["max_files"].as_u64().map(|n| n as usize);
-            tools::get_blast_radius(store, file, mode, max_files)
         }
         "get_architecture_brief" => {
             let provenance = args["provenance"].as_str().unwrap_or("ratified");
@@ -396,22 +528,6 @@ fn handle_tool_call(
                 width,
                 token_budget,
             )
-        }
-        "get_lang_status" => {
-            let file = args["file"].as_str().unwrap_or("");
-            tools::get_lang_status(store, file)
-        }
-        "search_symbol" => {
-            let name = args["name"].as_str().unwrap_or("");
-            let exact = args["exact"].as_bool().unwrap_or(false);
-            tools::search_symbol(store, name, exact)
-        }
-        "get_repo_map" => tools::get_repo_map(store),
-        "get_graph_stats" => tools::get_graph_stats(store),
-        "get_execution_path" => {
-            let source = args["source"].as_str().unwrap_or("");
-            let sink = args["sink"].as_str().unwrap_or("");
-            tools::get_execution_path(store, source, sink)
         }
         "get_context" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -467,48 +583,6 @@ fn handle_tool_call(
             let query = args["query"].as_str().unwrap_or("");
             crate::sanitize::sanitize_for_mcp(&tools::seed_trace(store, query))
         }
-        "get_graph_json" => {
-            let query = args["query"].as_str().unwrap_or("");
-            let direction = args["direction"].as_str().unwrap_or("both");
-            // McpClient sends Record<string,string> so depth arrives as a JSON
-            // string ("3"), not a number. Try numeric first for direct callers,
-            // then fall back to string parsing for the VS Code extension path.
-            let depth = args["depth"]
-                .as_u64()
-                .or_else(|| args["depth"].as_str().and_then(|s| s.parse::<u64>().ok()))
-                .unwrap_or(2)
-                .clamp(1, 4) as u8;
-            let kind_filter = args["kind_filter"].as_str().unwrap_or("");
-            // #318 O6: optional token budget (additive arg). 0 = unlimited,
-            // preserving pre-#318 behaviour when the arg is absent.
-            let token_budget = args["token_budget"]
-                .as_u64()
-                .or_else(|| {
-                    args["token_budget"]
-                        .as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .unwrap_or(0) as usize;
-            // #319 P3: LOD repo-map overview mode + package drill path_prefix.
-            let mode = args["mode"].as_str().unwrap_or("");
-            let path_prefix = args["path_prefix"].as_str().unwrap_or("");
-            // RFC-027 section 10: optional, and absent means "everything", so an
-            // existing caller keeps seeing the fresher graph unchanged.
-            let provenance = args["provenance"].as_str().unwrap_or("");
-            tools::get_graph_json(
-                store,
-                &tools::GraphJsonParams {
-                    query,
-                    direction,
-                    depth,
-                    kind_filter,
-                    token_budget,
-                    mode,
-                    path_prefix,
-                    provenance,
-                },
-            )
-        }
         // RFC-012 A2 F1: dynamic synonym management. Single-repo (stdio) only —
         // see `handle_tool_call_global` for the multi-repo rejection.
         "synonym_add" => tools::synonym_add(
@@ -532,10 +606,8 @@ fn handle_tool_call(
         "synonym_list" => tools::synonym_list(store),
         "synonym_reset" => tools::synonym_reset(store),
         // VSCODE-247: global-registry management for the "Registered repos" webview.
-        "repos_list" => tools::repos_list(),
         "repos_prune" => tools::repos_prune(),
         "repos_remove" => tools::repos_remove(args["name"].as_str().unwrap_or("")),
-        "repo_languages" => tools::repo_languages(store),
         "get_snippets" => {
             let symbols = args["symbols"].as_str().unwrap_or("");
             // McpClient (VS Code) sends args as JSON strings, so token_budget
@@ -554,7 +626,6 @@ fn handle_tool_call(
             tools::get_snippets(store, symbols, token_budget, mode, path)
         }
         // #636: read-only observability tools.
-        "get_index_status" => crate::observability::get_index_status(store),
         "get_daemon_logs" => {
             let tail = args["tail"]
                 .as_u64()
@@ -564,7 +635,6 @@ fn handle_tool_call(
             let level = args["level"].as_str().unwrap_or("info");
             crate::observability::get_daemon_logs(store, tail, level)
         }
-        "get_graph_health" => crate::observability::get_graph_health(store),
         other => {
             return error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"));
         }
@@ -2013,6 +2083,70 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// #1036: `travsr ui` must show what an MCP client would get. Every browse
+    /// tool, called the way the page calls it (string arguments), returns the
+    /// exact text of the matching `tools/call`.
+    #[test]
+    fn browse_tool_call_matches_tools_call() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for (tool, args) in [
+            (
+                "search_symbol",
+                serde_json::json!({ "name": "run", "exact": "true" }),
+            ),
+            (
+                "get_callers",
+                serde_json::json!({ "symbol": "run", "path": "src/a.rs" }),
+            ),
+            (
+                "get_dependencies",
+                serde_json::json!({ "file": "src/a.rs" }),
+            ),
+            (
+                "get_blast_radius",
+                serde_json::json!({ "file": "src/a.rs" }),
+            ),
+            ("get_repo_map", serde_json::json!({})),
+            ("get_graph_stats", serde_json::json!({})),
+            (
+                "get_graph_json",
+                serde_json::json!({ "query": "", "depth": "2", "mode": "overview" }),
+            ),
+            (
+                "get_execution_path",
+                serde_json::json!({ "source": "a", "sink": "b" }),
+            ),
+            ("get_lang_status", serde_json::json!({ "file": "src/a.rs" })),
+            ("get_index_status", serde_json::json!({})),
+            ("get_graph_health", serde_json::json!({})),
+            ("repo_languages", serde_json::json!({})),
+        ] {
+            let via_ui = browse_tool_call(&store, tool, &args).expect(tool);
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/call".into(),
+                params: Some(serde_json::json!({ "name": tool, "arguments": args })),
+            };
+            let resp = handle_request(&mut store, req).expect("tools/call answers");
+            let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(
+                v["result"]["content"][0]["text"].as_str(),
+                Some(via_ui.as_str()),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn browse_tool_call_refuses_other_tools_and_bad_args() {
+        let store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let err = browse_tool_call(&store, "synonym_add", &serde_json::json!({})).unwrap_err();
+        assert!(err.contains("unknown tool"), "{err}");
+        let err = browse_tool_call(&store, "get_callers", &serde_json::json!({})).unwrap_err();
+        assert!(err.contains("missing required argument `symbol`"), "{err}");
     }
 
     /// #1009: a wrong-typed, missing, empty or misspelled argument is a tool
