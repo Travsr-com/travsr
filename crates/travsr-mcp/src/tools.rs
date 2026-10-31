@@ -323,16 +323,17 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// The **live** half stays repo-wide and says so: it reports that an un-ratified
 /// overlay is in play at all, which is true of the whole graph the answer was
 /// drawn from, not of any one file in it.
-fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
+fn live_overlay_note(store: &SqliteStore, answer: &str, has_live_row: bool) -> Option<String> {
     // #1053: the live half says a call "is included and marked `live`", a claim
-    // about THIS answer, so it may only fire when this answer actually printed a
-    // live row. The repo-wide count alone fired it beside a not-found or
-    // zero-result answer that contains no rows at all, which reads as a direct
-    // contradiction. A live row carries `LIVE_MARKER`; the note is appended to
-    // `answer` only after this returns, so the marker is present here exactly
-    // when a row the answer rendered carries it. The count stays repo-wide (the
+    // about THIS answer, so it may only fire when this answer actually rendered a
+    // live edge. The repo-wide count alone fired it beside a not-found or
+    // zero-result answer that holds no such edge at all, which reads as a direct
+    // contradiction. `has_live_row` is that per-answer fact, computed by each
+    // caller in the terms of its own surface: a prose row carries `LIVE_MARKER`,
+    // while the JSON surface carries the edge's `live` provenance, so no single
+    // string test over `answer` can serve both. The count stays repo-wide (the
     // note says so); the gate decides only whether to speak, not the number.
-    let live = if answer.contains(LIVE_MARKER) {
+    let live = if has_live_row {
         store.count_edges_with_provenance("live").ok().unwrap_or(0)
     } else {
         0
@@ -560,7 +561,9 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
     // names, and a note already appended is not part of the answer.
     let notes = [
         phase_b_degraded_note(store),
-        live_overlay_note(store, &body),
+        // A prose row flags a live edge with `LIVE_MARKER`; its presence in the
+        // body (as it stands before any note is appended) is the per-answer gate.
+        live_overlay_note(store, &body, body.contains(LIVE_MARKER)),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ];
     let mut out = body;
@@ -627,10 +630,15 @@ fn with_head_note(store: &SqliteStore, body: String) -> String {
 /// (#617) and the index/HEAD mismatch note (#645), each already carried in the
 /// `signals` array the global aggregator merges. `head` is injectable for the
 /// same testability reason as [`append_head_note`].
+///
+/// `has_live` tells the live-overlay note whether this answer's subgraph carries
+/// an un-ratified edge: the JSON surface has no `LIVE_MARKER` to test for, so the
+/// caller derives it from the edges' `live` provenance (#1053).
 fn read_note_signals(
     store: &SqliteStore,
     head: Option<&str>,
     answer: &str,
+    has_live: bool,
 ) -> Vec<serde_json::Value> {
     let stored = store
         .get_meta("last_commit")
@@ -643,7 +651,7 @@ fn read_note_signals(
         // so a renderer or agent reading JSON is told just as plainly that this
         // answer includes un-ratified edges, and scoped against the same kind of
         // evidence (here the serialized nodes, which carry the file paths).
-        live_overlay_note(store, answer),
+        live_overlay_note(store, answer, has_live),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -10673,7 +10681,15 @@ fn get_graph_json_raw(
     // incomplete (#617) and index/HEAD drift (#645) are independent and may both
     // apply. Carried as JSON `signals` array items (never appended as prose) so
     // the JSON body still parses; the global aggregator already merges `signals`.
-    let signals = read_note_signals(store, head, &out["nodes"].to_string());
+    // #1053: the live half of the overlay note may speak only when this subgraph
+    // actually carries an un-ratified edge. The JSON body has no `LIVE_MARKER`
+    // (that is a prose-row flag), so the per-answer signal here is an emitted edge
+    // whose `provenance` is `live`, read back from the edges that survived into
+    // the answer.
+    let has_live_edge = out["edges"]
+        .as_array()
+        .is_some_and(|edges| edges.iter().any(|e| e["provenance"] == "live"));
+    let signals = read_note_signals(store, head, &out["nodes"].to_string(), has_live_edge);
     if !signals.is_empty() {
         out["signals"] = serde_json::Value::Array(signals);
     }
@@ -18825,7 +18841,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         assert!(
-            live_overlay_note(&store, "a.ts").is_none(),
+            live_overlay_note(&store, "a.ts", false).is_none(),
             "a repo with no uncommitted edits must get no note"
         );
 
@@ -18841,11 +18857,10 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        // #1053: the live half speaks only beside an answer that actually
-        // rendered a live row, so the probe answer carries the marker a real
-        // live row would.
-        let answer = format!("callers in a.ts:3{LIVE_MARKER}");
-        let note = live_overlay_note(&store, &answer).expect("an overlay must be announced");
+        // #1053: the live half speaks only when the answer actually rendered a
+        // live row, which the caller reports as `has_live_row`.
+        let note = live_overlay_note(&store, "callers in a.ts:3", true)
+            .expect("an overlay must be announced");
         assert!(
             note.contains("1 call found in edits not yet committed is included"),
             "singular form: {note}"
@@ -18858,7 +18873,12 @@ mod snippet_tests {
         // #1053: the same overlay beside an answer with no live row stays silent
         // rather than claiming a row was included where none is on screen.
         assert!(
-            live_overlay_note(&store, "No symbol named 'ReindexCommit' in the graph.").is_none(),
+            live_overlay_note(
+                &store,
+                "No symbol named 'ReindexCommit' in the graph.",
+                false
+            )
+            .is_none(),
             "the live half must not fire on an answer that printed no live row"
         );
     }
@@ -18890,12 +18910,12 @@ mod snippet_tests {
         // Calls are traced at HEAD: what is still pending is a call no commit
         // resolves (`Vec::new`), so "the next commit confirms them" is false.
         assert!(
-            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            live_overlay_note(&store, "callers in a.ts:3", false).is_none(),
             "no pending note while no edit awaits tracing"
         );
 
         store.set_meta("phase_b_dirty", "1").unwrap();
-        let note = live_overlay_note(&store, "callers in a.ts:3")
+        let note = live_overlay_note(&store, "callers in a.ts:3", false)
             .expect("a pending reference must be announced");
         assert!(
             note.contains("1 reference in the files above changed since the last commit and is not traced yet"),
@@ -18905,7 +18925,7 @@ mod snippet_tests {
         // Scoped, not ambient: an answer that never mentions `a.ts` must not be
         // told about `a.ts`'s gaps.
         assert!(
-            live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
+            live_overlay_note(&store, "callers in unrelated.ts:9", false).is_none(),
             "the pending half must not fire for a file the answer never names"
         );
 
@@ -18924,7 +18944,7 @@ mod snippet_tests {
         git(&["commit", "-q", "-m", "a"]);
         std::fs::write(repo.path().join("other.ts"), "").unwrap();
         assert!(
-            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            live_overlay_note(&store, "callers in a.ts:3", false).is_none(),
             "a committed file's pending rows were reported as changed"
         );
     }
@@ -19030,14 +19050,15 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        // #1053: both seams announce the overlay only beside an answer that
-        // rendered a live row, so each probe answer carries the marker a real
-        // live row would. What matters here is that neither seam gains or loses
-        // the note the other keeps.
+        // #1053: both seams announce the overlay only when the answer actually
+        // carried a live row. Each surface signals that in its own terms: the
+        // prose body carries `LIVE_MARKER`, the JSON seam is told `has_live`.
+        // What matters here is that neither seam gains or loses the note the
+        // other keeps.
         let prose = append_read_notes(&store, format!("body{LIVE_MARKER}"), None);
         assert!(prose.contains("marked `live`"), "prose: {prose}");
 
-        let signals = read_note_signals(&store, None, &format!("a.ts{LIVE_MARKER}"));
+        let signals = read_note_signals(&store, None, "a.ts", true);
         assert!(
             signals
                 .iter()
@@ -19110,7 +19131,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
 
-        let signals = read_note_signals(&store, Some("chk1111"), "a.ts");
+        let signals = read_note_signals(&store, Some("chk1111"), "a.ts", false);
         assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
 
         // Embedding them in a graph-json envelope must still parse as JSON.
@@ -19132,9 +19153,9 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
-        assert!(read_note_signals(&store, None, "a.ts").is_empty());
+        assert!(read_note_signals(&store, None, "a.ts", false).is_empty());
         // Caller at the same commit ⇒ still no head signal.
-        assert!(read_note_signals(&store, Some("idx0000"), "a.ts").is_empty());
+        assert!(read_note_signals(&store, Some("idx0000"), "a.ts", false).is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
@@ -19245,6 +19266,106 @@ mod snippet_tests {
         assert!(
             parsed.get("signals").is_none(),
             "complete graph must not emit signals; got: {raw}"
+        );
+    }
+
+    /// #1053: on the JSON surface the live half must fire exactly when the
+    /// returned subgraph carries an un-ratified edge. The gate used to look for
+    /// the prose `LIVE_MARKER`, which a JSON body never contains, so
+    /// get_graph_json stayed silent while serving a live edge.
+    #[test]
+    fn get_graph_json_announces_live_edge_in_subgraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let callee = make_fn_node_with_pkg("src/b.ts", "fn:beta", 1, 3);
+        let (caller_id, callee_id) = (caller.id, callee.id);
+        let mut store = make_store_with_root(&dir, &[caller, callee]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                caller_id,
+                callee_id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            provenance: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Precondition: the live edge really did reach the subgraph, so a pass
+        // cannot be for the wrong reason.
+        assert!(
+            raw.contains(r#""provenance":"live""#),
+            "the live edge must be in the subgraph: {raw}"
+        );
+        let signals = parsed["signals"].as_array().expect("signals array");
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("marked `live`")),
+            "JSON surface must announce the live overlay it is serving: {raw}"
+        );
+    }
+
+    /// #1053: a live edge elsewhere in the repo must not make get_graph_json
+    /// claim THIS subgraph includes one. The gate is per-answer; the repo-wide
+    /// count the note reports is not what decides whether it speaks.
+    #[test]
+    fn get_graph_json_silent_on_live_edge_outside_subgraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let other_src = make_fn_node_with_pkg("src/c.ts", "fn:gamma", 1, 3);
+        let other_dst = make_fn_node_with_pkg("src/d.ts", "fn:delta", 1, 3);
+        let (g_id, d_id) = (other_src.id, other_dst.id);
+        let mut store = make_store_with_root(&dir, &[seed, other_src, other_dst]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        // A live edge the alpha subgraph never reaches.
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                g_id,
+                d_id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+        // Precondition: the repo really does hold a live edge, so it is the gate,
+        // not an empty overlay, that keeps the note silent.
+        assert_eq!(store.count_edges_with_provenance("live").unwrap(), 1);
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            provenance: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            !raw.contains(r#""provenance":"live""#),
+            "the live edge must stay out of this subgraph: {raw}"
+        );
+        // Not `is_none_or`: clippy.toml pins msrv at 1.75 (ADR-001) and that is a
+        // 1.82 API, so `clippy::incompatible_msrv` would fail `-D warnings`.
+        assert!(
+            parsed
+                .get("signals")
+                .and_then(|s| s.as_array())
+                .map_or(true, |a| !a
+                    .iter()
+                    .any(|s| s.as_str().unwrap_or("").contains("marked `live`"))),
+            "live half must not fire when the subgraph holds no live edge: {raw}"
         );
     }
 
