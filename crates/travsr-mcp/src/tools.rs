@@ -324,7 +324,19 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// overlay is in play at all, which is true of the whole graph the answer was
 /// drawn from, not of any one file in it.
 fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
-    let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
+    // #1053: the live half says a call "is included and marked `live`", a claim
+    // about THIS answer, so it may only fire when this answer actually printed a
+    // live row. The repo-wide count alone fired it beside a not-found or
+    // zero-result answer that contains no rows at all, which reads as a direct
+    // contradiction. A live row carries `LIVE_MARKER`; the note is appended to
+    // `answer` only after this returns, so the marker is present here exactly
+    // when a row the answer rendered carries it. The count stays repo-wide (the
+    // note says so); the gate decides only whether to speak, not the number.
+    let live = if answer.contains(LIVE_MARKER) {
+        store.count_edges_with_provenance("live").ok().unwrap_or(0)
+    } else {
+        0
+    };
     // Only files edited since HEAD: the same count `travsr status` gives.
     let pending: u64 = crate::query::pending_refs_in_edited_files(store)
         .into_iter()
@@ -18829,7 +18841,11 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
+        // #1053: the live half speaks only beside an answer that actually
+        // rendered a live row, so the probe answer carries the marker a real
+        // live row would.
+        let answer = format!("callers in a.ts:3{LIVE_MARKER}");
+        let note = live_overlay_note(&store, &answer).expect("an overlay must be announced");
         assert!(
             note.contains("1 call found in edits not yet committed is included"),
             "singular form: {note}"
@@ -18837,6 +18853,13 @@ mod snippet_tests {
         assert!(
             note.contains("marked `live`"),
             "a reader must be told how to get ratified-only truth: {note}"
+        );
+
+        // #1053: the same overlay beside an answer with no live row stays silent
+        // rather than claiming a row was included where none is on screen.
+        assert!(
+            live_overlay_note(&store, "No symbol named 'ReindexCommit' in the graph.").is_none(),
+            "the live half must not fire on an answer that printed no live row"
         );
     }
 
@@ -19007,10 +19030,14 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        let prose = append_read_notes(&store, "body".to_string(), None);
+        // #1053: both seams announce the overlay only beside an answer that
+        // rendered a live row, so each probe answer carries the marker a real
+        // live row would. What matters here is that neither seam gains or loses
+        // the note the other keeps.
+        let prose = append_read_notes(&store, format!("body{LIVE_MARKER}"), None);
         assert!(prose.contains("marked `live`"), "prose: {prose}");
 
-        let signals = read_note_signals(&store, None, "a.ts");
+        let signals = read_note_signals(&store, None, &format!("a.ts{LIVE_MARKER}"));
         assert!(
             signals
                 .iter()
