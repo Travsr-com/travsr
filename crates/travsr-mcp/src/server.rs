@@ -550,7 +550,8 @@ fn handle_tool_call(
                 .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
                 as usize;
             let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
-            tools::get_snippets(store, symbols, token_budget, mode)
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::get_snippets(store, symbols, token_budget, mode, path)
         }
         // #636: read-only observability tools.
         "get_index_status" => crate::observability::get_index_status(store),
@@ -906,6 +907,10 @@ pub fn tools_list() -> serde_json::Value {
                             "enum": ["auto", "full", "skeleton"],
                             "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else a condensed structural outline. 'full': complete definition, no line cap. 'skeleton': structural outline only (signatures, no bodies)."
                         },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected. With a single bare name the hint hard-scopes (as in find_references); with several, it is a per-name filter, so a name absent under the hint keeps its matches from elsewhere and the result notes that the hint was skipped for it."
+                        },
                         "repo": {
                             "type": "string",
                             "description": "Restrict to a specific registered repo by name (global / multi-repo mode only)."
@@ -1202,7 +1207,8 @@ fn handle_tool_call_global(
                 .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
                 as usize;
             let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
-            tools::get_snippets_global(repos, symbols, token_budget, repo_arg, mode)
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::get_snippets_global(repos, symbols, token_budget, repo_arg, mode, path)
         }
         "synonym_add"
         | "synonym_set"
@@ -1459,6 +1465,10 @@ pub fn tools_list_global() -> serde_json::Value {
                             "type": "string",
                             "enum": ["auto", "full", "skeleton"],
                             "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else a condensed structural outline. 'full': complete definition, no line cap. 'skeleton': structural outline only (signatures, no bodies)."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected. With a single bare name the hint hard-scopes (as in find_references); with several, it is a per-name filter, so a name absent under the hint keeps its matches from elsewhere and the result notes that the hint was skipped for it."
                         },
                         "repo": {
                             "type": "string",

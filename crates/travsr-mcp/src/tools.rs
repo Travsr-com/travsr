@@ -15517,6 +15517,23 @@ enum SymbolToken<'a> {
     BareSig(&'a str),
 }
 
+/// The requested name a [`SymbolToken`] came from, for the `#1052` "no symbol
+/// matched" note. Echoes back what the caller can act on: the bare name for a
+/// bare signature, the `sig (path)` form for a full header (keep the path: it
+/// disambiguates which overload/location was looked up and failed), and the
+/// explicit `nodeId:`/`path:line` form for the coordinate tiers.
+fn token_display_name(tok: &SymbolToken<'_>) -> String {
+    match tok {
+        SymbolToken::NodeId(id) => format!("nodeId:{id}"),
+        SymbolToken::FullHeader { sig, path } => format!("{sig} ({path})"),
+        // Unreachable from the sole caller (the generic "no symbol matched"
+        // note): a PathLine token always resolves to a synthetic node, so it
+        // never reaches that note. Kept only for match exhaustiveness.
+        SymbolToken::PathLine { path, start, .. } => format!("{path}:{start}"),
+        SymbolToken::BareSig(sig) => (*sig).to_string(),
+    }
+}
+
 /// Split `symbols_arg` on newline / comma and classify each token into the
 /// appropriate [`SymbolToken`] resolution tier.
 ///
@@ -15693,6 +15710,7 @@ fn get_snippets_body(
     symbols_arg: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     // Read repo_root from meta — written by init_repo_with_progress.
     // Absent on indexes created before this feature; degrade gracefully.
@@ -15717,6 +15735,30 @@ fn get_snippets_body(
         return String::new();
     }
 
+    // #1052: how many distinct bare names the request carries. The shared `path`
+    // hint is hard-scoped only when it disambiguates a single bare name (parity
+    // with find_references); with several bare names it is a soft per-name
+    // filter, so a name living outside the hint keeps its unhinted matches.
+    // Counts BareSig only: a nodeId / path:line / full-header token is already
+    // path-pinned and never consults the hint, so it must not relax this rule.
+    // #1076: count distinct names, not occurrences, so a name repeated in the
+    // request (`foo,foo`) still reads as one bare name and keeps hard-scoping,
+    // instead of being misread as multi-name and dropped into the soft filter.
+    // Only the `path` hint branch below reads this, so compute it only when a
+    // hint is present; the common no-hint call then allocates nothing here.
+    let bare_sig_count = if path.is_some() {
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                SymbolToken::BareSig(sig) => Some(*sig),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    } else {
+        0
+    };
+
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
     // search_nodes_by_name (O(N) LIKE) is generally avoided for exact-match
@@ -15725,12 +15767,30 @@ fn get_snippets_body(
     // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
     // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
+    // #1052: per-name notes appended after the snippet blocks, each a full,
+    // ready-to-emit `[note: ...]` line, so the answer can say which request came
+    // back empty instead of dropping it without a trace. Mostly one line per
+    // requested name that produced no snippet, but NOT only hard misses: #1076
+    // also records here the informational note for a multi-name request whose
+    // shared hint was skipped for a name that DID resolve elsewhere, so an entry
+    // is not a reliable "produced no snippet" signal. Recorded at resolution
+    // time (before the budget cap), so a name that resolved but was later
+    // trimmed for budget is never reported here.
+    let mut unmatched: Vec<String> = Vec::new();
     for tok in &tokens {
+        let before = resolved.len();
+        let before_un = unmatched.len();
         match tok {
             // Tier 0: VS Code / internal callers pass the node's primary key.
             SymbolToken::NodeId(id) => match store.get_node(travsr_core::NodeId(*id)) {
                 Ok(Some(n)) if n.kind != "file" => resolved.push(n),
-                Ok(_) => {}
+                // The node exists but is a `file` container, which has no
+                // definition snippet. Say so, rather than letting the generic
+                // check below report a present node as "no symbol matched".
+                Ok(Some(_)) => unmatched.push(format!(
+                    "[note: 'nodeId:{id}' is a file, not a symbol with a snippet]"
+                )),
+                Ok(None) => {}
                 Err(e) => tracing::warn!("get_snippets nodeId:{id} lookup error: {e}"),
             },
 
@@ -15765,17 +15825,136 @@ fn get_snippets_body(
             // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
             SymbolToken::BareSig(sig) => {
+                // #1052: honour the caller's `path` hint. resolve_symbol_nodes
+                // can apply a hint itself, but only as an internal `retain` that
+                // hard-scopes and reports nothing back. We need the per-node
+                // match mask here to (a) soft-filter in a multi-name request and
+                // (b) tell a single-name hint miss apart from a genuine absence,
+                // so resolve unhinted and apply the mask in this scope.
                 let mut nodes = resolve_symbol_nodes(store, sig, None);
+                let existed = !nodes.is_empty();
+                let mut dropped_by_hint = false;
+                if let Some(p) = path {
+                    // One `path_hint_matches` pass: the mask is reused for the
+                    // `any` test and the retain, since path_hint_matches
+                    // allocates per node and the old two-pass form did it twice.
+                    let keep: Vec<bool> = nodes
+                        .iter()
+                        .map(|n| path_hint_matches(&n.vname.path, p))
+                        .collect();
+                    let any = keep.iter().any(|&k| k);
+                    // One `path` hint is shared by every name in a multi-name
+                    // request, so a name living outside it keeps its unhinted
+                    // matches rather than being erased. A request with a single
+                    // bare name keeps find_references' hard path-scoping, so its
+                    // empty hinted set stands.
+                    if any || bare_sig_count == 1 {
+                        let mut i = 0;
+                        nodes.retain(|_| {
+                            let k = keep[i];
+                            i += 1;
+                            k
+                        });
+                        dropped_by_hint = !any && existed;
+                    } else if existed {
+                        // #1076: multi-name request and this name has no match
+                        // under the shared hint, so it kept its unhinted matches
+                        // above. Say the hint was skipped for it, so the caller is
+                        // not misled into reading these as hint-scoped.
+                        unmatched.push(format!(
+                            "[note: '{sig}' is not under path hint '{p}'; \
+                             showing its matches from elsewhere]"
+                        ));
+                    }
+                }
                 // Reorder before the cap so a tracked definition is never the
                 // one dropped when more than MAX_SIGNATURE_MATCHES names match.
                 prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+                // A single-name hint that filtered out every real match means
+                // "not under this path", not "nowhere": name the hint so a
+                // stale/off path is not read as a missing symbol. Genuine
+                // absence (no match even unhinted) falls through to the generic
+                // note below.
+                if resolved.len() == before && dropped_by_hint {
+                    unmatched.push(format!(
+                        "[note: no symbol matched '{sig}' under path hint \
+                         '{}'; it exists outside that path]",
+                        path.unwrap_or("")
+                    ));
+                }
             }
+        }
+        // #1052: this token added nothing to the result set, and no tier above
+        // already recorded a more specific note for it (e.g. a file node).
+        if resolved.len() == before && unmatched.len() == before_un {
+            unmatched.push(format!(
+                "[note: no symbol matched '{}']",
+                token_display_name(tok)
+            ));
         }
     }
 
+    // #1052: a name repeated in the request (`foo,foo`) produces one identical
+    // note per occurrence; collapse duplicates so each unresolved name is
+    // reported once, preserving first-seen order.
+    if unmatched.len() > 1 {
+        let mut seen = std::collections::HashSet::new();
+        unmatched.retain(|n| seen.insert(n.clone()));
+    }
+
+    // #1076: a name repeated in the request (`foo,foo`), or two tokens that
+    // resolve to the same definition, each pushed an identical node. Collapse
+    // exact duplicates so one block renders and the footer count is honest,
+    // keyed by the fields that make a rendered block identical (path + span +
+    // kind + signature). This keeps genuinely distinct overloads (same name,
+    // different file) and distinct `path:line` windows apart.
+    if resolved.len() > 1 {
+        // Key the dedup on borrowed fields so a node is not cloned just to detect
+        // the (near-always absent) duplicate. `seen` is scoped so its borrow of
+        // `resolved` is released before the mutable `retain`, same one-pass-mask
+        // shape as the path-hint filter above.
+        let keep: Vec<bool> = {
+            let mut seen = std::collections::HashSet::new();
+            resolved
+                .iter()
+                .map(|n| {
+                    seen.insert((
+                        n.vname.path.as_str(),
+                        n.line,
+                        n.end_line,
+                        n.kind.as_str(),
+                        n.vname.signature.as_str(),
+                    ))
+                })
+                .collect()
+        };
+        let mut i = 0;
+        resolved.retain(|_| {
+            let k = keep[i];
+            i += 1;
+            k
+        });
+    }
+
     if resolved.is_empty() {
-        return "No symbols matching the provided names found in the graph.".to_string();
+        // #1052: name each token that matched nothing, rather than one generic
+        // line, so the caller can tell a typo from a missing symbol. Sanitised
+        // because a requested name is untrusted input.
+        let body = if unmatched.is_empty() {
+            "No symbols matching the provided names found in the graph.".to_string()
+        } else {
+            unmatched.join("\n")
+        };
+        // #1076: this body is only the per-name notes, no snippet payload, so a
+        // tiny token_budget must not shrink the cap below the notes themselves
+        // (budget=1 gave an 8-byte cap that cut "[note: no symbol matched ...]"
+        // down to "[note: "). Size the cap to the notes, still under the 1 MiB
+        // ceiling; the names are already bounded by the validated input length.
+        // Multiply by 4: sanitize escapes `<`/`>` to 4-byte entities AFTER the
+        // pre-truncation, so a raw-length cap would cut the tail of a note
+        // naming an angle-bracket symbol (`Vec<T>`); x4 is the worst case.
+        return sanitize_mcp_body_with_limit(&body, body.len().saturating_mul(4).min(1_024_000));
     }
 
     // Accumulate blocks within budget.  All symbols are equally requested so
@@ -15885,11 +16064,30 @@ fn get_snippets_body(
         return "Token budget too small to include any symbols.".to_string();
     }
 
-    let body = parts.join("\n\n");
-    let sanitized = sanitize_mcp_body_with_limit(
-        &body,
+    // Sanitise the snippet payload under the budget-derived cap.
+    let mut sanitized = sanitize_mcp_body_with_limit(
+        &parts.join("\n\n"),
         (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
     );
+    // #1052/#1076: append one note per requested name that produced no snippet.
+    // Each note is sanitised on its own, under a cap sized to its escaped-worst-
+    // case length (x4 for `<`/`>` expansion), NOT folded into the snippet body
+    // before the budget cap: a single large Full definition (the pin case) can
+    // fill that cap and would push appended notes off the end, silently
+    // dropping the "which name missed" answer #1052 guarantees. The names are
+    // bounded by the validated input length, so each note stays under 1 MiB.
+    for note in &unmatched {
+        sanitized.push_str("\n\n");
+        sanitized.push_str(&sanitize_mcp_body_with_limit(
+            note,
+            note.len().saturating_mul(4).min(1_024_000),
+        ));
+        // The notes are now always included in full, so folding their cost into
+        // the `~N tokens` footer is honest (the budget loop fixed tokens_used
+        // above). Same per-block estimate the loop uses (`+ 1` covers the
+        // separator).
+        tokens_used += note.len() / TOKEN_CHARS_PER_TOKEN + 1;
+    }
     let untracked_note = if shown_untracked {
         "\n[note: a definition shown is in an untracked (not-yet-committed) file; \
          it leaves the graph at the next commit.]"
@@ -15914,10 +16112,20 @@ pub fn get_snippets(
     symbols: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets rejected invalid arg: {reason}");
         return String::new();
+    }
+    // #1076: the `path` hint reaches only in-memory matching, never the
+    // filesystem, but validate it like get_callers/find_references so a
+    // pathological oversize hint can't be string-matched against every node.
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_snippets rejected invalid path arg: {reason}");
+            return String::new();
+        }
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     // `get_snippets_body` already sanitizes its body with a budget-derived limit
@@ -15925,7 +16133,7 @@ pub fn get_snippets(
     // Wrap-only here — like `get_context` — so the response honours `token_budget`
     // instead of being re-truncated to the 4 KiB scalar-output cap (which silently
     // dropped everything past ~6 symbols and cut off the summary footer).
-    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode))
+    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode, path))
 }
 
 pub(crate) fn get_snippets_raw(
@@ -15933,8 +16141,9 @@ pub(crate) fn get_snippets_raw(
     symbols: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
-    get_snippets_body(store, symbols, token_budget, mode)
+    get_snippets_body(store, symbols, token_budget, mode, path)
 }
 
 /// Global variant: searches across all registered repos (or a named one).
@@ -15944,14 +16153,22 @@ pub fn get_snippets_global(
     token_budget: usize,
     repo: Option<&str>,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets_global rejected invalid arg: {reason}");
         return String::new();
     }
+    // #1076: validate the `path` hint, same as the single-repo get_snippets.
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_snippets_global rejected invalid path arg: {reason}");
+            return String::new();
+        }
+    }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_snippets_raw(store, symbols, budget, mode);
+        let result = get_snippets_raw(store, symbols, budget, mode, path);
         if result.is_empty() || single {
             result
         } else {
@@ -16185,7 +16402,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(result.contains("function hello()"), "snippet body missing");
         assert!(result.contains("return 'hi'"), "snippet content missing");
         assert!(
@@ -16214,6 +16431,7 @@ mod snippet_tests {
             "method:ClassA.enableSupportForFeatureX",
             2000,
             SnippetMode::Auto,
+            None,
         );
         assert!(
             exact.contains("enableSupportForFeatureX() {"),
@@ -16221,14 +16439,20 @@ mod snippet_tests {
         );
 
         // 2. Plain function name works
-        let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        let plain = get_snippets_body(
+            &store,
+            "enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
         assert!(
             plain.contains("enableSupportForFeatureX() {"),
             "plain function name failed"
         );
 
         // 3. Bare class name works
-        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
+        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto, None);
         assert!(class.contains("class ClassA"), "bare class name failed");
 
         // 4. Dotted symbol name works
@@ -16237,17 +16461,438 @@ mod snippet_tests {
             "ClassA.enableSupportForFeatureX",
             2000,
             SnippetMode::Auto,
+            None,
         );
         assert!(
             dotted.contains("enableSupportForFeatureX() {"),
             "dotted symbol name failed"
         );
 
-        // 5. Unknown symbol
-        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
+        // 5. Unknown symbol (#1052): named in a per-name note, not dropped.
+        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto, None);
         assert!(
-            unknown.contains("No symbols matching the provided names found in the graph."),
-            "unknown symbol failed"
+            unknown.contains("[note: no symbol matched 'unknownSymbol']"),
+            "unknown symbol failed: {unknown}"
+        );
+    }
+
+    /// #1052 Repro A: a name that resolves to nothing must be named in a note,
+    /// not silently dropped, and the resolvable name must still be returned.
+    #[test]
+    fn get_snippets_body_notes_each_unresolved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(
+            &store,
+            "fn:hello\nfn:does_not_exist",
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
+        assert!(
+            out.contains("function hello()"),
+            "resolved snippet missing: {out}"
+        );
+        assert!(
+            out.contains("[note: no symbol matched 'fn:does_not_exist']"),
+            "unmatched name not noted: {out}"
+        );
+        // The footer counts only names that produced a block.
+        assert!(
+            out.contains("1 symbols, 1 with snippets"),
+            "footer wrong: {out}"
+        );
+    }
+
+    /// #1052 Repro B: a `path` hint scopes an overloaded bare name to one file,
+    /// same semantics as find_references.
+    #[test]
+    fn get_snippets_body_path_hint_scopes_overloaded_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function dup() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/x.ts"),
+            "function dup() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:dup", 1, 3),
+                make_fn_node("b/x.ts", "fn:dup", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        let out = get_snippets_body(&store, "dup", 2000, SnippetMode::Full, Some("b/x.ts"));
+        assert!(out.contains("b/x.ts"), "path-pinned file missing: {out}");
+        assert!(!out.contains("a/x.ts"), "unscoped file leaked: {out}");
+        assert!(out.contains("return 2"), "wrong definition returned: {out}");
+        assert!(
+            out.contains("1 symbols"),
+            "should resolve exactly one: {out}"
+        );
+    }
+
+    /// #1052: the single `path` hint is shared by every name in a multi-name
+    /// request. A name that lives outside the hinted path must still resolve
+    /// (fall back to its unhinted match) rather than be filtered out and then
+    /// reported "no symbol matched".
+    #[test]
+    fn get_snippets_body_path_hint_does_not_drop_names_outside_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // Hint pins to a/x.ts, where only foo lives; bar lives in b/y.ts and must
+        // survive via the unhinted fallback.
+        let out = get_snippets_body(&store, "foo\nbar", 2000, SnippetMode::Full, Some("a/x.ts"));
+        assert!(out.contains("return 1"), "hinted name foo missing: {out}");
+        assert!(
+            out.contains("return 2"),
+            "name outside the hint was dropped: {out}"
+        );
+        assert!(
+            !out.contains("no symbol matched 'bar'"),
+            "a present name outside the hint must not be called missing: {out}"
+        );
+    }
+
+    /// #1052 review: a single-name request hard-scopes to the `path` hint (no
+    /// unhinted fallback). When the hint filters out a symbol that exists
+    /// elsewhere, the note must name the hint and say the symbol exists outside
+    /// it, not report a bare "no symbol matched" that reads as "does not exist".
+    /// A genuinely-absent name must still get the plain note (no false blame on
+    /// the path).
+    #[test]
+    fn get_snippets_body_single_name_hint_miss_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // foo exists only in a/x.ts; the hint pins b/y.ts.
+        let out = get_snippets_body(&store, "foo", 2000, SnippetMode::Full, Some("b/y.ts"));
+        assert!(
+            out.contains("under path hint 'b/y.ts'") && out.contains("exists outside that path"),
+            "hint-miss note must name the path and say it exists elsewhere: {out}"
+        );
+
+        // A name that exists nowhere keeps the plain note, with no path blame.
+        let out = get_snippets_body(&store, "ghost", 2000, SnippetMode::Full, Some("b/y.ts"));
+        assert!(
+            out.contains("[note: no symbol matched 'ghost']"),
+            "genuinely-absent name must get the plain note: {out}"
+        );
+        assert!(
+            !out.contains("under path hint"),
+            "a nowhere name must not blame the path: {out}"
+        );
+    }
+
+    /// #1052 review: a name repeated in the request yields identical notes; they
+    /// must collapse to one line, not one per occurrence.
+    #[test]
+    fn get_snippets_body_repeated_unresolved_name_noted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "ghost,ghost", 2000, SnippetMode::Auto, None);
+        assert_eq!(
+            out.matches("no symbol matched 'ghost'").count(),
+            1,
+            "duplicate unresolved-name notes not collapsed: {out}"
+        );
+    }
+
+    /// #1076: a name repeated in the request (`foo,foo`) resolves the same node
+    /// set per occurrence; the identical blocks must collapse so the symbol is
+    /// shown once and the footer counts it once: the resolved-side mirror of
+    /// the duplicate-note collapse above.
+    #[test]
+    fn get_snippets_body_repeated_resolved_name_shown_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "function run() { /* a */ }\n").unwrap();
+        let store = make_store_with_meta(&[make_fn_node("a.ts", "fn:run", 1, 1)], dir.path());
+
+        let result = get_snippets_body(&store, "fn:run,fn:run", 2000, SnippetMode::Full, None);
+        assert_eq!(
+            result.matches("/* a */").count(),
+            1,
+            "duplicate resolved snippet not collapsed: {result}"
+        );
+        assert!(
+            result.contains("1 symbols"),
+            "footer must count the symbol once: {result}"
+        );
+    }
+
+    /// #1076: in a multi-name request the shared hint is a soft per-name filter.
+    /// A name with no match under the hint keeps its matches from elsewhere, and
+    /// a note must say the hint was skipped for it, so the caller does not read
+    /// the result as hint-scoped.
+    #[test]
+    fn get_snippets_body_multi_name_hint_miss_notes_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        let out = get_snippets_body(&store, "foo\nbar", 2000, SnippetMode::Full, Some("a/x.ts"));
+        assert!(
+            out.contains("return 2"),
+            "fallback match for bar missing: {out}"
+        );
+        assert!(
+            out.contains("'bar' is not under path hint 'a/x.ts'"),
+            "multi-name hint miss must be noted: {out}"
+        );
+    }
+
+    /// #1076 review: get_snippets resolves a single bare name unhinted and
+    /// re-applies the `path` hint in its own scope (to get the per-node mask),
+    /// rather than letting `resolve_symbol_nodes` apply it. Both sides share
+    /// `path_hint_matches`, but guard the equivalence so a future change to the
+    /// resolve-side hint handling that get_snippets does not track is caught
+    /// here instead of silently breaking the `--path` parity the schema promises.
+    #[test]
+    fn get_snippets_body_single_name_hint_matches_resolve_symbol_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function dup() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/x.ts"),
+            "function dup() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:dup", 1, 3),
+                make_fn_node("b/x.ts", "fn:dup", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // resolve_symbol_nodes is the hint authority the find_references path uses.
+        let hinted = resolve_symbol_nodes(&store, "dup", Some("b/x.ts"));
+        assert_eq!(hinted.len(), 1, "fixture should pin exactly one def");
+        let want = hinted[0].vname.path.clone();
+
+        let out = get_snippets_body(&store, "dup", 2000, SnippetMode::Full, Some("b/x.ts"));
+        assert!(
+            out.contains(want.as_str()),
+            "get_snippets must include the path resolve_symbol_nodes kept ({want}): {out}"
+        );
+        assert!(
+            !out.contains("a/x.ts"),
+            "get_snippets must not include a path resolve_symbol_nodes excluded: {out}"
+        );
+    }
+
+    /// #1076: the all-unresolved path returns only per-name notes. A tiny budget
+    /// must not truncate those notes (budget=1 once cut them to "[note: ").
+    #[test]
+    fn get_snippets_body_notes_survive_tiny_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "somemissingsymbol", 1, SnippetMode::Auto, None);
+        assert!(
+            out.contains("no symbol matched 'somemissingsymbol'"),
+            "tiny budget truncated the unresolved-name note: {out}"
+        );
+    }
+
+    /// #1076: the first resolved symbol is always included even when it alone
+    /// exceeds the budget (the pin-into-context case). A miss note for an
+    /// unresolved sibling must still survive that budget pressure, or the #1052
+    /// "name every miss" guarantee fails exactly when the payload is largest.
+    #[test]
+    fn get_snippets_body_notes_survive_a_large_pinned_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        // A definition far larger than the sanitize cap a small budget allows,
+        // so the snippet payload alone would fill it and crowd out the note.
+        let big: String = std::iter::once("function big() {".to_string())
+            .chain((0..400).map(|i| format!("  const x{i} = {i};")))
+            .chain(std::iter::once("}".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("big.ts"), big).unwrap();
+        let store = make_store_with_meta(&[make_fn_node("big.ts", "fn:big", 1, 402)], dir.path());
+
+        let out = get_snippets_body(&store, "big\nmissingsibling", 50, SnippetMode::Full, None);
+        assert!(
+            out.contains("no symbol matched 'missingsibling'"),
+            "miss note dropped under a large pinned snippet: {out}"
+        );
+    }
+
+    /// #1076: a miss note names the requested symbol verbatim, and sanitize
+    /// escapes `<`/`>` to 4-byte entities, so a cap sized to the raw note length
+    /// cut the closing bytes of an angle-bracket name. The whole note survives.
+    #[test]
+    fn get_snippets_body_unresolved_angle_bracket_name_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "Vec<Widget>", 2000, SnippetMode::Auto, None);
+        assert!(
+            out.contains("no symbol matched 'Vec&lt;Widget&gt;']"),
+            "angle-bracket miss note was truncated: {out}"
+        );
+    }
+
+    /// #1076: `foo,foo` is one distinct bare name, so the shared path hint must
+    /// hard-scope it (parity with find_references): a match only outside the hint
+    /// yields the single-name "under path hint" miss note, NOT the multi-name
+    /// "showing its matches from elsewhere" fallback.
+    #[test]
+    fn get_snippets_body_duplicate_single_name_keeps_hard_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(&[make_fn_node("a/x.ts", "fn:foo", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "foo,foo", 2000, SnippetMode::Full, Some("b/"));
+        assert!(
+            out.contains("no symbol matched 'foo' under path hint 'b/'"),
+            "duplicate single name lost hard-scoping: {out}"
+        );
+        assert!(
+            !out.contains("showing its matches from elsewhere"),
+            "duplicate single name wrongly took the multi-name fallback: {out}"
+        );
+    }
+
+    /// #1076: an invalid `path` hint is rejected like get_callers/find_references,
+    /// returning empty rather than being string-matched against every node.
+    #[test]
+    fn get_snippets_rejects_invalid_path_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets(
+            &store,
+            "hello",
+            2000,
+            SnippetMode::Auto,
+            Some("../etc/passwd"),
+        );
+        assert!(out.is_empty(), "invalid path hint must be rejected: {out}");
+    }
+
+    /// #1052: a `nodeId:` that resolves to a `file` container node exists but has
+    /// no definition snippet. It must be noted accurately, not reported as a
+    /// missing symbol (which misdescribes a present node).
+    #[test]
+    fn get_snippets_body_file_node_id_is_noted_not_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let file_node = CoreNode::new(
+            VName::new("corpus", "", "lib.ts", "typescript", "file:lib.ts"),
+            "file",
+        );
+        let store = make_store_with_meta(
+            &[make_fn_node("lib.ts", "fn:hello", 1, 3), file_node],
+            dir.path(),
+        );
+
+        // Resolve the file container node's id to pass it back as `nodeId:`.
+        let file_id = store
+            .search_nodes_by_name("file:lib.ts")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == "file")
+            .expect("a file container node exists")
+            .id;
+
+        let out = get_snippets_body(
+            &store,
+            &format!("nodeId:{}", file_id.0),
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
+        assert!(
+            out.contains("is a file, not a symbol"),
+            "file node should be noted accurately: {out}"
+        );
+        assert!(
+            !out.contains("no symbol matched"),
+            "a present file node must not be called missing: {out}"
         );
     }
 
@@ -16272,7 +16917,7 @@ mod snippet_tests {
         .with_end_line(31);
         let store = make_store_with_meta(&[class_node], dir.path());
 
-        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full);
+        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full, None);
         assert!(
             full.contains("last = true"),
             "full mode must include last line: {full}"
@@ -16282,7 +16927,7 @@ mod snippet_tests {
             "full mode must not be a skeleton: {full}"
         );
 
-        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto);
+        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto, None);
         assert!(
             auto.contains("[skeleton:") || !auto.contains("last = true"),
             "auto mode caps/skeletonises the oversized class: {auto}"
@@ -16300,7 +16945,7 @@ mod snippet_tests {
         let node = make_fn_node("s.ts", "fn:small", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton);
+        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton, None);
         assert!(
             skel.contains("[skeleton:"),
             "skeleton mode must render the AST summary even for a small fn: {skel}"
@@ -16313,7 +16958,7 @@ mod snippet_tests {
         let db_path = dir.path().join("graph.db");
         let store = SqliteStore::open(&db_path).unwrap();
         // No set_meta("repo_root") — simulates an old index.
-        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto, None);
         assert!(
             result.contains("travsr init"),
             "must prompt user to re-init: {result}"
@@ -16340,7 +16985,7 @@ mod snippet_tests {
         // Tight budget (5 tokens) — the first resolved symbol is always included
         // (so a single large definition is never dropped), but the second respects
         // the exhausted budget and must not appear.
-        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto);
+        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto, None);
         assert!(
             tight.contains("aaa"),
             "first symbol must always be included even under a tiny budget: {tight}"
@@ -16353,7 +16998,7 @@ mod snippet_tests {
         // Ordering budget (20 tokens) — enough for one symbol (header ~9 tokens +
         // 3-line snippet ~8 tokens = ~17 tokens) but not both. The first symbol
         // in request order ("aaa") must appear; the second ("bbb") must not.
-        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto);
+        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto, None);
         assert!(
             ordered.contains("aaa"),
             "first symbol must be included within budget: {ordered}"
@@ -16371,7 +17016,7 @@ mod snippet_tests {
         let node = make_fn_node("missing.ts", "fn:ghost", 1, 5);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto, None);
         // Should return metadata line without panic.
         assert!(
             result.contains("fn:ghost"),
@@ -16414,7 +17059,7 @@ mod snippet_tests {
             .put_file_hash("lib.ts", &sha256_hex_for_test(original.as_bytes()))
             .unwrap();
 
-        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             !fresh.contains("stale:"),
             "an unmodified file must not be flagged: {fresh}"
@@ -16425,7 +17070,7 @@ mod snippet_tests {
         // covers it.
         std::fs::write(&src, format!("// added\n// added\n{original}")).unwrap();
 
-        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             drifted.contains("stale:"),
             "a file edited since indexing must be disclosed, not answered \
@@ -16447,7 +17092,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full);
+        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full, None);
         assert!(
             out.contains("lib.ts:1-3"),
             "header must carry the path:start-end span: {out}"
@@ -16522,7 +17167,7 @@ mod snippet_tests {
         let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
         let store = make_store_with_meta(&[node_a, node_b], dir.path());
 
-        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full, None);
 
         // Both nodes must appear in the output.
         assert!(
@@ -16563,7 +17208,7 @@ mod snippet_tests {
 
         // Caller passes the full header with path — should resolve to a.ts only.
         let full_header = "fn:run (function) \u{2014} a.ts [package: mypkg]";
-        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full, None);
 
         assert!(
             result.contains("/* a */"),
@@ -16601,7 +17246,7 @@ mod snippet_tests {
             header.contains("a.ts:1"),
             "sanity: real header must carry the line locator: {header}"
         );
-        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full, None);
         assert!(
             result.contains("/* a */"),
             "must resolve a.ts from the real get_context header: {result}\nheader={header}"
@@ -16615,7 +17260,7 @@ mod snippet_tests {
         let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
         let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None, false);
         assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
-        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
+        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full, None);
         assert!(
             result_pkg.contains("/* a */") && !result_pkg.contains("/* b */"),
             "package-present header must also resolve a.ts only: {result_pkg}"
@@ -16754,7 +17399,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             result.contains("function hello()"),
             "snippet body missing: {result}"
@@ -16789,7 +17434,13 @@ mod snippet_tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let result = get_snippets_body(&store, "src/exact.ts:3-5", 2000, SnippetMode::Skeleton);
+        let result = get_snippets_body(
+            &store,
+            "src/exact.ts:3-5",
+            2000,
+            SnippetMode::Skeleton,
+            None,
+        );
 
         assert!(
             result.contains("line3"),
@@ -16821,7 +17472,7 @@ mod snippet_tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let out = get_snippets_body(&store, "src/win.ts:3", 2000, SnippetMode::Full);
+        let out = get_snippets_body(&store, "src/win.ts:3", 2000, SnippetMode::Full, None);
         assert!(
             out.contains("src/win.ts:3"),
             "header must cite the requested start line: {out}"
@@ -16853,7 +17504,13 @@ mod snippet_tests {
         assert_eq!(rows.len(), 1, "expected 1 node");
         let id = rows[0].id.0;
 
-        let result = get_snippets_body(&store, &format!("nodeId:{id}"), 2000, SnippetMode::Auto);
+        let result = get_snippets_body(
+            &store,
+            &format!("nodeId:{id}"),
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
         assert!(result.contains("return 99"), "snippet missing: {result}");
         assert!(result.contains("fn:direct"), "header missing: {result}");
     }
@@ -16876,7 +17533,7 @@ mod snippet_tests {
         }
         let store = make_store_with_meta(&nodes, dir.path());
 
-        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto, None);
 
         // Footer must report exactly MAX_SIGNATURE_MATCHES symbols resolved.
         assert!(
