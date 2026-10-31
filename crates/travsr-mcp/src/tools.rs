@@ -9920,8 +9920,9 @@ fn file_label(path: &str) -> &str {
 /// first node, dropping any edge whose later endpoint was cut, and reserving
 /// `header_bytes` for the envelope fields serialized alongside. Returns whether
 /// it truncated. `token_budget == 0` means unbounded and leaves the vectors
-/// untouched. This mirrors the symbol-mode budget pass in `get_graph_json_raw`;
-/// nodes must therefore be in a deterministic order so truncation is stable.
+/// untouched. This is the single budget pass shared by the symbol-mode graph in
+/// `get_graph_json_raw` and the overview/drill graphs; nodes must therefore be
+/// in a deterministic order so truncation is stable.
 fn apply_overview_budget(
     nodes_out: &mut Vec<serde_json::Value>,
     edges_out: &mut Vec<serde_json::Value>,
@@ -9944,10 +9945,14 @@ fn apply_overview_budget(
             .unwrap_or(0)
     };
     // Each node is charged its own JSON plus every edge whose later endpoint it
-    // is — an edge survives a prefix cut exactly when that endpoint does.
-    let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
+    // is — an edge survives a prefix cut exactly when that endpoint does. The
+    // `+ 1` on every element covers the comma that `serde_json` writes between
+    // array elements, so the summed cost does not undercount the serialized
+    // length (the fixed `{"nodes":[...],"edges":[...]}` scaffolding is absorbed
+    // by `header_bytes`).
+    let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len() + 1).collect();
     for e in edges_out.iter() {
-        cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
+        cost[at(e, "source").max(at(e, "target"))] += e.to_string().len() + 1;
     }
     let budget_bytes = token_budget
         .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
@@ -10087,8 +10092,17 @@ fn repo_overview_graph(
         })
         .collect();
 
-    // #1054: honour token_budget. Reserve ~48 bytes for the trailing envelope
-    // fields (mode + token_budget + truncated_by_budget).
+    // #1054: honour token_budget. Order nodes by `dependents` descending (tie
+    // broken by id for a stable cut) so a budget prefix keeps the most
+    // depended-on regions rather than the alphabetically-first ones. Reserve
+    // ~48 bytes for the trailing envelope fields (mode + token_budget +
+    // truncated_by_budget).
+    nodes_out.sort_by(|a, b| {
+        b["dependents"]
+            .as_u64()
+            .cmp(&a["dependents"].as_u64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
     let truncated_by_budget =
         apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, 48);
 
@@ -10131,7 +10145,7 @@ fn package_drill_graph(
         return r#"{"nodes":[],"edges":[],"mode":"prefix"}"#.to_string();
     }
 
-    let mut nodes_out: Vec<serde_json::Value> = Vec::new();
+    let mut file_nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut node_ids_out: HashSet<String> = HashSet::new();
 
     // Emit file nodes in a deterministic order: `prefix_paths` is a HashSet, and
@@ -10142,7 +10156,7 @@ fn package_drill_graph(
     for path in &sorted_prefix {
         let json_id = format!("file:{path}");
         node_ids_out.insert(json_id.clone());
-        nodes_out.push(serde_json::json!({
+        file_nodes_out.push(serde_json::json!({
             "id":    json_id,
             "label": file_label(path),
             "kind":  "file",
@@ -10151,6 +10165,7 @@ fn package_drill_graph(
         }));
     }
 
+    let mut ghost_nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut ghost_pkg_counts: HashMap<String, u32> = HashMap::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
     let mut edge_seen: HashSet<(String, String)> = HashSet::new();
@@ -10192,7 +10207,7 @@ fn package_drill_graph(
             *count += 1;
             if *count == 1 {
                 node_ids_out.insert(ghost_id.clone());
-                nodes_out.push(serde_json::json!({
+                ghost_nodes_out.push(serde_json::json!({
                     "id":    ghost_id.clone(),
                     "label": ghost_pkg,
                     "kind":  "ghost",
@@ -10210,6 +10225,16 @@ fn package_drill_graph(
             }
         }
     }
+
+    // Emit ghost package nodes BEFORE file nodes so a token_budget prefix cut
+    // keeps the cross-boundary dependency targets (and the edges into them)
+    // rather than dropping them with the tail of the file list (#1054). Ghost
+    // nodes are bounded by the distinct external packages imported, so this
+    // still leaves room for files under any sane budget. Sort them by id so the
+    // cut among ghosts is stable regardless of pair iteration order.
+    ghost_nodes_out.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let mut nodes_out = ghost_nodes_out;
+    nodes_out.extend(file_nodes_out);
 
     // #1054: honour token_budget. Reserve ~48 bytes plus the echoed path_prefix
     // for the trailing envelope fields (mode + path_prefix + budget fields).
@@ -10735,45 +10760,17 @@ fn get_graph_json_raw(
         };
 
     // #1013: the BFS charges `token_cost`, a fraction of a node's JSON, and
-    // nothing for edges, which are most of the bytes. Charge what is returned:
-    // each node's JSON plus every edge whose later endpoint it is (an edge
-    // survives a prefix cut exactly when that endpoint does), then keep the
-    // longest BFS prefix that fits. The seed always survives.
-    if token_budget > 0 && !nodes_out.is_empty() {
-        let index: HashMap<&str, usize> = nodes_out
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
-            .collect();
-        let at = |e: &serde_json::Value, end: &str| {
-            index
-                .get(e[end].as_str().unwrap_or(""))
-                .copied()
-                .unwrap_or(0)
-        };
-        let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
-        for e in &edges_out {
-            cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
-        }
-        // The header returned with the graph comes out of the same budget.
-        let header = coverage.to_string().len()
-            + serde_json::to_string(&ambiguous_candidates).map_or(0, |s| s.len());
-        let budget_bytes = token_budget
-            .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
-            .saturating_sub(header);
-        let mut used = cost[0];
-        let mut keep = 1;
-        while keep < cost.len() && used + cost[keep] <= budget_bytes {
-            used += cost[keep];
-            keep += 1;
-        }
-        if keep < nodes_out.len() {
-            truncated_by_budget = true;
-            // The budget, not the node cap, is what bounds this answer.
-            truncated = false;
-            edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
-            nodes_out.truncate(keep);
-        }
+    // nothing for edges, which are most of the bytes. Charge what is returned
+    // (each node's JSON plus every edge whose later endpoint it is) and keep the
+    // longest BFS prefix that fits — the shared overview-budget pass. The seed is
+    // node 0, so it always survives. The header returned with the graph comes out
+    // of the same budget.
+    let header = coverage.to_string().len()
+        + serde_json::to_string(&ambiguous_candidates).map_or(0, |s| s.len());
+    if apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, header) {
+        truncated_by_budget = true;
+        // The budget, not the node cap, is what bounds this answer.
+        truncated = false;
     }
 
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
@@ -10833,7 +10830,7 @@ pub fn get_graph_json_global(
         direction,
         depth,
         kind_filter,
-        token_budget: _,
+        token_budget,
         mode,
         path_prefix,
         provenance,
@@ -10846,7 +10843,7 @@ pub fn get_graph_json_global(
             }
         }
         // Overview mode: run per-repo and merge package tiles
-        return get_graph_json_global_overview(repos, repo, path_prefix, provenance);
+        return get_graph_json_global_overview(repos, repo, path_prefix, provenance, *token_budget);
     }
     if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
@@ -10952,6 +10949,7 @@ fn get_graph_json_global_overview(
     repo: Option<&str>,
     path_prefix: &str,
     provenance: &str,
+    token_budget: usize,
 ) -> String {
     use std::collections::HashMap as HMap;
 
@@ -10975,9 +10973,9 @@ fn get_graph_json_global_overview(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                // The multi-repo aggregator trims after merging, not per repo, so
-                // each repo's subgraph is requested unbounded (matches the symbol
-                // path above, which passes 0 for the per-repo budget).
+                // Request each repo's subgraph unbounded; the budget is applied
+                // once to the merged graph below (matches the symbol path above,
+                // which passes 0 for the per-repo budget).
                 let raw = overview_graph(&store, path_prefix, provenance, 0);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
@@ -10998,8 +10996,17 @@ fn get_graph_json_global_overview(
         }
     }
 
-    let nodes_out: Vec<&serde_json::Value> = merged_nodes.values().collect();
-    let edges_out: Vec<serde_json::Value> = merged_edges
+    // Order nodes by `dependents` descending (tie broken by id for a stable cut)
+    // so the trim below keeps the most depended-on tiles. Ghost/file nodes from a
+    // drill carry no `dependents`, so they fall back to the deterministic id sort.
+    let mut nodes_out: Vec<serde_json::Value> = merged_nodes.into_values().collect();
+    nodes_out.sort_by(|a, b| {
+        b["dependents"]
+            .as_u64()
+            .cmp(&a["dependents"].as_u64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    let mut edges_out: Vec<serde_json::Value> = merged_edges
         .iter()
         .map(|((src, tgt), count)| {
             serde_json::json!({
@@ -11011,11 +11018,22 @@ fn get_graph_json_global_overview(
         })
         .collect();
 
-    match serde_json::to_string(&serde_json::json!({
+    // #1054: honour token_budget on the merged graph. The per-repo subgraphs are
+    // requested unbounded (0 above) and trimmed once here, after the merge, so the
+    // budget bounds the combined result rather than each repo independently.
+    let truncated_by_budget =
+        apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, 48);
+
+    let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
         "mode":  "overview",
-    })) {
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("get_graph_json_global_overview serialization error: {e}");
@@ -14437,6 +14455,63 @@ mod tests {
 
         // Bounded: must truncate, flag it, echo the budget, and stay within a
         // small factor of budget * TOKEN_CHARS_PER_TOKEN bytes.
+        let budget = 50usize;
+        let raw = call(budget);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["truncated_by_budget"], true, "must flag truncation");
+        assert_eq!(v["token_budget"], budget as u64, "must echo the budget");
+        let n = v["nodes"].as_array().unwrap().len();
+        assert!((1..40).contains(&n), "must keep a non-empty prefix: {n}");
+        assert!(
+            raw.len() <= budget * travsr_retrieval::TOKEN_CHARS_PER_TOKEN + 256,
+            "output {} bytes exceeds budget {} tokens by more than slack",
+            raw.len(),
+            budget
+        );
+    }
+
+    #[test]
+    fn global_overview_honours_token_budget_after_merge() {
+        use travsr_core::{Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            // 40 crate-level components -> 40 pkg tiles once merged.
+            for i in 0..40 {
+                let path = format!("crates/c{i:02}/src/file.rs");
+                let n = Node::new(VName::new("", "", path.clone(), "rust", path), "file");
+                store.put_node(&n).unwrap();
+            }
+        }
+        let key = dir.path().to_string_lossy().to_string();
+        let repos: HashMap<String, PathBuf> = HashMap::from([(key, db)]);
+
+        let call = |budget: usize| {
+            get_graph_json_global(
+                &repos,
+                None,
+                &GraphJsonParams {
+                    query: "",
+                    direction: "both",
+                    depth: 2,
+                    kind_filter: "",
+                    provenance: "",
+                    token_budget: budget,
+                    mode: "overview",
+                    path_prefix: "",
+                },
+            )
+        };
+
+        // Unbounded: all 40 tiles, no budget fields.
+        let unbounded: serde_json::Value = serde_json::from_str(&call(0)).unwrap();
+        assert_eq!(unbounded["nodes"].as_array().unwrap().len(), 40);
+        assert!(unbounded.get("truncated_by_budget").is_none());
+
+        // Bounded: the budget is applied to the MERGED graph, so the SSE/global
+        // path must trim, flag it, echo the budget, and stay within a small factor
+        // of budget * TOKEN_CHARS_PER_TOKEN bytes (#1054).
         let budget = 50usize;
         let raw = call(budget);
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
