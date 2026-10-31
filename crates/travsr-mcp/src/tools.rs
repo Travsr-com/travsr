@@ -15735,16 +15735,23 @@ fn get_snippets_body(
         return String::new();
     }
 
-    // #1052: how many bare-name tokens the request carries. The shared `path`
+    // #1052: how many distinct bare names the request carries. The shared `path`
     // hint is hard-scoped only when it disambiguates a single bare name (parity
     // with find_references); with several bare names it is a soft per-name
     // filter, so a name living outside the hint keeps its unhinted matches.
     // Counts BareSig only: a nodeId / path:line / full-header token is already
     // path-pinned and never consults the hint, so it must not relax this rule.
+    // #1076: count distinct names, not occurrences, so a name repeated in the
+    // request (`foo,foo`) still reads as one bare name and keeps hard-scoping,
+    // instead of being misread as multi-name and dropped into the soft filter.
     let bare_sig_count = tokens
         .iter()
-        .filter(|t| matches!(t, SymbolToken::BareSig(_)))
-        .count();
+        .filter_map(|t| match t {
+            SymbolToken::BareSig(sig) => Some(*sig),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
@@ -15919,7 +15926,10 @@ fn get_snippets_body(
         // (budget=1 gave an 8-byte cap that cut "[note: no symbol matched ...]"
         // down to "[note: "). Size the cap to the notes, still under the 1 MiB
         // ceiling; the names are already bounded by the validated input length.
-        return sanitize_mcp_body_with_limit(&body, body.len().min(1_024_000));
+        // Multiply by 4: sanitize escapes `<`/`>` to 4-byte entities AFTER the
+        // pre-truncation, so a raw-length cap would cut the tail of a note
+        // naming an angle-bracket symbol (`Vec<T>`); x4 is the worst case.
+        return sanitize_mcp_body_with_limit(&body, body.len().saturating_mul(4).min(1_024_000));
     }
 
     // Accumulate blocks within budget.  All symbols are equally requested so
@@ -16029,23 +16039,30 @@ fn get_snippets_body(
         return "Token budget too small to include any symbols.".to_string();
     }
 
-    let mut body = parts.join("\n\n");
-    // #1052: append one note per requested name that produced no snippet, inside
-    // the body so the untrusted names are sanitised with everything else (the
-    // ASCII footer below is added after sanitisation and must stay name-free).
-    for note in &unmatched {
-        body.push_str("\n\n");
-        body.push_str(note);
-        // #1052: these notes are appended after the budget loop fixed
-        // tokens_used, so fold their cost in too or the footer's `~N tokens`
-        // understates the real payload for a budget-sensitive caller. Same
-        // per-block estimate the loop uses (`+ 1` covers the separator).
-        tokens_used += note.len() / TOKEN_CHARS_PER_TOKEN + 1;
-    }
-    let sanitized = sanitize_mcp_body_with_limit(
-        &body,
+    // Sanitise the snippet payload under the budget-derived cap.
+    let mut sanitized = sanitize_mcp_body_with_limit(
+        &parts.join("\n\n"),
         (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
     );
+    // #1052/#1076: append one note per requested name that produced no snippet.
+    // Each note is sanitised on its own, under a cap sized to its escaped-worst-
+    // case length (x4 for `<`/`>` expansion), NOT folded into the snippet body
+    // before the budget cap: a single large Full definition (the pin case) can
+    // fill that cap and would push appended notes off the end, silently
+    // dropping the "which name missed" answer #1052 guarantees. The names are
+    // bounded by the validated input length, so each note stays under 1 MiB.
+    for note in &unmatched {
+        sanitized.push_str("\n\n");
+        sanitized.push_str(&sanitize_mcp_body_with_limit(
+            note,
+            note.len().saturating_mul(4).min(1_024_000),
+        ));
+        // The notes are now always included in full, so folding their cost into
+        // the `~N tokens` footer is honest (the budget loop fixed tokens_used
+        // above). Same per-block estimate the loop uses (`+ 1` covers the
+        // separator).
+        tokens_used += note.len() / TOKEN_CHARS_PER_TOKEN + 1;
+    }
     let untracked_note = if shown_untracked {
         "\n[note: a definition shown is in an untracked (not-yet-committed) file; \
          it leaves the graph at the next commit.]"
@@ -16678,6 +16695,71 @@ mod snippet_tests {
         assert!(
             out.contains("no symbol matched 'somemissingsymbol'"),
             "tiny budget truncated the unresolved-name note: {out}"
+        );
+    }
+
+    /// #1076: the first resolved symbol is always included even when it alone
+    /// exceeds the budget (the pin-into-context case). A miss note for an
+    /// unresolved sibling must still survive that budget pressure, or the #1052
+    /// "name every miss" guarantee fails exactly when the payload is largest.
+    #[test]
+    fn get_snippets_body_notes_survive_a_large_pinned_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        // A definition far larger than the sanitize cap a small budget allows,
+        // so the snippet payload alone would fill it and crowd out the note.
+        let big: String = std::iter::once("function big() {".to_string())
+            .chain((0..400).map(|i| format!("  const x{i} = {i};")))
+            .chain(std::iter::once("}".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("big.ts"), big).unwrap();
+        let store = make_store_with_meta(&[make_fn_node("big.ts", "fn:big", 1, 402)], dir.path());
+
+        let out = get_snippets_body(&store, "big\nmissingsibling", 50, SnippetMode::Full, None);
+        assert!(
+            out.contains("no symbol matched 'missingsibling'"),
+            "miss note dropped under a large pinned snippet: {out}"
+        );
+    }
+
+    /// #1076: a miss note names the requested symbol verbatim, and sanitize
+    /// escapes `<`/`>` to 4-byte entities, so a cap sized to the raw note length
+    /// cut the closing bytes of an angle-bracket name. The whole note survives.
+    #[test]
+    fn get_snippets_body_unresolved_angle_bracket_name_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "Vec<Widget>", 2000, SnippetMode::Auto, None);
+        assert!(
+            out.contains("no symbol matched 'Vec&lt;Widget&gt;']"),
+            "angle-bracket miss note was truncated: {out}"
+        );
+    }
+
+    /// #1076: `foo,foo` is one distinct bare name, so the shared path hint must
+    /// hard-scope it (parity with find_references): a match only outside the hint
+    /// yields the single-name "under path hint" miss note, NOT the multi-name
+    /// "showing its matches from elsewhere" fallback.
+    #[test]
+    fn get_snippets_body_duplicate_single_name_keeps_hard_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(&[make_fn_node("a/x.ts", "fn:foo", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "foo,foo", 2000, SnippetMode::Full, Some("b/"));
+        assert!(
+            out.contains("no symbol matched 'foo' under path hint 'b/'"),
+            "duplicate single name lost hard-scoping: {out}"
+        );
+        assert!(
+            !out.contains("showing its matches from elsewhere"),
+            "duplicate single name wrongly took the multi-name fallback: {out}"
         );
     }
 

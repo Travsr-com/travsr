@@ -4350,9 +4350,14 @@ impl SqliteStore {
       -- #1052: a member-qualified signature (`variant:Enum.Member`,
       -- `method:Class.m`, scip `Type#member`) is a genuine name match on its
       -- trailing `.Member`/`#member`, just like the `:`-scoped case above. Rank
-      -- it 10 so it is not buried at ELSE 40 under unrelated path-substring hits
+      -- it above ELSE 40 so it is not buried under unrelated path-substring hits
       -- and truncated away by the LIMIT before the caller's name filter runs.
-      WHEN signature LIKE '%.' || ?1 OR signature LIKE '%#' || ?1 THEN 10
+      -- #1076: rank it 11, one below the `:`-scoped tier, NOT a tie at 10: a
+      -- flood of member homonyms (`method:X.id`) past the LIMIT would otherwise
+      -- break the `path ASC` tie against a genuine `:`-scoped definition and
+      -- push it out of the window. 11 keeps the member-leaf above the 20/40
+      -- flood tiers (the #1052 win) while the `:`-scoped match always sorts first.
+      WHEN signature LIKE '%.' || ?1 OR signature LIKE '%#' || ?1 THEN 11
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
       WHEN path LIKE '%/' || ?1 THEN 15
@@ -15720,6 +15725,46 @@ mod tests {
             hits.iter()
                 .any(|n| n.vname.signature == "variant:Command.Mcp"),
             "member-qualified variant was buried behind the path-substring flood"
+        );
+    }
+
+    /// #1076: the member-leaf tier (rank 11) sorts below the `:`-scoped tier
+    /// (rank 10), so a flood of same-kind member homonyms past the LIMIT can
+    /// never break the `path ASC` tie against a genuine `:`-scoped definition and
+    /// push it out of the window. This is the #1052 flood bug re-created for
+    /// `:`-scoped names if the two tiers were left tied at 10.
+    #[test]
+    fn scoped_name_survives_member_leaf_flood() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // The `:`-scoped definition (`fn:id` -> `%:id`, rank 10), on a path that
+        // sorts AFTER the flood so only its rank can keep it in the window.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "zzz/defs.rs", "rust", "fn:id"),
+                "function",
+            ))
+            .unwrap();
+        // Flood of member homonyms (`method:Widget{i}.id` -> `%.id`, rank 11),
+        // same function/method kind penalty (0), on paths that sort before the
+        // definition's: only the base-rank gap keeps `fn:id` in the window.
+        for i in 0..(NODE_NAME_SEARCH_LIMIT + 20) {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "",
+                        "",
+                        format!("aaa/widget_{i}.rs"),
+                        "rust",
+                        format!("method:Widget{i}.id"),
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        let hits = store.search_nodes_by_name("id").unwrap();
+        assert!(
+            hits.iter().any(|n| n.vname.signature == "fn:id"),
+            "`:`-scoped definition was buried behind the member-leaf flood"
         );
     }
 
