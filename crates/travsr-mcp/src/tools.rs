@@ -10146,7 +10146,6 @@ fn package_drill_graph(
     }
 
     let mut file_nodes_out: Vec<serde_json::Value> = Vec::new();
-    let mut node_ids_out: HashSet<String> = HashSet::new();
 
     // Emit file nodes in a deterministic order: `prefix_paths` is a HashSet, and
     // once token_budget truncation (below) keeps only a prefix, *which* files
@@ -10155,7 +10154,6 @@ fn package_drill_graph(
     sorted_prefix.sort_unstable();
     for path in &sorted_prefix {
         let json_id = format!("file:{path}");
-        node_ids_out.insert(json_id.clone());
         file_nodes_out.push(serde_json::json!({
             "id":    json_id,
             "label": file_label(path),
@@ -10206,7 +10204,6 @@ fn package_drill_graph(
             let count = ghost_pkg_counts.entry(ghost_pkg.clone()).or_insert(0);
             *count += 1;
             if *count == 1 {
-                node_ids_out.insert(ghost_id.clone());
                 ghost_nodes_out.push(serde_json::json!({
                     "id":    ghost_id.clone(),
                     "label": ghost_pkg,
