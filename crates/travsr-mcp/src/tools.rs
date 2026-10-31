@@ -550,7 +550,17 @@ fn repo_head_from_registry_path(db_path: &std::path::Path) -> Option<String> {
 /// `head` is the caller's live short HEAD (or `None` when git-less); split out
 /// as a parameter so the composition is deterministically testable without the
 /// process-global `LAUNCH_CWD`.
-fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+///
+/// `has_live` is the per-answer live signal (#1053): whether THIS answer drew on
+/// an un-ratified edge. The caller computes it in the terms of its own surface,
+/// because no single test over `body` serves every surface (see the note at the
+/// `live_overlay_note` call below).
+fn append_read_notes(
+    store: &SqliteStore,
+    body: String,
+    head: Option<&str>,
+    has_live: bool,
+) -> String {
     let stored = store
         .get_meta("last_commit")
         .ok()
@@ -561,9 +571,13 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
     // names, and a note already appended is not part of the answer.
     let notes = [
         phase_b_degraded_note(store),
-        // A prose row flags a live edge with `LIVE_MARKER`; its presence in the
-        // body (as it stands before any note is appended) is the per-answer gate.
-        live_overlay_note(store, &body, body.contains(LIVE_MARKER)),
+        // #1053: `has_live` is passed by the caller, not derived from `body`.
+        // get_callers / find_references flag a live edge with `LIVE_MARKER` in
+        // the body, but get_blast_radius / get_execution_path traverse live edges
+        // and render no marker at all, so a `body.contains(LIVE_MARKER)` gate here
+        // would silence the overlay note on those two surfaces forever. Each
+        // caller instead reports its own per-answer fact.
+        live_overlay_note(store, &body, has_live),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ];
     let mut out = body;
@@ -581,9 +595,9 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
 /// Production entry: resolves the caller's HEAD from the captured launch cwd
 /// (§ `LAUNCH_CWD`) and appends the advisory notes. Fail-safe — no cwd or no git
 /// means no head note.
-fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
+fn with_phase_b_note(store: &SqliteStore, body: String, has_live: bool) -> String {
     let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
-    append_read_notes(store, body, head.as_deref())
+    append_read_notes(store, body, head.as_deref(), has_live)
 }
 
 /// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
@@ -731,10 +745,9 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     } else {
         format!("[note: '{shown}' is in the graph but nothing calls or contains it.]")
     };
-    with_phase_b_note(
-        store,
-        wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT)),
-    )
+    let body = wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT));
+    let has_live = body.contains(LIVE_MARKER);
+    with_phase_b_note(store, body, has_live)
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
@@ -1372,7 +1385,8 @@ pub fn get_callers_global(
             .and_then(|db| repo_head_from_registry_path(db));
         let raw = get_callers_raw(store, symbol, path);
         answered |= !raw.is_empty();
-        let result = append_read_notes(store, raw, head.as_deref());
+        let has_live = raw.contains(LIVE_MARKER);
+        let result = append_read_notes(store, raw, head.as_deref(), has_live);
         if result.is_empty() || single {
             result
         } else {
@@ -1997,7 +2011,8 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         raw
     };
     let body = sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT);
-    wrap_envelope(&with_phase_b_note(store, body))
+    let has_live = body.contains(LIVE_MARKER);
+    wrap_envelope(&with_phase_b_note(store, body, has_live))
 }
 
 /// One resolved definition site, for the structured `find_references` result.
@@ -3861,10 +3876,13 @@ pub fn get_blast_radius(
     }
     // #617: append the Phase-B staleness note so a partial radius is not
     // trusted as the complete impact set.
-    with_phase_b_note(
-        store,
-        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode, max_files)),
-    )
+    // #1053: get_blast_radius renders no `LIVE_MARKER`, so its per-answer live
+    // signal is "a real affected set was produced". `get_blast_radius_raw` returns
+    // an empty string only for a seed that was not found, which is exactly the
+    // not-found case the live note must stay off for.
+    let raw = get_blast_radius_raw(store, file, mode, max_files);
+    let has_live = !raw.is_empty();
+    with_phase_b_note(store, sanitize_for_mcp(&raw), has_live)
 }
 
 fn get_blast_radius_raw(
@@ -4297,11 +4315,9 @@ pub fn get_blast_radius_global(
         let head = repos
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
-        let result = append_read_notes(
-            store,
-            get_blast_radius_raw(store, file, mode, max_files),
-            head.as_deref(),
-        );
+        let raw = get_blast_radius_raw(store, file, mode, max_files);
+        let has_live = !raw.is_empty();
+        let result = append_read_notes(store, raw, head.as_deref(), has_live);
         if result.is_empty() || single {
             result
         } else {
@@ -6993,10 +7009,15 @@ fn get_execution_path_with_filter(
     }
     // #617: append the Phase-B staleness note so "no path" is never trusted
     // while the call-edge set is known-incomplete.
-    with_phase_b_note(
-        store,
-        sanitize_for_mcp(&get_execution_path_body(store, source, sink, filter, true)),
-    )
+    // #1053: get_execution_path renders no `LIVE_MARKER`. A real path body begins
+    // with the render header "path (" (see `get_execution_path_body`), while every
+    // not-found / no-path / ambiguous outcome does not. That prefix is the
+    // per-answer live signal, read from the raw body before `sanitize_for_mcp`
+    // wraps it in the `<travsr-data>` envelope. It keeps the overlay note off the
+    // diagnostic answers it would otherwise contradict.
+    let raw = get_execution_path_body(store, source, sink, filter, true);
+    let has_live = raw.starts_with("path (");
+    with_phase_b_note(store, sanitize_for_mcp(&raw), has_live)
 }
 
 /// How one `get_execution_path` endpoint name resolved, after access filtering.
@@ -7357,11 +7378,9 @@ pub fn get_execution_path_global(
         let head = repos
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
-        let result = append_read_notes(
-            store,
-            get_execution_path_body(store, source, sink, filter, single),
-            head.as_deref(),
-        );
+        let body = get_execution_path_body(store, source, sink, filter, single);
+        let has_live = body.starts_with("path (");
+        let result = append_read_notes(store, body, head.as_deref(), has_live);
         if result.is_empty() || single {
             result
         } else {
@@ -18783,7 +18802,7 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "idx0000").unwrap();
 
         // Caller's HEAD differs from the index ⇒ note appended to the body.
-        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"));
+        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"), false);
         assert!(out.starts_with("real result"), "body preserved: {out}");
         assert!(
             out.contains("idx0000") && out.contains("chk1111"),
@@ -18792,12 +18811,12 @@ mod snippet_tests {
 
         // Same commit ⇒ no head note.
         assert_eq!(
-            append_read_notes(&store, "real result".to_string(), Some("idx0000")),
+            append_read_notes(&store, "real result".to_string(), Some("idx0000"), false),
             "real result"
         );
         // git-less caller ⇒ no head note.
         assert_eq!(
-            append_read_notes(&store, "real result".to_string(), None),
+            append_read_notes(&store, "real result".to_string(), None, false),
             "real result"
         );
     }
@@ -18808,7 +18827,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Empty body + mismatch: the note is the whole answer (no leading newline).
-        let out = append_read_notes(&store, String::new(), Some("chk1111"));
+        let out = append_read_notes(&store, String::new(), Some("chk1111"), false);
         assert!(out.starts_with("[note:"), "note is the body: {out}");
         assert!(
             !out.contains("\n[note:"),
@@ -18823,7 +18842,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
         // ...and the caller is at yet another commit ⇒ head note also fires.
-        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
+        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"), false);
         assert!(
             out.contains("calls are still being traced for this commit"),
             "phase-b note: {out}"
@@ -19055,7 +19074,7 @@ mod snippet_tests {
         // prose body carries `LIVE_MARKER`, the JSON seam is told `has_live`.
         // What matters here is that neither seam gains or loses the note the
         // other keeps.
-        let prose = append_read_notes(&store, format!("body{LIVE_MARKER}"), None);
+        let prose = append_read_notes(&store, format!("body{LIVE_MARKER}"), None, true);
         assert!(prose.contains("marked `live`"), "prose: {prose}");
 
         let signals = read_note_signals(&store, None, "a.ts", true);
@@ -19070,6 +19089,58 @@ mod snippet_tests {
         let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
         let text = serde_json::to_string(&out).unwrap();
         serde_json::from_str::<serde_json::Value>(&text).expect("body must stay valid JSON");
+    }
+
+    /// #1053 / #1077: get_blast_radius and get_execution_path render no
+    /// `LIVE_MARKER`, so their per-answer live signal is "a real result was
+    /// produced" (a non-empty radius, a rendered path). The overlay note must
+    /// fire beside a real answer drawn over an un-ratified edge, and stay silent
+    /// beside a not-found answer, the same contract the marker tools keep. A
+    /// `body.contains(LIVE_MARKER)` gate would leave both surfaces permanently
+    /// silent, which is the regression this test guards.
+    #[test]
+    fn marker_less_prose_tools_still_track_the_live_overlay() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        let caller = node_with("fn:execCaller", "function", "caller.ts");
+        let callee = node_with("fn:execCallee", "function", "callee.ts");
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                caller.id,
+                callee.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        // get_execution_path: a rendered path over the live edge carries the note.
+        let path = get_execution_path(&store, "execCaller", "execCallee");
+        assert!(path.contains("path ("), "a real path must render: {path}");
+        assert!(
+            path.contains("marked `live`"),
+            "a path built over an un-ratified edge must carry the live note: {path}"
+        );
+        // A sink that does not resolve is a not-found answer: stay silent.
+        let no_path = get_execution_path(&store, "execCaller", "ghostSink");
+        assert!(
+            !no_path.contains("marked `live`"),
+            "the live note must not fire beside a not-found path: {no_path}"
+        );
+
+        // get_blast_radius: a found seed yields a real radius over the live edge.
+        let blast = get_blast_radius(&store, "callee.ts", AnalysisMode::TreeSitter, None);
+        assert!(
+            blast.contains("marked `live`"),
+            "a blast radius over an un-ratified edge must carry the live note: {blast}"
+        );
+        // A missing file is the not-found case the note must stay off for.
+        let missing = get_blast_radius(&store, "ghost.ts", AnalysisMode::TreeSitter, None);
+        assert!(
+            !missing.contains("marked `live`"),
+            "the live note must not fire beside a not-found radius: {missing}"
+        );
     }
 
     /// Build a node for the overlay tests.
