@@ -9857,7 +9857,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
                 return "{}".to_string();
             }
         }
-        return overview_graph(store, path_prefix, provenance);
+        return overview_graph(store, path_prefix, provenance, *token_budget);
     }
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(*kind_filter, "" | "file") {
@@ -9915,8 +9915,65 @@ fn file_label(path: &str) -> &str {
     path.rfind('/').map_or(path, |i| &path[i + 1..])
 }
 
+/// Trim `(nodes, edges)` to the longest emission-order prefix whose JSON fits
+/// `token_budget` tokens (`* TOKEN_CHARS_PER_TOKEN` bytes), always keeping the
+/// first node, dropping any edge whose later endpoint was cut, and reserving
+/// `header_bytes` for the envelope fields serialized alongside. Returns whether
+/// it truncated. `token_budget == 0` means unbounded and leaves the vectors
+/// untouched. This mirrors the symbol-mode budget pass in `get_graph_json_raw`;
+/// nodes must therefore be in a deterministic order so truncation is stable.
+fn apply_overview_budget(
+    nodes_out: &mut Vec<serde_json::Value>,
+    edges_out: &mut Vec<serde_json::Value>,
+    token_budget: usize,
+    header_bytes: usize,
+) -> bool {
+    use std::collections::HashMap;
+    if token_budget == 0 || nodes_out.is_empty() {
+        return false;
+    }
+    let index: HashMap<&str, usize> = nodes_out
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
+        .collect();
+    let at = |e: &serde_json::Value, end: &str| {
+        index
+            .get(e[end].as_str().unwrap_or(""))
+            .copied()
+            .unwrap_or(0)
+    };
+    // Each node is charged its own JSON plus every edge whose later endpoint it
+    // is — an edge survives a prefix cut exactly when that endpoint does.
+    let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
+    for e in edges_out.iter() {
+        cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
+    }
+    let budget_bytes = token_budget
+        .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
+        .saturating_sub(header_bytes);
+    let mut used = cost[0];
+    let mut keep = 1;
+    while keep < cost.len() && used + cost[keep] <= budget_bytes {
+        used += cost[keep];
+        keep += 1;
+    }
+    if keep < nodes_out.len() {
+        edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
+        nodes_out.truncate(keep);
+        true
+    } else {
+        false
+    }
+}
+
 /// Entry point for `mode="overview"`. Routes by whether path_prefix is set.
-fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> String {
+fn overview_graph(
+    store: &SqliteStore,
+    path_prefix: &str,
+    provenance: &str,
+    token_budget: usize,
+) -> String {
     let file_nodes = match store.nodes_by_kind("file") {
         Ok(n) => n,
         Err(e) => {
@@ -9924,21 +9981,31 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> S
             return r#"{"nodes":[],"edges":[]}"#.to_string();
         }
     };
-    // Resolved cross-file dependency pairs (ref/call + resolves-to) — the same
-    // language-agnostic primitive the repo map uses. Replaces the old
-    // depends+resolves-to-only `file_import_pairs`, which produced ~0 edges here
-    // because top-level-dir buckets collapsed every intra-monorepo edge.
-    let pairs = match store.resolved_dep_pairs(provenance) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
-            vec![]
-        }
-    };
     if path_prefix.is_empty() {
-        repo_overview_graph(&file_nodes, &pairs)
+        // Resolved cross-file dependency pairs (ref/call + resolves-to) — the same
+        // language-agnostic primitive the repo map uses. The region-tile view is an
+        // architecture overview, so call edges belong here as well as imports.
+        let pairs = match store.resolved_dep_pairs(provenance) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
+                vec![]
+            }
+        };
+        repo_overview_graph(&file_nodes, &pairs, token_budget)
     } else {
-        package_drill_graph(&file_nodes, &pairs, path_prefix)
+        // #1054: the package drill labels every edge "imports", so it must be fed
+        // import-resolution pairs only. `resolved_dep_pairs` also folds in `ref/call`
+        // edges, and a Phase A bare-name call collision (e.g. `settle()` resolving to
+        // `bench/*.mjs:settle`) then surfaced as a ghost "imports" edge to pkg:bench.
+        let pairs = match store.file_import_pairs(provenance) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("overview_graph: file_import_pairs error: {e}");
+                vec![]
+            }
+        };
+        package_drill_graph(&file_nodes, &pairs, path_prefix, token_budget)
     }
 }
 
@@ -9948,7 +10015,11 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> S
 /// (crates/mcp -> crates/core) actually appears instead of collapsing into one
 /// `crates` self-edge. Nodes carry `dependents` so renderers can rank by it.
 // O(F + P) where F = file nodes, P = resolved pairs
-fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, String)]) -> String {
+fn repo_overview_graph(
+    file_nodes: &[travsr_core::Node],
+    pairs: &[(String, String)],
+    token_budget: usize,
+) -> String {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     let mut file_paths: HashSet<String> = HashSet::new();
@@ -9990,7 +10061,7 @@ fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, Strin
     let dep_edges: HashSet<(String, String)> = cross.keys().cloned().collect();
     let dependents = repo_region_dependents(&known, &dep_edges);
 
-    let nodes_out: Vec<serde_json::Value> = region_files
+    let mut nodes_out: Vec<serde_json::Value> = region_files
         .iter()
         .map(|(region, file_count)| {
             serde_json::json!({
@@ -10004,7 +10075,7 @@ fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, Strin
         })
         .collect();
 
-    let edges_out: Vec<serde_json::Value> = cross
+    let mut edges_out: Vec<serde_json::Value> = cross
         .iter()
         .map(|((src, dst), count)| {
             serde_json::json!({
@@ -10016,11 +10087,21 @@ fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, Strin
         })
         .collect();
 
-    match serde_json::to_string(&serde_json::json!({
+    // #1054: honour token_budget. Reserve ~48 bytes for the trailing envelope
+    // fields (mode + token_budget + truncated_by_budget).
+    let truncated_by_budget =
+        apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, 48);
+
+    let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
         "mode":  "overview",
-    })) {
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("repo_overview_graph serialization error: {e}");
@@ -10036,6 +10117,7 @@ fn package_drill_graph(
     file_nodes: &[travsr_core::Node],
     pairs: &[(String, String)],
     path_prefix: &str,
+    token_budget: usize,
 ) -> String {
     use std::collections::{HashMap, HashSet};
 
@@ -10052,7 +10134,12 @@ fn package_drill_graph(
     let mut nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut node_ids_out: HashSet<String> = HashSet::new();
 
-    for path in &prefix_paths {
+    // Emit file nodes in a deterministic order: `prefix_paths` is a HashSet, and
+    // once token_budget truncation (below) keeps only a prefix, *which* files
+    // survive must not depend on hash iteration order (#1054).
+    let mut sorted_prefix: Vec<&str> = prefix_paths.iter().copied().collect();
+    sorted_prefix.sort_unstable();
+    for path in &sorted_prefix {
         let json_id = format!("file:{path}");
         node_ids_out.insert(json_id.clone());
         nodes_out.push(serde_json::json!({
@@ -10124,12 +10211,26 @@ fn package_drill_graph(
         }
     }
 
-    match serde_json::to_string(&serde_json::json!({
+    // #1054: honour token_budget. Reserve ~48 bytes plus the echoed path_prefix
+    // for the trailing envelope fields (mode + path_prefix + budget fields).
+    let truncated_by_budget = apply_overview_budget(
+        &mut nodes_out,
+        &mut edges_out,
+        token_budget,
+        48 + path_prefix.len(),
+    );
+
+    let mut out = serde_json::json!({
         "nodes":       nodes_out,
         "edges":       edges_out,
         "mode":        "prefix",
         "path_prefix": path_prefix,
-    })) {
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("package_drill_graph serialization error: {e}");
@@ -10874,7 +10975,10 @@ fn get_graph_json_global_overview(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = overview_graph(&store, path_prefix, provenance);
+                // The multi-repo aggregator trims after merging, not per repo, so
+                // each repo's subgraph is requested unbounded (matches the symbol
+                // path above, which passes 0 for the per-repo budget).
+                let raw = overview_graph(&store, path_prefix, provenance, 0);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -14202,6 +14306,149 @@ mod tests {
         assert!(
             intra.is_some(),
             "intra-prefix edge must be emitted: {edges:?}"
+        );
+    }
+
+    // #1054 P1: the package drill labels every edge "imports", so a Phase A
+    // `ref/call` name-collision edge crossing the prefix boundary (e.g. a bare
+    // `settle()` resolving to `bench/run.mjs:settle`) must NOT surface as a ghost
+    // "imports" edge. Only depends->resolves-to import pairs may produce edges.
+    #[test]
+    fn package_drill_graph_excludes_refcall_ghost_edges() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // Inside the prefix: a file and a function defined in it.
+        let fmod = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "pkg/a/mod.ts"),
+            "file",
+        );
+        let caller = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "fn:gatherHealth"),
+            "function",
+        );
+        // A genuine cross-boundary import target (a file in another package).
+        let flib = Node::new(
+            VName::new("", "", "lib/x/lib.ts", "typescript", "lib/x/lib.ts"),
+            "file",
+        );
+        let imp = Node::new(
+            VName::new("", "", "lib/x/lib.ts", "typescript", "import:x"),
+            "import",
+        );
+        // A spurious cross-boundary CALL target (a function in bench/).
+        let settle = Node::new(
+            VName::new("", "", "bench/run.mjs", "javascript", "fn:settle"),
+            "function",
+        );
+        for n in [&fmod, &caller, &flib, &imp, &settle] {
+            store.put_node(n).unwrap();
+        }
+        // Real import: pkg/a/mod.ts --depends--> import --resolves-to--> lib/x/lib.ts
+        store
+            .put_edge(&Edge::new(fmod.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, flib.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        // Spurious call: fn:gatherHealth (pkg/a/mod.ts) --ref/call--> fn:settle (bench/run.mjs)
+        store
+            .put_edge(&Edge::new(caller.id, settle.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                provenance: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "pkg/a/",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mode"], "prefix");
+        let ids: Vec<&str> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        // The real import's ghost port is present.
+        assert!(
+            ids.contains(&"pkg:lib"),
+            "real import ghost pkg:lib must be present: {ids:?}"
+        );
+        // The ref/call target must NOT become a ghost import node.
+        assert!(
+            !ids.contains(&"pkg:bench"),
+            "ref/call edge must not surface as a ghost import to pkg:bench: {ids:?}"
+        );
+        let edges = v["edges"].as_array().unwrap();
+        assert!(
+            !edges.iter().any(|e| e["target"] == "pkg:bench"),
+            "no edge may target the ref/call ghost pkg:bench: {edges:?}"
+        );
+    }
+
+    // #1054 P2: overview/prefix mode must honour token_budget and emit the
+    // truncated_by_budget signal, like symbol and file mode already do.
+    #[test]
+    fn package_drill_graph_honours_token_budget() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for i in 0..40 {
+            let n = Node::new(
+                VName::new(
+                    "",
+                    "",
+                    format!("pkg/a/file{i:02}.ts"),
+                    "typescript",
+                    format!("pkg/a/file{i:02}.ts"),
+                ),
+                "file",
+            );
+            store.put_node(&n).unwrap();
+        }
+
+        let call = |budget: usize| {
+            get_graph_json(
+                &store,
+                &GraphJsonParams {
+                    query: "",
+                    direction: "both",
+                    depth: 2,
+                    kind_filter: "",
+                    provenance: "",
+                    token_budget: budget,
+                    mode: "overview",
+                    path_prefix: "pkg/a/",
+                },
+            )
+        };
+
+        // Unbounded: all 40 files, no budget fields.
+        let unbounded: serde_json::Value = serde_json::from_str(&call(0)).unwrap();
+        assert_eq!(unbounded["nodes"].as_array().unwrap().len(), 40);
+        assert!(unbounded.get("truncated_by_budget").is_none());
+
+        // Bounded: must truncate, flag it, echo the budget, and stay within a
+        // small factor of budget * TOKEN_CHARS_PER_TOKEN bytes.
+        let budget = 50usize;
+        let raw = call(budget);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["truncated_by_budget"], true, "must flag truncation");
+        assert_eq!(v["token_budget"], budget as u64, "must echo the budget");
+        let n = v["nodes"].as_array().unwrap().len();
+        assert!((1..40).contains(&n), "must keep a non-empty prefix: {n}");
+        assert!(
+            raw.len() <= budget * travsr_retrieval::TOKEN_CHARS_PER_TOKEN + 256,
+            "output {} bytes exceeds budget {} tokens by more than slack",
+            raw.len(),
+            budget
         );
     }
 
