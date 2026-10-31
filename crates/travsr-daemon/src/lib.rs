@@ -3282,7 +3282,7 @@ fn resolve_unresolved_calls(
         let filtered = if u.hint_crate.is_none() && bare_fn && filtered.len() > 1 {
             let imported_files = imported_files.get_or_insert_with(|| {
                 store
-                    .file_import_pairs()
+                    .file_import_pairs("")
                     .unwrap_or_else(|e| {
                         tracing::warn!("resolve_unresolved_calls: import pair lookup failed: {e}");
                         Vec::new()

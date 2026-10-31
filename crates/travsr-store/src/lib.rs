@@ -4901,24 +4901,44 @@ LIMIT ?4",
     /// src_path is the path of the node making the import (any kind: file, function, etc.).
     /// dst_path is the path of the resolved target file.
     /// Used by the graph-overview aggregation to compute cross-package edges.
-    pub fn file_import_pairs(&self) -> Result<Vec<(String, String)>, StoreError> {
+    ///
+    /// `provenance` filters with the same grammar as [`resolved_dep_pairs`]: `""`
+    /// returns everything, `"ratified"` drops `live` overlay edges, and any other
+    /// value is matched exactly on both the `depends` and `resolves-to` edge.
+    pub fn file_import_pairs(&self, provenance: &str) -> Result<Vec<(String, String)>, StoreError> {
         (|| -> AnyResult<Vec<(String, String)>> {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT n1.path, n2.path
+            // Built as SQL rather than a bound parameter because the shape of the
+            // predicate differs per mode, not just its value. `provenance` is
+            // never interpolated: the exact-match arm binds it.
+            let (pred_e1, pred_e2, bind_exact) = match provenance {
+                "" => ("", "", false),
+                "ratified" => (
+                    " AND e1.provenance <> 'live'",
+                    " AND e2.provenance <> 'live'",
+                    false,
+                ),
+                _ => (" AND e1.provenance = ?1", " AND e2.provenance = ?1", true),
+            };
+            let sql = format!(
+                "SELECT n1.path, n2.path
                      FROM edges e1
                      JOIN nodes n1 ON n1.id = e1.src
                      JOIN edges e2 ON e2.src = e1.dst AND e2.kind = 'resolves-to'
                      JOIN nodes n2 ON n2.id = e2.dst AND n2.kind = 'file'
-                     WHERE e1.kind = 'depends'",
-                )
+                     WHERE e1.kind = 'depends'{pred_e1}{pred_e2}"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
                 .context("preparing file_import_pairs query")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .context("executing file_import_pairs query")?;
+            let map_row =
+                |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            let rows = if bind_exact {
+                stmt.query_map([provenance], map_row)
+            } else {
+                stmt.query_map([], map_row)
+            }
+            .context("executing file_import_pairs query")?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding file_import_pairs row")?);
@@ -17765,7 +17785,7 @@ mod tests {
     #[test]
     fn file_import_pairs_empty_store_returns_empty() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert!(store.file_import_pairs().unwrap().is_empty());
+        assert!(store.file_import_pairs("").unwrap().is_empty());
     }
 
     #[test]
@@ -17785,7 +17805,7 @@ mod tests {
         store
             .put_edge(&Edge::new(src.id, imp.id, EdgeKind::Depends))
             .unwrap();
-        assert!(store.file_import_pairs().unwrap().is_empty());
+        assert!(store.file_import_pairs("").unwrap().is_empty());
     }
 
     #[test]
@@ -17813,10 +17833,67 @@ mod tests {
         store
             .put_edge(&Edge::new(imp.id, dst.id, EdgeKind::ResolvesTo))
             .unwrap();
-        let pairs = store.file_import_pairs().unwrap();
+        let pairs = store.file_import_pairs("").unwrap();
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "pkg/a/mod.ts");
         assert_eq!(pairs[0].1, "test/b/util.ts");
+    }
+
+    #[test]
+    fn file_import_pairs_honours_the_provenance_filter() {
+        // Same contract as resolved_dep_pairs: an un-ratified live import chain
+        // must not be handed to a caller that asked for ratified ground truth.
+        // Provenance is set by the write method; a whole chain is ratified only
+        // when both its edges are.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "typescript", sig), kind)
+        };
+        // Ratified chain: r_src --Depends--> r_imp --ResolvesTo--> r_dst
+        let r_src = mk("a/mod.ts", "a/mod.ts", "file");
+        let r_imp = mk("lib/x.ts", "import:x", "import");
+        let r_dst = mk("lib/x.ts", "lib/x.ts", "file");
+        // Live chain: l_src --Depends--> l_imp --ResolvesTo--> l_dst
+        let l_src = mk("a/mod2.ts", "a/mod2.ts", "file");
+        let l_imp = mk("lib/y.ts", "import:y", "import");
+        let l_dst = mk("lib/y.ts", "lib/y.ts", "file");
+        for n in [&r_src, &r_imp, &r_dst, &l_src, &l_imp, &l_dst] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(r_src.id, r_imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(r_imp.id, r_dst.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        store
+            .put_edge_live(&Edge::new(l_src.id, l_imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge_live(&Edge::new(l_imp.id, l_dst.id, EdgeKind::ResolvesTo))
+            .unwrap();
+
+        let all = store.file_import_pairs("").unwrap();
+        assert_eq!(all.len(), 2, "empty filter accepts every chain: {all:?}");
+
+        let ratified = store.file_import_pairs("ratified").unwrap();
+        assert_eq!(
+            ratified,
+            vec![("a/mod.ts".to_string(), "lib/x.ts".to_string())],
+            "`ratified` must drop the live import chain"
+        );
+
+        let live = store.file_import_pairs("live").unwrap();
+        assert_eq!(
+            live,
+            vec![("a/mod2.ts".to_string(), "lib/y.ts".to_string())],
+            "an exact provenance names one kind"
+        );
+
+        assert!(
+            store.file_import_pairs("ratifed").unwrap().is_empty(),
+            "unknown filter must match nothing"
+        );
     }
 
     // ── resolved_dep_pairs ────────────────────────────────────────────────────
