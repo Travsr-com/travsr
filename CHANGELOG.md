@@ -21,10 +21,14 @@ All notable changes to Travsr are documented here.
 
 ### Upgrading from 1.3.0
 
-Enum members are now indexed as `variant:Enum.Member` nodes and the signature
-format moves to v4, so run `travsr init --force` once after upgrading in any
-repository that defines enums. Identifier lookups now match by prefix instead of
-substring by default (see Changed). No config key changes.
+Run `travsr init` once in every repository after upgrading. The index
+signature format moves from v3 to v4 (enum members are now indexed as
+`variant:Enum.Member` nodes), and an older index is not updated in place: the
+commit hook skips it until it is rebuilt, and `travsr status` warns
+"this index was built with an older version of travsr". This applies to every
+existing index, not only repositories that define enums. Identifier lookups now
+match by prefix instead of substring by default (see Changed). No config key
+changes.
 
 ### Added
 
