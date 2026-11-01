@@ -47,6 +47,7 @@ const PAGES_HTML: &str = include_str!("assets/pages.html");
 const GRAPH_HTML: &str = include_str!("assets/graph.html");
 const SHELL_CSS: &str = include_str!("assets/shell.css");
 const NAV_CSS: &str = include_str!("assets/nav.css");
+const THEME_CSS: &str = include_str!("assets/theme.css");
 const COMMON_JS: &str = include_str!("assets/common.js");
 const HEALTH_JS: &str = include_str!("assets/health.js");
 const PAGES_JS: &str = include_str!("assets/pages.js");
@@ -163,6 +164,7 @@ fn router(state: Arc<UiState>) -> Router {
         // Assets.
         .route("/assets/shell.css", get(|| async { asset(CSS, SHELL_CSS) }))
         .route("/assets/nav.css", get(|| async { asset(CSS, NAV_CSS) }))
+        .route("/assets/theme.css", get(|| async { asset(CSS, THEME_CSS) }))
         .route("/assets/common.js", get(|| async { asset(JS, COMMON_JS) }))
         .route("/assets/health.js", get(|| async { asset(JS, HEALTH_JS) }))
         .route("/assets/pages.js", get(|| async { asset(JS, PAGES_JS) }))

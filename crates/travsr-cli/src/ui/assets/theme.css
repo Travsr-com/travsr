@@ -1,0 +1,178 @@
+/* travsr ui: the travsr.com palette.
+
+   Loaded last on every page, after shell.css / graph.css and nav.css, and
+   only re-points their variables (plus the few rules whose accent is not a
+   variable), so the layouts stay the extension's while the colours, type
+   and accent are the website's:
+
+     dark   bg #1A1A1A  surface #242424  text #F0EBE6  muted #9B9590
+            accent #E08C30  secondary #E2B546  success #8BD675
+     light  bg #F6F1ED  surface #EDE8E3  text #1A1A1A  muted #6B6560
+            accent #CF6A0A (text #994A06)  secondary #866000  success #2C681C
+
+   Orange is the accent (primary actions, the current page, links, focus,
+   headline figures), as on the site. Green stays, but only for "ok", as the
+   site uses it. The graph's node colours (function green, class gold, ...)
+   are the extension's legend and are left alone.
+
+   Fonts are the site's stacks (Noto Sans, Inria Serif, JetBrains Mono).
+   The page's CSP loads no remote fonts, so each falls back to the system
+   face when the font is not installed. */
+
+:root, body.vscode-dark {
+  --tsr-bg: #1A1A1A;
+  --tsr-surface: #242424;
+  --tsr-input: #2C2C2C;
+  --tsr-border: rgba(255, 255, 255, .12);
+  --tsr-border-soft: rgba(255, 255, 255, .07);
+  --tsr-text: #F0EBE6;
+  --tsr-muted: #9B9590;
+  --tsr-subtle: #7F7974;
+  --tsr-accent: #E08C30;
+  --tsr-accent-text: #E08C30;
+  --tsr-accent-fill: #E08C30;
+  --tsr-accent-deep: rgba(224, 140, 48, .14);
+  --tsr-accent-line: rgba(224, 140, 48, .45);
+  --tsr-on-accent: #1A1A1A;
+  --tsr-secondary: #E2B546;
+  --tsr-success: #8BD675;
+  --tsr-success-deep: rgba(139, 214, 117, .12);
+  --tsr-error: #F07560;
+  --tsr-glow: rgba(224, 140, 48, .09);
+  --tsr-font-sans: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --tsr-font-serif: "Inria Serif", Georgia, Cambria, serif;
+  --tsr-font-mono: "JetBrains Mono", "Fira Code", ui-monospace, Consolas, monospace;
+}
+body.vscode-light, body.vscode-high-contrast-light {
+  --tsr-bg: #F6F1ED;
+  --tsr-surface: #FBF8F5;
+  --tsr-input: #EDE8E3;
+  --tsr-border: rgba(0, 0, 0, .12);
+  --tsr-border-soft: rgba(0, 0, 0, .07);
+  --tsr-text: #1A1A1A;
+  --tsr-muted: #6B6560;
+  --tsr-subtle: #8A837D;
+  --tsr-accent: #CF6A0A;
+  --tsr-accent-text: #994A06;
+  /* The site's --color-primary-fill: white text on #CF6A0A falls short of
+     comfortable contrast, so filled controls use the darker shade. */
+  --tsr-accent-fill: #A85408;
+  --tsr-accent-deep: rgba(207, 106, 10, .10);
+  --tsr-accent-line: rgba(207, 106, 10, .40);
+  --tsr-on-accent: #FFFFFF;
+  --tsr-secondary: #866000;
+  --tsr-success: #2C681C;
+  --tsr-success-deep: rgba(44, 104, 28, .10);
+  --tsr-error: #B91C1C;
+  --tsr-glow: rgba(207, 106, 10, .07);
+}
+
+/* ── shell.css pages (Health, Callers, Dependencies, Blast radius, Repos) ── */
+body.ui-page, body.ui-page.vscode-dark, body.ui-page.vscode-light {
+  --bg: var(--tsr-bg); --bg-elev: var(--tsr-surface); --bg-input: var(--tsr-input);
+  --border: var(--tsr-border);
+  --fg: var(--tsr-text); --fg-muted: var(--tsr-muted); --fg-subtle: var(--tsr-subtle);
+  --green: var(--tsr-success); --green-deep: var(--tsr-success-deep);
+  --gold: var(--tsr-secondary);
+  --orange: var(--tsr-accent); --orange-deep: var(--tsr-accent-deep);
+  --error: var(--tsr-error);
+  --blue: var(--tsr-accent-text);
+  --vscode-font-family: var(--tsr-font-sans);
+  --vscode-editor-font-family: var(--tsr-font-mono);
+  background:
+    radial-gradient(1100px 420px at 50% -120px, var(--tsr-glow), transparent 70%),
+    var(--tsr-bg);
+  background-attachment: fixed;
+  font-family: var(--tsr-font-sans);
+}
+body.ui-page h2, body.ui-page h3 { font-family: var(--tsr-font-serif); letter-spacing: -.01em; }
+body.ui-page .phead h2 { font-size: 22px; }
+
+/* The accent, where the extension used green for "primary" rather than "ok". */
+body.ui-page .btn { border-radius: 8px; }
+body.ui-page .btn.primary {
+  background: var(--tsr-accent-fill); border-color: var(--tsr-accent-fill); color: var(--tsr-on-accent); font-weight: 600;
+}
+body.ui-page .btn.primary:hover:not(:disabled) { background: var(--tsr-accent-fill); filter: brightness(1.08); }
+body.ui-page .chip-btn.on,
+body.ui-page .pill-btn[aria-pressed="true"] {
+  background: var(--tsr-accent-deep); border-color: var(--tsr-accent); color: var(--tsr-accent-text);
+}
+body.ui-page .card { border-radius: 10px; border-color: var(--tsr-border-soft); }
+body.ui-page .card .v { color: var(--tsr-accent-text); font-family: var(--tsr-font-serif); }
+body.ui-page .card.warn .v { color: var(--tsr-secondary); }
+body.ui-page .card.bad .v { color: var(--tsr-error); }
+body.ui-page .hsec { border-color: var(--tsr-border-soft); border-radius: 10px; }
+body.ui-page .hsec > summary { background: transparent; }
+body.ui-page :focus-visible,
+body.ui-page input:focus, body.ui-page select:focus { outline: 2px solid var(--tsr-accent); outline-offset: 1px; }
+body.ui-page mark { background: var(--tsr-accent); color: var(--tsr-on-accent); }
+body.ui-page a, body.ui-page .link-btn, body.ui-page .ref { color: var(--tsr-accent-text); }
+body.ui-page .note-box { background: var(--tsr-accent-deep); border-color: var(--tsr-accent-line); }
+
+/* ── Navigation strip ─────────────────────────────────────────────────── */
+.tsr-nav, body.vscode-light .tsr-nav, body.vscode-high-contrast-light .tsr-nav {
+  --n-bg: var(--tsr-bg); --n-border: var(--tsr-border-soft); --n-fg: var(--tsr-text);
+  --n-muted: var(--tsr-muted); --n-subtle: var(--tsr-subtle); --n-input: var(--tsr-input);
+  --n-green: var(--tsr-accent-text); --n-green-deep: var(--tsr-accent-deep);
+  font-family: var(--tsr-font-sans);
+}
+.tsr-nav .tsr-brand span { font-family: var(--tsr-font-serif); font-weight: 400; font-size: 18px; }
+.tsr-nav .tsr-dot.ok { background: var(--tsr-success); }
+.tsr-nav .tsr-live[data-state="live"] { color: var(--tsr-success); border-color: var(--tsr-success); }
+
+/* ── Graph page (the extension's graph.css) ───────────────────────────── */
+/* Its brand accent is its green ramp; the site's is orange. Re-pointing the
+   ramp and the semantic tokens recolours the chrome (top bar, chips, panels,
+   status bar). A few glows are literal colours in graph.css, and node
+   colours by kind are graph.js's legend; both are left as the extension has
+   them. */
+body:not(.ui-page) {
+  --green-300: var(--tsr-accent); --green-400: var(--tsr-accent); --green-500: var(--tsr-accent-text);
+  --node: var(--tsr-accent);
+  --tint-green: var(--tsr-accent-deep); --line-green: var(--tsr-accent-line);
+  --bg: var(--tsr-bg); --bg-elev: var(--tsr-surface); --bg-input: var(--tsr-input);
+  --border: var(--tsr-border-soft); --border-mid: var(--tsr-border);
+  --fg: var(--tsr-text); --fg-muted: var(--tsr-muted); --fg-subtle: var(--tsr-subtle);
+  --font-ui: var(--tsr-font-sans); --font-mono: var(--tsr-font-mono); --font-display: var(--tsr-font-serif);
+}
+body:not(.ui-page) #topbar { background: var(--tsr-bg); }
+body:not(.ui-page) #topbar::after {
+  background: linear-gradient(90deg, transparent, var(--tsr-accent-line) 12%, transparent 60%);
+}
+body:not(.ui-page) ::selection { background: var(--tsr-accent-deep); }
+body:not(.ui-page) .btn.active { box-shadow: 0 0 10px var(--tsr-accent-deep); }
+body:not(.ui-page) #main {
+  background: radial-gradient(1000px 580px at 58% 34%, var(--tsr-glow), transparent 60%), var(--tsr-bg);
+}
+body:not(.ui-page) .b1 { background: radial-gradient(circle, var(--tsr-accent-deep), transparent 62%); }
+body:not(.ui-page) #spotlight { background: radial-gradient(circle, var(--tsr-glow), transparent 65%); }
+body:not(.ui-page) #halo { border-color: var(--tsr-accent-line); }
+body:not(.ui-page) #node-search-results li.active { background: var(--tsr-accent-deep); }
+/* Surfaces graph.css paints a fixed near-black, even in its light mode, which
+   left the light theme's text on grey islands. */
+body:not(.ui-page) .grp { background: var(--tsr-surface); border-color: var(--tsr-border-soft); }
+body:not(.ui-page) .grp-label { color: var(--tsr-muted); }
+body:not(.ui-page) #searchInput { background: var(--tsr-surface); color: var(--tsr-text); }
+body:not(.ui-page) #searchInput:focus {
+  background: var(--tsr-surface); border-color: var(--tsr-accent);
+  box-shadow: 0 0 0 3px var(--tsr-accent-deep);
+}
+body:not(.ui-page) #searchInput::placeholder { color: var(--tsr-subtle); }
+body:not(.ui-page) #searchWrap::after { background: var(--tsr-input); color: var(--tsr-muted); }
+body:not(.ui-page) .col-head { background: var(--tsr-surface); color: var(--tsr-muted); }
+body:not(.ui-page) #hint { background: var(--tsr-surface); color: var(--tsr-muted); }
+body:not(.ui-page) #hint b { color: var(--tsr-text); }
+body:not(.ui-page) #hint i { color: var(--tsr-accent-text); }
+body:not(.ui-page) #hint kbd { background: var(--tsr-input); color: var(--tsr-text); }
+body:not(.ui-page) #minimapBox { background: var(--tsr-surface); }
+/* graph.js paints the minimap canvas near-black whatever the theme. In light
+   mode, inverting lightness (and rotating hue back) turns it light while the
+   node dots keep their colours. */
+body.vscode-light:not(.ui-page) #minimap { filter: invert(1) hue-rotate(180deg); }
+body:not(.ui-page) #zoomCtl .btn { background: var(--tsr-surface); color: var(--tsr-text); }
+body:not(.ui-page) .pk-ln.hl { background: var(--tsr-accent-deep); }
+body:not(.ui-page) #brand .word {
+  background: none; -webkit-text-fill-color: currentColor; color: var(--tsr-text);
+  font-family: var(--tsr-font-serif); font-weight: 400;
+}

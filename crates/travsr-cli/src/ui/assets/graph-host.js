@@ -126,10 +126,50 @@
     }
   }
 
+  // The travsr.com palette on the canvas. graph.js sets its Cytoscape styles
+  // in code, so the CSS theme cannot reach them; these rules are layered on
+  // top: functions and calls take the site's orange (the legend in
+  // graph.html says so), and file group boxes take its warm neutral instead
+  // of the extension's dark green. Other kinds keep their legend colours.
+  // Re-applied when the light/dark theme flips.
+  function themeCanvas() {
+    if (typeof cy === "undefined" || !cy.style) return;
+    const css = getComputedStyle(document.body);
+    const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+    const accent = v("--tsr-accent", "#E08C30");
+    const light = document.body.classList.contains("vscode-light");
+    const rgb = light ? "207,106,10" : "224,140,48";
+    cy.style()
+      .selector('node[kind="function"], node[kind="method"], node[kind="constructor"]')
+      .style({ "background-color": accent, "border-color": accent })
+      .selector('edge[kind="calls"]')
+      .style({
+        "line-color": "rgba(" + rgb + ",0.30)",
+        "target-arrow-color": "rgba(" + rgb + ",0.30)",
+        "line-gradient-stop-colors": ["rgba(" + rgb + ",0.10)", "rgba(" + rgb + ",0.60)"],
+      })
+      // Labels in the site's text colour, outlined in its background, so they
+      // read on either theme (graph.js outlines them near-black for dark).
+      .selector("node, node[?root], node.lbl-keep, node:selected")
+      .style({ color: v("--tsr-text", "#F0EBE6"), "text-outline-color": v("--tsr-bg", "#1A1A1A") })
+      .selector(":parent")
+      .style({
+        "background-color": light ? "#EDE8E3" : "#242424",
+        // Solid: Cytoscape drops the alpha of an rgba() border colour, so the
+        // site's 12% white rendered as full white.
+        "border-color": light ? "#D9D0C8" : "#3A3836",
+        color: v("--tsr-muted", "#9B9590"),
+        "text-background-color": v("--tsr-bg", "#1A1A1A"),
+      })
+      .update();
+  }
+  new MutationObserver(themeCanvas).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+
   // Start once the repo is known: the extension opens the graph on the active
   // file or the repo map; here the URL says which (?q=symbol, ?file=path).
   async function start() {
     const row = await ui.init("/graph");
+    themeCanvas();
     ui.api("/api/status", { repo: ui.repo }).then((s) => ui.setConnection(s.route), () => ui.setConnection(null));
     ready = true;
     if (!row || !row.indexed) {
