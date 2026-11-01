@@ -991,14 +991,14 @@
       }
       const maxW = Math.max(1, ...b.edges.map((e) => e.weight));
       html += '<h3 class="a-h">Dependencies' + (selected ? " of " + esc(shortName(selected)) : "") + ' <span class="badge dim">' + shown.length + "</span></h3>" +
-        '<table class="a-edges"><thead><tr><th>From</th><th></th><th>To</th><th>Weight</th><th>Seen in</th></tr></thead><tbody>' +
+        '<div class="a-edges-wrap"><table class="a-edges"><thead><tr><th>From</th><th></th><th>To</th><th>Weight</th><th>Seen in</th></tr></thead><tbody>' +
         shown.map((e) => {
           const bad = inCycle.has(e.from) && inCycle.has(e.to);
           return '<tr' + (bad ? ' class="cyc"' : "") + '><td><button class="link-btn" type="button" data-comp="' + esc(e.from) + '">' + esc(e.from) + '</button></td><td class="muted">→</td>' +
             '<td><button class="link-btn" type="button" data-comp="' + esc(e.to) + '">' + esc(e.to) + "</button></td>" +
             '<td class="a-w"><span class="a-bar"><span style="width:' + Math.max(3, (e.weight / maxW) * 100).toFixed(0) + '%"></span></span> ' + e.weight + "</td>" +
             '<td class="muted">' + esc(e.source) + "</td></tr>";
-        }).join("") + "</tbody></table>" +
+        }).join("") + "</tbody></table></div>" +
         '<p class="sub" style="font-size:11.5px">Weight is the number of distinct file pairs that cross; <em>manifest</em> means declared in a package manifest, <em>code</em> means resolved in the code.</p>';
 
       html += b.notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("");

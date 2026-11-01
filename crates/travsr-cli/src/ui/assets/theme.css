@@ -435,3 +435,9 @@ body:not(.ui-page) #brand .word {
 }
 .tsr-modal-cmd { color: var(--tsr-accent-text) !important; }
 .tsr-modal-box :focus-visible { outline: 2px solid var(--tsr-accent); outline-offset: 2px; }
+/* The edge table scrolls inside its own box rather than widening the page. */
+.a-edges-wrap { max-width: 100%; overflow-x: auto; }
+@media (max-width: 760px) {
+  .a-edges td .link-btn { word-break: break-all; text-align: left; }
+  .a-bar { width: 36px; }
+}
