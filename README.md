@@ -333,6 +333,7 @@ travsr mcp --stdio                   Start the MCP stdio server (single-repo, cw
 travsr mcp --stdio --global          Start the MCP stdio server (all registered repos)
 travsr mcp --stdio --db <path>       Start the MCP stdio server (explicit db path)
 travsr serve                         Serve MCP over HTTP/SSE with bearer-token auth (loopback by default)
+travsr ui                            Browse the graph in a web browser at http://localhost:7330 (--open, --port)
 travsr lang list                     Per-language analysis status, prerequisites, and this repo's state
 travsr lang status [language]        Alias of `lang list`; name a language to see only that row
 travsr lang install <language>       Set up full cross-file analysis for a language, and enable this repo
@@ -568,6 +569,85 @@ travsr graph --all --format json
   ]
 }
 ```
+
+### travsr ui
+
+Browse an indexed repository in your web browser, without an editor or an AI
+tool. Run it inside a repository you have run `travsr init` in:
+
+```bash
+travsr ui            # prints http://localhost:7330/
+travsr ui --open     # also opens it in your default browser
+travsr ui --port 0   # pick any free port
+```
+
+The pages are the VS Code extension's, for the current repository or any other
+registered one:
+
+- **Health:** the extension's Health page: verdict, metric tiles, daemon,
+  index freshness, sidecars, storage and integrity, languages, repositories,
+  recent activity and the daemon log with its filters.
+- **Architecture:** how the repository is put together, from the
+  `get_architecture_brief` facts agents get: components stacked in layers
+  from foundation to entry point, dependency cycles, the dependency edges by
+  weight, and what each component owns. Click a component to see what it
+  depends on and what depends on it.
+- **Graph:** the extension's graph view itself (repo map, symbol graph, blast
+  view, definition peek, DOT/JSON/PNG export).
+- **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's
+  panels of the same names. The lookup boxes suggest matching symbols or
+  indexed files as you type.
+- **Path:** the extension's Show Execution Path. Name a source and a sink
+  symbol and see the lowest-cost call chain between them as numbered steps,
+  with the symbols near it, and **Show on graph** to draw it on the Graph
+  page. An ambiguous name lists its candidates to pick from.
+- **Context:** the extension's Context Explorer. Ask a question in plain words
+  or name a symbol, and see what `get_context` hands an agent for it: the
+  symbols picked and why, each one's relevance, the tokens used against the
+  budget, the retrieval confidence, and optionally the code. **Copy for chat**
+  copies the exact text an agent receives. Fast with the daemon running; from a
+  cold read-only open of a large index it can take a minute or more.
+- **Terminal:** run the read-only CLI commands from the page and see their
+  own output, as in a shell, with symbols and file:line links: `ask`,
+  `graph`, `references`, `pattern`, `explain`, `status` and `invariants`,
+  each with its read-only options as fields. Only these run, as this same
+  binary with no shell, and only after a read-only open of the index
+  succeeds. `fsck` is not offered: even its report mode opens the index
+  writable.
+
+Every graph answer is the text the matching MCP tool (`search_symbol`,
+`get_callers`, `get_dependencies`, `get_blast_radius`, `get_graph_json`, ...)
+returns for the same arguments, and the Health page runs the same read-only
+CLI commands the extension runs (`daemon status`, `lang list --json`, ...).
+Graph queries go to the repository's running daemon, as `travsr status` does;
+with no daemon running they read the index directly, read-only, and the page
+says so. Reading never writes the index: one that needs a schema upgrade is
+reported with the command to run (`travsr init`) instead of being migrated.
+
+The action buttons run their command in the selected repository, after you
+confirm, and show its output: Start / Stop / Restart daemon, Reindex and Set up
+again (`travsr init`), Full rebuild (`init --force`), Run fsck and Compact
+(`fsck`, `fsck --fix`), Register all (`connect`), Disable a language
+(`lang remove`), the Sidecars Install and Change model (`embed init`,
+`embed list`), and on the Repos page Prune stale and remove an entry. Only
+that fixed list runs, one at a time, and only from a page this server served:
+each request carries a per-session token other websites cannot read, and a
+request from another origin is refused. With `--allow-remote` the buttons copy
+the command instead and nothing runs.
+"Open in editor" links open the file in VS Code when it is installed.
+
+Open pages redraw themselves when the index changes (after a commit, a save
+the daemon picks up, or a `travsr init`), as the extension's panels do. The
+strip at the top says `live`, `index changing...` while a reindex is still
+writing, and `updating...` while the page redraws.
+
+**Security.** The server binds `127.0.0.1` and only answers requests addressed
+to a loopback name, so a web page on another site cannot reach it through DNS
+rebinding. It has no login: binding any other address needs
+`--host <ip> --allow-remote`, and anyone who can reach that port can then read
+the graph and the source of every indexed file (never a file outside the index,
+such as a gitignored `.env`). Stop it with Ctrl-C. If the port is taken, `travsr ui` says so and
+exits; pass `--port` to pick another.
 
 ---
 

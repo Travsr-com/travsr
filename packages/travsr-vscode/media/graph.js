@@ -932,9 +932,15 @@ function updateDiagBadge() {
 
 // ── Status bar ────────────────────────────────────────────────────────────────
 function updateStatusBar() {
-  const n = cy.nodes(':visible').not(':parent').length;
-  const e = cy.edges(':visible').length;
-  const tokens = cy.nodes(':visible').not(':parent').reduce((sum, nd) => {
+  // Shown, not `:visible`: Cytoscape counts opacity 0 as invisible, and this
+  // runs right after bloom() has set every element to opacity 0 for its
+  // fade-in, so `:visible` read "0 nodes · 0 edges" whenever fx was on.
+  // Filters hide elements with display/visibility, which is what to count.
+  const shown = (els) => els.filter((el) => el.style('display') !== 'none' && el.style('visibility') !== 'hidden');
+  const nodes = shown(cy.nodes().not(':parent'));
+  const n = nodes.length;
+  const e = shown(cy.edges()).length;
+  const tokens = nodes.reduce((sum, nd) => {
     const d = nd.data();
     return sum + Math.max(1, Math.floor(((d.label || '').length + (d.kind || '').length + (d.path || '').length) / 4));
   }, 0);
@@ -2284,7 +2290,13 @@ function packTiles(nodes) {
     return { ...n, w, h: Math.round(w * 0.62) };
   });
   sized.sort((a, b) => b.w - a.w); // largest first → better row utilisation
-  const MAXW = 640, GAP = 50;
+  // Row width follows the canvas shape, so many tiles fill a wide panel
+  // instead of stacking into a tall column that fit() shrinks until labels
+  // drop below min-zoomed-font-size. 640 stays the floor for few tiles.
+  const GAP = 50;
+  const area = sized.reduce((s, t) => s + (t.w + GAP) * (t.h + GAP + 14), 0);
+  const aspect = (cy && cy.width() && cy.height()) ? cy.width() / cy.height() : 1.6;
+  const MAXW = Math.max(640, Math.round(Math.sqrt(area * aspect)));
   const rows = [[]], rws = [0];
   sized.forEach(t => {
     const last = rows.length - 1;

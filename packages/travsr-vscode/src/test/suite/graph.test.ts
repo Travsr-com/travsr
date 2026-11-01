@@ -194,13 +194,18 @@ suite("GraphPanel", () => {
     // No re-throw means the panel stays alive with empty data
   });
 
-  test("buildLoadingHtml status bar uses visible-element counts", () => {
-    const html = getFullHtml();
-    // updateStatusBar must use ':visible' selector, not plain .nodes()
+  test("buildLoadingHtml status bar counts shown elements, not opacity", () => {
+    const graphJs = readGraphJs();
+    const fn = graphJs.slice(graphJs.indexOf("function updateStatusBar"), graphJs.indexOf("function setFreshness"));
+    // Elements a filter hides (display/visibility) are left out...
     assert.ok(
-      html.includes("':visible'") || html.includes("nodes(':visible')"),
-      "status bar must count only visible nodes"
+      fn.includes("style('display') !== 'none'") && fn.includes("style('visibility') !== 'hidden'"),
+      "status bar must count only shown nodes"
     );
+    // ...but not by `:visible`, which also drops opacity 0: bloom() fades
+    // every element in from opacity 0 just before the bar is drawn, so it read
+    // "0 nodes · 0 edges" whenever fx was on.
+    assert.ok(!fn.includes("':visible'"), "status bar must not count by :visible");
   });
 
   test("buildLoadingHtml includes depth slider", () => {

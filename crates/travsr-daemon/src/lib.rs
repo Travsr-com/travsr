@@ -9943,6 +9943,33 @@ mod tests {
         WATCH_SHED_TOTAL.store(0, Ordering::Relaxed);
     }
 
+    /// #1036 review: the git-running diagnostics are refused on the control
+    /// pipe whoever asks, not only skipped by `travsr ui`; graph reads are
+    /// still served.
+    #[test]
+    fn tool_query_refuses_direct_only_tools() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for tool in travsr_mcp::DIRECT_ONLY_TOOLS {
+            let err = run_query(
+                &store,
+                "tool",
+                serde_json::json!({ "tool": tool, "args": {} }),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("not served through the daemon"),
+                "{tool}: {err}"
+            );
+        }
+        let ok = run_query(
+            &store,
+            "tool",
+            serde_json::json!({ "tool": "get_graph_stats", "args": {} }),
+        )
+        .unwrap();
+        assert!(ok.get("text").is_some(), "{ok}");
+    }
+
     /// RFC-002: when the stored signature format version differs from the binary's
     /// version, `reindex_files` must return `Ok(())` without touching the graph.
     /// This is the core correctness guarantee — a version mismatch must never
@@ -17260,6 +17287,24 @@ fn run_query(
             let mut payload = query::status_query(store)?;
             payload.watch_shed = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             Ok(serde_json::to_value(payload)?)
+        }
+        // #1036: one read-only MCP tool for `travsr ui`. A daemon older than
+        // this arm answers "unknown query tool", which the CLI reads as "route
+        // unavailable" and answers from a direct open instead.
+        "tool" => {
+            let args: query::ToolQueryArgs =
+                serde_json::from_value(args).context("invalid tool query args")?;
+            // Refused here, not only skipped by `travsr ui`: these shell out
+            // to git, and this pipe serves one request at a time, so any
+            // client asking for one would hold up the reindex and every other
+            // query behind it.
+            if travsr_mcp::DIRECT_ONLY_TOOLS.contains(&args.tool.as_str()) {
+                anyhow::bail!(
+                    "'{}' is not served through the daemon; open the index read-only for it",
+                    args.tool
+                );
+            }
+            Ok(serde_json::to_value(query::tool_query(store, &args))?)
         }
         other => anyhow::bail!("unknown query tool '{other}'"),
     }

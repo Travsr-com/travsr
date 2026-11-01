@@ -254,6 +254,15 @@ These are the reasons a query can come back thin. Embeddings let a question matc
 $ travsr embed status
 $ travsr synonym list
 
+## can I see the graph in a browser?
+> Yes. travsr ui serves the VS Code extension's pages on this machine.
+- defaults to http://localhost:7330
+- health, graph, callers, dependencies, blast radius
+- same answers as the MCP tools, from the same code
+- --allow-remote is needed to bind beyond loopback
+The page reads the index through the repository's daemon, the way travsr status does, and falls back to the index file when no daemon runs. It has no login, so it only answers on this machine unless you opt in.
+$ travsr ui --open
+
 ## can I run it for a team?
 > Yes, over the SSE server, but it is a deliberate step.
 - stdio is the local transport; SSE is the shared one

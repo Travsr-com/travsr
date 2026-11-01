@@ -1,0 +1,443 @@
+/* travsr ui: the travsr.com palette.
+
+   Loaded last on every page, after shell.css / graph.css and nav.css, and
+   only re-points their variables (plus the few rules whose accent is not a
+   variable), so the layouts stay the extension's while the colours, type
+   and accent are the website's:
+
+     dark   bg #1A1A1A  surface #242424  text #F0EBE6  muted #9B9590
+            accent #E08C30  secondary #E2B546  success #8BD675
+     light  bg #F6F1ED  surface #EDE8E3  text #1A1A1A  muted #6B6560
+            accent #CF6A0A (text #994A06)  secondary #866000  success #2C681C
+
+   Orange is the accent (primary actions, the current page, links, focus,
+   headline figures), as on the site. Green stays, but only for "ok", as the
+   site uses it. The graph's node colours (function green, class gold, ...)
+   are the extension's legend and are left alone.
+
+   Fonts are the site's stacks (Noto Sans, Inria Serif, JetBrains Mono).
+   The page's CSP loads no remote fonts, so each falls back to the system
+   face when the font is not installed. */
+
+:root, body.vscode-dark {
+  --tsr-bg: #1A1A1A;
+  --tsr-surface: #242424;
+  --tsr-input: #2C2C2C;
+  --tsr-border: rgba(255, 255, 255, .12);
+  --tsr-border-soft: rgba(255, 255, 255, .07);
+  --tsr-text: #F0EBE6;
+  --tsr-muted: #9B9590;
+  --tsr-subtle: #7F7974;
+  --tsr-accent: #E08C30;
+  --tsr-accent-text: #E08C30;
+  --tsr-accent-fill: #E08C30;
+  --tsr-accent-deep: rgba(224, 140, 48, .14);
+  --tsr-accent-line: rgba(224, 140, 48, .45);
+  --tsr-on-accent: #1A1A1A;
+  --tsr-secondary: #E2B546;
+  --tsr-success: #8BD675;
+  --tsr-success-deep: rgba(139, 214, 117, .12);
+  --tsr-error: #F07560;
+  --tsr-glow: rgba(224, 140, 48, .09);
+  --tsr-font-sans: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --tsr-font-serif: "Inria Serif", Georgia, Cambria, serif;
+  --tsr-font-mono: "JetBrains Mono", "Fira Code", ui-monospace, Consolas, monospace;
+}
+body.vscode-light, body.vscode-high-contrast-light {
+  --tsr-bg: #F6F1ED;
+  --tsr-surface: #FBF8F5;
+  --tsr-input: #EDE8E3;
+  --tsr-border: rgba(0, 0, 0, .12);
+  --tsr-border-soft: rgba(0, 0, 0, .07);
+  --tsr-text: #1A1A1A;
+  --tsr-muted: #6B6560;
+  --tsr-subtle: #8A837D;
+  --tsr-accent: #CF6A0A;
+  --tsr-accent-text: #994A06;
+  /* The site's --color-primary-fill: white text on #CF6A0A falls short of
+     comfortable contrast, so filled controls use the darker shade. */
+  --tsr-accent-fill: #A85408;
+  --tsr-accent-deep: rgba(207, 106, 10, .10);
+  --tsr-accent-line: rgba(207, 106, 10, .40);
+  --tsr-on-accent: #FFFFFF;
+  --tsr-secondary: #866000;
+  --tsr-success: #2C681C;
+  --tsr-success-deep: rgba(44, 104, 28, .10);
+  --tsr-error: #B91C1C;
+  --tsr-glow: rgba(207, 106, 10, .07);
+}
+
+/* ── shell.css pages (Health, Callers, Dependencies, Blast radius, Repos) ── */
+body.ui-page, body.ui-page.vscode-dark, body.ui-page.vscode-light {
+  --bg: var(--tsr-bg); --bg-elev: var(--tsr-surface); --bg-input: var(--tsr-input);
+  --border: var(--tsr-border);
+  --fg: var(--tsr-text); --fg-muted: var(--tsr-muted); --fg-subtle: var(--tsr-subtle);
+  --green: var(--tsr-success); --green-deep: var(--tsr-success-deep);
+  --gold: var(--tsr-secondary);
+  --orange: var(--tsr-accent); --orange-deep: var(--tsr-accent-deep);
+  --error: var(--tsr-error);
+  --blue: var(--tsr-accent-text);
+  --vscode-font-family: var(--tsr-font-sans);
+  --vscode-editor-font-family: var(--tsr-font-mono);
+  background:
+    radial-gradient(1100px 420px at 50% -120px, var(--tsr-glow), transparent 70%),
+    var(--tsr-bg);
+  background-attachment: fixed;
+  font-family: var(--tsr-font-sans);
+}
+body.ui-page h2, body.ui-page h3 { font-family: var(--tsr-font-serif); letter-spacing: -.01em; }
+body.ui-page .phead h2 { font-size: 22px; }
+
+/* The accent, where the extension used green for "primary" rather than "ok". */
+body.ui-page .btn { border-radius: 8px; }
+body.ui-page .btn.primary {
+  background: var(--tsr-accent-fill); border-color: var(--tsr-accent-fill); color: var(--tsr-on-accent); font-weight: 600;
+}
+body.ui-page .btn.primary:hover:not(:disabled) { background: var(--tsr-accent-fill); filter: brightness(1.08); }
+body.ui-page .chip-btn.on,
+body.ui-page .pill-btn[aria-pressed="true"] {
+  background: var(--tsr-accent-deep); border-color: var(--tsr-accent); color: var(--tsr-accent-text);
+}
+body.ui-page .card { border-radius: 10px; border-color: var(--tsr-border-soft); }
+body.ui-page .card .v { color: var(--tsr-accent-text); font-family: var(--tsr-font-serif); }
+body.ui-page .card.warn .v { color: var(--tsr-secondary); }
+body.ui-page .card.bad .v { color: var(--tsr-error); }
+body.ui-page .hsec { border-color: var(--tsr-border-soft); border-radius: 10px; }
+body.ui-page .hsec > summary { background: transparent; }
+body.ui-page :focus-visible,
+body.ui-page input:focus, body.ui-page select:focus { outline: 2px solid var(--tsr-accent); outline-offset: 1px; }
+body.ui-page mark { background: var(--tsr-accent); color: var(--tsr-on-accent); }
+body.ui-page a, body.ui-page .link-btn, body.ui-page .ref { color: var(--tsr-accent-text); }
+body.ui-page .note-box { background: var(--tsr-accent-deep); border-color: var(--tsr-accent-line); }
+
+/* ── Navigation strip ─────────────────────────────────────────────────── */
+.tsr-nav, body.vscode-light .tsr-nav, body.vscode-high-contrast-light .tsr-nav {
+  --n-bg: var(--tsr-bg); --n-border: var(--tsr-border-soft); --n-fg: var(--tsr-text);
+  --n-muted: var(--tsr-muted); --n-subtle: var(--tsr-subtle); --n-input: var(--tsr-input);
+  --n-green: var(--tsr-accent-text); --n-green-deep: var(--tsr-accent-deep);
+  font-family: var(--tsr-font-sans);
+}
+.tsr-nav .tsr-brand span { font-family: var(--tsr-font-serif); font-weight: 400; font-size: 18px; }
+.tsr-nav .tsr-dot.ok { background: var(--tsr-success); }
+.tsr-nav .tsr-live[data-state="live"] { color: var(--tsr-success); border-color: var(--tsr-success); }
+
+/* ── Graph page (the extension's graph.css) ───────────────────────────── */
+/* Its brand accent is its green ramp; the site's is orange. Re-pointing the
+   ramp and the semantic tokens recolours the chrome (top bar, chips, panels,
+   status bar). A few glows are literal colours in graph.css, and node
+   colours by kind are graph.js's legend; both are left as the extension has
+   them. */
+body:not(.ui-page) {
+  --green-300: var(--tsr-accent); --green-400: var(--tsr-accent); --green-500: var(--tsr-accent-text);
+  --node: var(--tsr-accent);
+  --tint-green: var(--tsr-accent-deep); --line-green: var(--tsr-accent-line);
+  --bg: var(--tsr-bg); --bg-elev: var(--tsr-surface); --bg-input: var(--tsr-input);
+  --border: var(--tsr-border-soft); --border-mid: var(--tsr-border);
+  --fg: var(--tsr-text); --fg-muted: var(--tsr-muted); --fg-subtle: var(--tsr-subtle);
+  --font-ui: var(--tsr-font-sans); --font-mono: var(--tsr-font-mono); --font-display: var(--tsr-font-serif);
+}
+body:not(.ui-page) #topbar { background: var(--tsr-bg); }
+body:not(.ui-page) #topbar::after {
+  background: linear-gradient(90deg, transparent, var(--tsr-accent-line) 12%, transparent 60%);
+}
+body:not(.ui-page) ::selection { background: var(--tsr-accent-deep); }
+body:not(.ui-page) .btn.active { box-shadow: 0 0 10px var(--tsr-accent-deep); }
+body:not(.ui-page) #main {
+  background: radial-gradient(1000px 580px at 58% 34%, var(--tsr-glow), transparent 60%), var(--tsr-bg);
+}
+body:not(.ui-page) .b1 { background: radial-gradient(circle, var(--tsr-accent-deep), transparent 62%); }
+body:not(.ui-page) #spotlight { background: radial-gradient(circle, var(--tsr-glow), transparent 65%); }
+body:not(.ui-page) #halo { border-color: var(--tsr-accent-line); }
+body:not(.ui-page) #node-search-results li.active { background: var(--tsr-accent-deep); }
+/* Surfaces graph.css paints a fixed near-black, even in its light mode, which
+   left the light theme's text on grey islands. */
+body:not(.ui-page) .grp { background: var(--tsr-surface); border-color: var(--tsr-border-soft); }
+body:not(.ui-page) .grp-label { color: var(--tsr-muted); }
+body:not(.ui-page) #searchInput { background: var(--tsr-surface); color: var(--tsr-text); }
+body:not(.ui-page) #searchInput:focus {
+  background: var(--tsr-surface); border-color: var(--tsr-accent);
+  box-shadow: 0 0 0 3px var(--tsr-accent-deep);
+}
+body:not(.ui-page) #searchInput::placeholder { color: var(--tsr-subtle); }
+body:not(.ui-page) #searchWrap::after { background: var(--tsr-input); color: var(--tsr-muted); }
+body:not(.ui-page) .col-head { background: var(--tsr-surface); color: var(--tsr-muted); }
+body:not(.ui-page) #hint { background: var(--tsr-surface); color: var(--tsr-muted); }
+body:not(.ui-page) #hint b { color: var(--tsr-text); }
+body:not(.ui-page) #hint i { color: var(--tsr-accent-text); }
+body:not(.ui-page) #hint kbd { background: var(--tsr-input); color: var(--tsr-text); }
+body:not(.ui-page) #minimapBox { background: var(--tsr-surface); }
+/* graph.js paints the minimap canvas near-black whatever the theme. In light
+   mode, inverting lightness (and rotating hue back) turns it light while the
+   node dots keep their colours. */
+body.vscode-light:not(.ui-page) #minimap { filter: invert(1) hue-rotate(180deg); }
+body:not(.ui-page) #zoomCtl .btn { background: var(--tsr-surface); color: var(--tsr-text); }
+body:not(.ui-page) .pk-ln.hl { background: var(--tsr-accent-deep); }
+body:not(.ui-page) #breadcrumb,
+body:not(.ui-page) #statusbar { background: var(--tsr-bg); border-color: var(--tsr-border-soft); }
+body:not(.ui-page) #statusbar #fresh { color: var(--tsr-success); }
+body:not(.ui-page) #statusbar .dot-pulse { background: var(--tsr-success); }
+body:not(.ui-page) #disambig-bar { background: var(--tsr-surface); border-color: var(--tsr-accent-line); }
+body:not(.ui-page) #detail,
+body:not(.ui-page) #peek { background: var(--tsr-surface); color: var(--tsr-text); }
+body:not(.ui-page) #peekBody pre { color: var(--tsr-text); }
+body:not(.ui-page) #tip, body:not(.ui-page) #db-tip { background: var(--tsr-surface); color: var(--tsr-muted); }
+body:not(.ui-page) #banner { background: var(--tsr-surface); color: var(--tsr-accent-text); border-color: var(--tsr-accent-line); }
+body:not(.ui-page) kbd { background: var(--tsr-input); color: var(--tsr-text); }
+body:not(.ui-page) #node-search { background: var(--tsr-surface); }
+body:not(.ui-page) #node-search-input { background: var(--tsr-input); color: var(--tsr-text); }
+/* Shadows tuned for the dark panel read as smudges on cream. */
+body.vscode-light:not(.ui-page) #topbar,
+body.vscode-light:not(.ui-page) #detail,
+body.vscode-light:not(.ui-page) #peek,
+body.vscode-light:not(.ui-page) #hint,
+body.vscode-light:not(.ui-page) #tip,
+body.vscode-light:not(.ui-page) #banner { box-shadow: 0 4px 16px rgba(60, 40, 20, .10); }
+/* Suggestions under a lookup box (common.js suggest()): Graph search,
+   Callers, Dependencies, Blast radius. */
+.suggest-anchor { position: relative; }
+.lookup-box { display: flex; min-width: 260px; flex: 0 1 420px; }
+.lookup-box input { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 760px) { .lookup-box { min-width: 0; flex: 1 1 100%; } }
+body:not(.ui-page) #searchWrap { position: relative; }
+.suggest {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
+  width: 460px; max-width: calc(100vw - 40px); max-height: 360px; overflow-y: auto;
+  list-style: none; margin: 0; padding: 4px;
+  background: var(--tsr-surface); border: 1px solid var(--tsr-border); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .35);
+  font: 12px var(--tsr-font-sans); color: var(--tsr-text);
+}
+body.vscode-light .suggest { box-shadow: 0 12px 32px rgba(60, 40, 20, .14); }
+.suggest li {
+  display: grid; grid-template-columns: minmax(0, auto) auto 1fr; align-items: baseline; gap: 8px;
+  padding: 6px 9px; border-radius: 7px; cursor: pointer;
+}
+.suggest li.active { background: var(--tsr-accent-deep); }
+.suggest li.empty { display: block; cursor: default; color: var(--tsr-muted); }
+.suggest .s-name { font: 600 12px var(--tsr-font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggest li.active .s-name { color: var(--tsr-accent-text); }
+.suggest .s-kind {
+  font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.suggest .s-path {
+  color: var(--tsr-muted); font: 11px var(--tsr-font-mono); text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl;
+}
+body:not(.ui-page) #brand .word {
+  background: none; -webkit-text-fill-color: currentColor; color: var(--tsr-text);
+  font-family: var(--tsr-font-serif); font-weight: 400;
+}
+
+/* ── Context explorer (pages.js contextView) ──────────────────────────── */
+.ctx-form .ctx-q { flex: 1 1 420px; min-width: 260px; }
+.ctx-form select { height: 30px; }
+.ctx-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--tsr-muted); cursor: pointer; }
+.ctx-check input { accent-color: var(--tsr-accent); min-width: 0; flex: none; width: auto; margin: 0; }
+.ctx-tips { margin: 6px 0 0; padding-left: 18px; color: var(--tsr-muted); font-size: 12.5px; line-height: 1.8; }
+.ctx-tips em { color: var(--tsr-text); }
+.ctx-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 12px; }
+.ctx-head h3 { margin: 0; }
+.ctx-actions { margin-left: auto; display: flex; gap: 8px; }
+.ctx-actions .btn[aria-pressed="true"] { border-color: var(--tsr-accent); color: var(--tsr-accent-text); background: var(--tsr-accent-deep); }
+.ctx-cards .card { flex: 1 1 140px; }
+.ctx-cards .card .v { font-size: 20px; }
+.ctx-cards .card .s { margin-top: 3px; font-size: 10.5px; color: var(--tsr-muted); }
+.ctx-meter {
+  display: flex; height: 8px; margin: 14px 0 6px; border-radius: 999px; overflow: hidden;
+  background: var(--tsr-input); border: 1px solid var(--tsr-border-soft);
+}
+.ctx-meter span { display: block; height: 100%; }
+.m-meta { background: var(--tsr-accent); }
+.m-code { background: var(--tsr-secondary); }
+.ctx-legend { display: flex; gap: 16px; font-size: 11px; color: var(--tsr-muted); margin-bottom: 12px; }
+.ctx-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+.ctx-sec { margin-top: 12px; }
+.ctx-list { list-style: none; margin: 0; padding: 4px 0; }
+.ctx-item { padding: 6px 12px; border-top: 1px solid var(--tsr-border-soft); }
+.ctx-item:first-child { border-top: 0; }
+.ctx-row { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; font-size: 12.5px; }
+.ctx-score {
+  flex: 0 0 38px; height: 4px; align-self: center; border-radius: 999px;
+  background: var(--tsr-input); overflow: hidden;
+}
+.ctx-score span { display: block; height: 100%; background: var(--tsr-accent); }
+.ctx-row .s-kind {
+  font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.ctx-name { font: 600 12.5px var(--tsr-font-mono); text-decoration: none; }
+.ctx-name:hover { text-decoration: underline; }
+.ctx-where { font: 11.5px var(--tsr-font-mono); }
+.ctx-where a { color: var(--tsr-muted); }
+.ctx-via { font-size: 11px; color: var(--tsr-subtle); font-style: italic; }
+.ctx-code, .ctx-raw {
+  margin: 8px 0 2px; padding: 10px 12px; border-radius: 8px; overflow-x: auto;
+  background: var(--tsr-input); border: 1px solid var(--tsr-border-soft);
+  font: 11.5px/1.55 var(--tsr-font-mono); color: var(--tsr-text); white-space: pre;
+}
+.ctx-raw { max-height: 70vh; overflow: auto; }
+.ctx-stale { display: flex; align-items: center; gap: 8px; }
+@media (max-width: 760px) { .ctx-form .ctx-q { min-width: 0; flex: 1 1 100%; } .ctx-actions { margin-left: 0; } }
+
+/* ── Terminal (pages.js terminalView) ─────────────────────────────────── */
+.t-tabs { margin: 0 0 12px; }
+.t-form .t-main { flex: 1 1 320px; min-width: 220px; }
+.t-form .t-path { flex: 0 1 220px; min-width: 160px; }
+.t-form select { height: 30px; }
+.t-form input:disabled, .t-form select:disabled { opacity: .45; }
+.t-log { display: flex; flex-direction: column; gap: 12px; margin-top: 6px; }
+.t-entry {
+  border: 1px solid var(--tsr-border-soft); border-radius: 10px; overflow: hidden;
+  background: var(--tsr-surface);
+}
+.t-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 7px 12px;
+  border-bottom: 1px solid var(--tsr-border-soft); font-size: 12px;
+}
+.t-cmd { font: 600 12px var(--tsr-font-mono); color: var(--tsr-accent-text); word-break: break-all; }
+.t-meta { color: var(--tsr-muted); font-size: 11px; white-space: nowrap; }
+.t-meta.bad { color: var(--tsr-error); }
+.t-acts { margin-left: auto; display: flex; gap: 10px; }
+.t-out {
+  margin: 0; padding: 10px 12px; max-height: 60vh; overflow: auto;
+  background: var(--tsr-input); font: 11.5px/1.55 var(--tsr-font-mono);
+  color: var(--tsr-text); white-space: pre;
+}
+.t-out.t-err { color: var(--tsr-secondary); background: var(--tsr-accent-deep); max-height: 9em; white-space: pre-wrap; }
+.t-out a { color: inherit; text-decoration: underline; text-decoration-color: var(--tsr-accent-line); text-underline-offset: 2px; }
+.t-out a.t-sig { color: var(--tsr-accent-text); }
+.t-out a:hover { text-decoration-color: currentColor; }
+@media (max-width: 760px) { .t-form .t-main, .t-form .t-path { min-width: 0; flex: 1 1 100%; } }
+.t-tabs { flex-wrap: wrap; }
+.t-help { margin: -4px 0 10px; font-size: 12px; }
+
+/* ── Execution path (pages.js pathView) ───────────────────────────────── */
+.p-form .p-box { flex: 1 1 240px; min-width: 200px; }
+.p-swap { padding: 4px 10px; }
+.p-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 6px 0 12px; }
+.p-head h3 { margin: 0; }
+.p-head .btn { margin-left: auto; text-decoration: none; }
+.p-steps { list-style: none; margin: 0 0 14px; padding: 0; }
+.p-step { position: relative; display: flex; align-items: center; gap: 12px; padding: 7px 0; }
+/* The connector between numbered steps. */
+.p-step::before {
+  content: ""; position: absolute; left: 13px; top: 0; bottom: 0; width: 2px;
+  background: var(--tsr-accent-line);
+}
+.p-step.p-first::before { top: 50%; }
+.p-step.p-last::before { bottom: 50%; }
+.p-step.p-first.p-last::before { display: none; }
+.p-num {
+  position: relative; z-index: 1; flex: 0 0 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center; font: 600 12px var(--tsr-font-mono);
+  background: var(--tsr-surface); color: var(--tsr-accent-text); border: 2px solid var(--tsr-accent);
+}
+.p-step.p-first .p-num, .p-step.p-last .p-num { background: var(--tsr-accent-fill); color: var(--tsr-on-accent); }
+.p-body { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; min-width: 0; }
+.p-body .s-kind, .p-cands .s-kind, .p-near .s-kind {
+  font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.p-name { font: 600 13px var(--tsr-font-mono); text-decoration: none; }
+.p-name:hover { text-decoration: underline; }
+.p-where { font: 11.5px var(--tsr-font-mono); }
+.p-where a { color: var(--tsr-muted); }
+.p-cands { list-style: none; margin: 4px 0 8px; padding: 0; }
+.p-cands li { padding: 4px 0; font-size: 12.5px; }
+.p-cands .link-btn { font: 600 12.5px var(--tsr-font-mono); }
+.p-near { margin-top: 6px; }
+.p-shared { font: 600 12.5px var(--tsr-font-mono); color: var(--tsr-muted); }
+
+/* ── Architecture (pages.js architectureView) ─────────────────────────── */
+.a-cards .card { flex: 1 1 130px; }
+.a-cards .card .s { margin-top: 3px; font-size: 10.5px; color: var(--tsr-muted); }
+.a-cycles { margin: 12px 0; }
+.a-cycle { margin: 6px 0; font: 600 12.5px var(--tsr-font-mono); }
+.a-cycle .link-btn { font: inherit; color: var(--tsr-error); }
+.a-h { margin: 18px 0 8px; }
+.a-layers { display: flex; flex-direction: column; gap: 6px; }
+.a-layer { display: flex; gap: 10px; align-items: stretch; }
+.a-ln {
+  flex: 0 0 28px; display: grid; place-items: center; border-radius: 8px;
+  font: 600 12px var(--tsr-font-mono); color: var(--tsr-muted); background: var(--tsr-input);
+}
+.a-row { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; padding: 4px 0; }
+.a-comp {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left;
+  padding: 7px 11px; border-radius: 8px; cursor: pointer; min-width: 120px;
+  background: var(--tsr-surface); border: 1px solid var(--tsr-border); color: var(--tsr-text);
+  transition: border-color .12s ease, background .12s ease;
+}
+.a-comp:hover { border-color: var(--tsr-accent-line); }
+.a-name { font: 600 12.5px var(--tsr-font-mono); }
+.a-meta { font-size: 10.5px; color: var(--tsr-muted); }
+.a-comp.cyc { border-color: var(--tsr-error); }
+.a-comp.dep { border-color: var(--tsr-accent); background: var(--tsr-accent-deep); }
+.a-comp.user { border-color: var(--tsr-secondary); box-shadow: inset 0 0 0 1px var(--tsr-secondary); }
+.a-comp.sel { border-color: var(--tsr-accent-fill); background: var(--tsr-accent-fill); color: var(--tsr-on-accent); }
+.a-comp.sel .a-meta { color: var(--tsr-on-accent); opacity: .85; }
+.a-legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 4px; font-size: 11px; color: var(--tsr-muted); }
+.a-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; border: 2px solid; }
+.a-legend i.sel { background: var(--tsr-accent-fill); border-color: var(--tsr-accent-fill); }
+.a-legend i.dep { background: var(--tsr-accent-deep); border-color: var(--tsr-accent); }
+.a-legend i.user { border-color: var(--tsr-secondary); }
+.a-legend i.cyc { border-color: var(--tsr-error); }
+.a-detail { margin-top: 14px; }
+.a-dhead { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--tsr-border-soft); }
+.a-dhead h3 { margin: 0; font: 600 14px var(--tsr-font-mono); }
+.a-dhead .link-btn { margin-left: auto; }
+.a-dbody { padding: 8px 12px 10px; }
+.a-own { display: flex; gap: 10px; padding: 3px 0; font-size: 12.5px; }
+.a-k { flex: 0 0 170px; color: var(--tsr-muted); }
+.a-v { font-family: var(--tsr-font-mono); font-size: 12px; word-break: break-word; }
+.a-edges { width: 100%; border-collapse: collapse; font-size: 12px; }
+.a-edges th { text-align: left; font-weight: 600; color: var(--tsr-muted); padding: 5px 8px; border-bottom: 1px solid var(--tsr-border); }
+.a-edges td { padding: 4px 8px; border-bottom: 1px solid var(--tsr-border-soft); }
+.a-edges td .link-btn { font: 12px var(--tsr-font-mono); }
+.a-edges tr.cyc td { background: rgba(240, 117, 96, .10); }
+.a-w { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.a-bar { display: inline-block; width: 70px; height: 5px; border-radius: 999px; background: var(--tsr-input); vertical-align: middle; overflow: hidden; }
+.a-bar span { display: block; height: 100%; background: var(--tsr-accent); }
+.a-caveats { margin: 14px 0; font-size: 12px; color: var(--tsr-muted); }
+.a-caveats summary { cursor: pointer; }
+@media (max-width: 760px) { .a-k { flex-basis: 110px; } .a-edges th:nth-child(5), .a-edges td:nth-child(5) { display: none; } }
+
+/* ── Action output dialog (common.js runCommand) ──────────────────────── */
+.tsr-modal {
+  position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px;
+  background: rgba(0, 0, 0, .45);
+}
+.tsr-modal-box {
+  width: min(760px, 100%); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--tsr-surface); color: var(--tsr-text); border: 1px solid var(--tsr-border);
+  border-radius: 12px; box-shadow: 0 20px 50px rgba(0, 0, 0, .4); overflow: hidden;
+}
+.tsr-modal-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--tsr-border-soft); }
+.tsr-modal-head code { font: 600 12.5px var(--tsr-font-mono); color: var(--tsr-accent-text); word-break: break-all; }
+.tsr-modal-state { margin-left: auto; font-size: 11.5px; color: var(--tsr-muted); white-space: nowrap; }
+.tsr-modal-state.ok { color: var(--tsr-success); }
+.tsr-modal-state.bad { color: var(--tsr-error); }
+.tsr-modal-out {
+  flex: 1; margin: 0; padding: 12px 14px; overflow: auto; min-height: 120px;
+  background: var(--tsr-input); font: 11.5px/1.55 var(--tsr-font-mono); white-space: pre-wrap; word-break: break-word;
+}
+.tsr-modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--tsr-border-soft); }
+.tsr-modal-title { font: 600 14px var(--tsr-font-sans); color: var(--tsr-text); }
+.tsr-modal-title.mono { font: 600 12.5px var(--tsr-font-mono); color: var(--tsr-accent-text); word-break: break-all; }
+.tsr-modal-ask { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.tsr-modal-detail { margin: 0; font-size: 13px; color: var(--tsr-muted); line-height: 1.5; }
+.tsr-modal-kv { display: flex; align-items: baseline; gap: 10px; }
+.tsr-modal-kv span { flex: 0 0 36px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--tsr-subtle); }
+.tsr-modal-kv code {
+  flex: 1; min-width: 0; padding: 6px 10px; border-radius: 6px; background: var(--tsr-input);
+  border: 1px solid var(--tsr-border-soft); font: 12px var(--tsr-font-mono); color: var(--tsr-text); word-break: break-all;
+}
+.tsr-modal-cmd { color: var(--tsr-accent-text) !important; }
+.tsr-modal-box :focus-visible { outline: 2px solid var(--tsr-accent); outline-offset: 2px; }
+/* The edge table scrolls inside its own box rather than widening the page. */
+.a-edges-wrap { max-width: 100%; overflow-x: auto; }
+@media (max-width: 760px) {
+  .a-edges td .link-btn { word-break: break-all; text-align: left; }
+  .a-bar { width: 36px; }
+}

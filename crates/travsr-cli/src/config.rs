@@ -198,29 +198,35 @@ fn cmd_unset(key: &str, repo: bool) -> Result<()> {
     Ok(())
 }
 
+/// The `config list --json` payload for `repo_root`. Shared with `travsr ui`,
+/// which answers the extension's Health page from it without starting a
+/// process.
+pub(crate) fn list_json(repo_root: Option<&std::path::Path>) -> String {
+    let entries: Vec<String> = travsr_config::list(repo_root)
+        .iter()
+        .map(|s| {
+            format!(
+                r#"{{"key":"{}","value":{},"source":"{}","default":"{}"}}"#,
+                s.key,
+                match &s.value {
+                    Some(v) => format!("\"{}\"", v.replace('"', "\\\"")),
+                    None => "null".to_string(),
+                },
+                s.source.label(),
+                s.default_display,
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(",\n"))
+}
+
 fn cmd_list(json: bool) -> Result<()> {
     let repo_root = current_repo_root();
-    let statuses = travsr_config::list(repo_root.as_deref());
-
     if json {
-        let entries: Vec<String> = statuses
-            .iter()
-            .map(|s| {
-                format!(
-                    r#"{{"key":"{}","value":{},"source":"{}","default":"{}"}}"#,
-                    s.key,
-                    match &s.value {
-                        Some(v) => format!("\"{}\"", v.replace('"', "\\\"")),
-                        None => "null".to_string(),
-                    },
-                    s.source.label(),
-                    s.default_display,
-                )
-            })
-            .collect();
-        println!("[{}]", entries.join(",\n"));
+        println!("{}", list_json(repo_root.as_deref()));
         return Ok(());
     }
+    let statuses = travsr_config::list(repo_root.as_deref());
 
     println!("{:<20} {:<26} {:<14} DESCRIPTION", "KEY", "VALUE", "SOURCE");
     println!("{}", "-".repeat(92));
