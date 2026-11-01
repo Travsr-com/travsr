@@ -285,7 +285,7 @@
     '<span class="chip ' + tone + '">' + (tone === "ok" ? OK_ICON : tone === "bad" ? BAD_ICON : tone === "warn" ? WARN_ICON : "") + esc(word) + "</span>";
   // The extension's action buttons run a command; here they copy it.
   const act = (label, cmd, tone) =>
-    '<button class="btn mini ' + (tone === "primary" ? "primary" : "ghost") + '" data-copy="' + esc(cmd) + '" title="Copy: ' + esc(cmd) + '">' + esc(label) + "</button>";
+    '<button class="btn mini ' + (tone === "primary" ? "primary" : "ghost") + '" data-run data-copy="' + esc(cmd) + '" title="' + esc(cmd) + '">' + esc(label) + "</button>";
   const row = (k, v, tone, trailing, keyTitle) =>
     '<div class="hrow"><span title="' + esc(keyTitle || k) + '">' + esc(k) + "</span>" +
     '<b class="' + (tone || "") + '">' + (tone === "ok" ? OK_ICON : tone === "warn" ? WARN_ICON : tone === "bad" ? BAD_ICON : "") + esc(v) + "</b>" +
@@ -324,7 +324,7 @@
         : early;
     const VERDICT_CLASS = { offline: "bad", stale: "warn2", degraded: "warn2", unindexed: "idle", healthy: "good" };
     const verdictBanner = '<div class="banner ' + VERDICT_CLASS[verdict.verdict] + ' verdict"><strong>' + esc(verdict.headline) + "</strong><span>" + esc(verdict.detail) + "</span>" +
-      (verdict.action ? '<button class="btn primary vact" data-copy="' + esc(verdict.action.cmd) + '" title="Copy: ' + esc(verdict.action.cmd) + '">' + esc(verdict.action.label) + "</button>" : "") + "</div>";
+      (verdict.action ? '<button class="btn primary vact" data-run data-copy="' + esc(verdict.action.cmd) + '" title="' + esc(verdict.action.cmd) + '">' + esc(verdict.action.label) + "</button>" : "") + "</div>";
 
     const diagCards = diags.length ? '<div class="diags">' + diags.map((x) => {
       const extra = x.hint.startsWith(x.title) ? x.hint.slice(x.title.length).trim() : x.hint;
@@ -805,6 +805,12 @@
         // also fold the section.
         ev.preventDefault();
         const cmd = copy.getAttribute("data-copy");
+        // An action button runs its command here when the server allows it
+        // (loopback, no --allow-remote), then the page re-reads everything.
+        if (copy.hasAttribute("data-run") && row && await ui.canRun(cmd)) {
+          if (await ui.runCommand(cmd, row.name, row.root)) gather(row);
+          return;
+        }
         const label = copy.textContent;
         try { await navigator.clipboard.writeText(cmd); copy.textContent = "Copied"; }
         catch (_) { window.prompt("Run this in a terminal in " + row.root, cmd); }
@@ -871,7 +877,7 @@
     const page = document.getElementById("page");
     if (!row) {
       page.innerHTML = '<h2>Health</h2><div class="banner idle verdict"><strong>No graph yet</strong><span>No indexed repositories found. Run travsr init in a git repository, then reload this page.</span>' +
-        '<button class="btn primary vact" data-copy="travsr init">Index a repo</button></div>';
+        '<button class="btn primary vact" data-run data-copy="travsr init">Index a repo</button></div>';
       wire({ root: "" });
       return;
     }

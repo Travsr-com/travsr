@@ -40,6 +40,7 @@ use travsr_mcp::query::{self, StatusPayload, ToolPayload, ToolQueryArgs};
 
 use crate::daemon_client;
 
+mod actions;
 mod files;
 mod terminal;
 
@@ -75,6 +76,9 @@ struct UiState {
     current: Option<NamedRepo>,
     /// Whether the Host-header check applies (loopback bind).
     check_host: bool,
+    /// The token the action buttons send (actions.rs); `None` turns actions
+    /// off, as `--allow-remote` does.
+    action_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -112,6 +116,9 @@ pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> any
     let state = Arc::new(UiState {
         current,
         check_host: ip.is_loopback(),
+        // A fresh random token per run; none at all under --allow-remote.
+        action_token: (!allow_remote && ip.is_loopback())
+            .then(|| uuid::Uuid::new_v4().simple().to_string()),
     });
 
     let addr = SocketAddr::new(ip, port);
@@ -187,6 +194,9 @@ fn router(state: Arc<UiState>) -> Router {
             "/assets/icon.png",
             get(|| async { ([(header::CONTENT_TYPE, "image/png")], ICON_PNG).into_response() }),
         )
+        // Actions: the one write path, guarded in actions.rs.
+        .route("/api/session", get(actions::session))
+        .route("/api/action/:name", axum::routing::post(actions::action))
         // API. GET only; nothing here writes.
         .route("/api/repos", get(repos))
         .route("/api/status", get(status))
@@ -755,6 +765,7 @@ mod tests {
         router(Arc::new(UiState {
             current: None,
             check_host: true,
+            action_token: Some("test-token".into()),
         }))
     }
 
@@ -936,6 +947,90 @@ mod tests {
         // A writing tool must not be callable through the page, even by name.
         let resp = get_with_host("/api/tool/synonym_add?repo=x", "localhost").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn post_action(
+        app: Router,
+        uri: &str,
+        token: Option<&str>,
+        origin: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "localhost:7330");
+        if let Some(t) = token {
+            req = req.header(actions::TOKEN_HEADER, t);
+        }
+        if let Some(o) = origin {
+            req = req.header(header::ORIGIN, o);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn actions_need_the_token_and_this_origin() {
+        let uri = "/api/action/init?repo=nope";
+        // No token, or the wrong one: refused before anything runs.
+        assert_eq!(
+            post_action(app(), uri, None, None).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_action(app(), uri, Some("guess"), None).await,
+            StatusCode::FORBIDDEN
+        );
+        // Right token from another website: refused.
+        assert_eq!(
+            post_action(app(), uri, Some("test-token"), Some("http://evil.example")).await,
+            StatusCode::FORBIDDEN
+        );
+        // Right token, this origin: past the guards, stopped at the unknown repo.
+        assert_eq!(
+            post_action(
+                app(),
+                uri,
+                Some("test-token"),
+                Some("http://localhost:7330")
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        // An action that is not on the list never runs.
+        assert_eq!(
+            post_action(
+                app(),
+                "/api/action/uninstall?repo=nope",
+                Some("test-token"),
+                None
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        // GET does not run anything.
+        let resp = get_with_host(uri, "localhost:7330").await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn allow_remote_turns_actions_off() {
+        let remote = router(Arc::new(UiState {
+            current: None,
+            check_host: false,
+            action_token: None,
+        }));
+        assert_eq!(
+            post_action(remote, "/api/action/init?repo=nope", Some("anything"), None).await,
+            StatusCode::FORBIDDEN
+        );
+        let session = get_with_host("/api/session", "localhost:7330").await;
+        let body = axum::body::to_bytes(session.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("\"actions\":true"));
     }
 
     #[tokio::test]

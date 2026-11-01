@@ -402,3 +402,24 @@ body:not(.ui-page) #brand .word {
 .a-caveats { margin: 14px 0; font-size: 12px; color: var(--tsr-muted); }
 .a-caveats summary { cursor: pointer; }
 @media (max-width: 760px) { .a-k { flex-basis: 110px; } .a-edges th:nth-child(5), .a-edges td:nth-child(5) { display: none; } }
+
+/* ── Action output dialog (common.js runCommand) ──────────────────────── */
+.tsr-modal {
+  position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px;
+  background: rgba(0, 0, 0, .45);
+}
+.tsr-modal-box {
+  width: min(760px, 100%); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--tsr-surface); color: var(--tsr-text); border: 1px solid var(--tsr-border);
+  border-radius: 12px; box-shadow: 0 20px 50px rgba(0, 0, 0, .4); overflow: hidden;
+}
+.tsr-modal-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--tsr-border-soft); }
+.tsr-modal-head code { font: 600 12.5px var(--tsr-font-mono); color: var(--tsr-accent-text); word-break: break-all; }
+.tsr-modal-state { margin-left: auto; font-size: 11.5px; color: var(--tsr-muted); white-space: nowrap; }
+.tsr-modal-state.ok { color: var(--tsr-success); }
+.tsr-modal-state.bad { color: var(--tsr-error); }
+.tsr-modal-out {
+  flex: 1; margin: 0; padding: 12px 14px; overflow: auto; min-height: 120px;
+  background: var(--tsr-input); font: 11.5px/1.55 var(--tsr-font-mono); white-space: pre-wrap; word-break: break-word;
+}
+.tsr-modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--tsr-border-soft); }

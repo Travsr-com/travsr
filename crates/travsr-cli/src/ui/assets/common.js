@@ -325,6 +325,100 @@ window.TravsrUi = (function () {
     return repoRow();
   }
 
+  // ── Actions: run a button's command (actions.rs) ─────────────────────────
+  // The commands the buttons show, mapped to the server's action names. Only
+  // these run; anything else stays a copy-to-clipboard button.
+  const ACTIONS = [
+    [/^travsr daemon start$/, "daemon-start", "Start the daemon for this repository? It keeps the graph fresh as you commit and save."],
+    [/^travsr daemon stop$/, "daemon-stop", "Stop the daemon for this repository? The graph stops refreshing until it is started again."],
+    [/^travsr daemon restart$/, "daemon-restart", "Restart the daemon for this repository?"],
+    [/^travsr init$/, "init", "Index this repository now? It updates the graph and may download language tools; on a large repository it can take several minutes."],
+    [/^travsr init --force$/, "init-force", "Rebuild the whole index from scratch? Every file is parsed again; on a large repository this can take a long time."],
+    [/^travsr fsck$/, "fsck", "Check the graph's integrity? Report only."],
+    [/^travsr fsck --fix$/, "fsck-fix", "Repair the graph? This deletes ghost nodes and sweeps orphan edges."],
+    [/^travsr connect$/, "connect", "Register Travsr with the AI coding tools found on this machine? This edits their configuration files."],
+    [/^travsr embed init$/, "embed-init", "Set up semantic search? This downloads the embedding sidecar and model, which can take several minutes."],
+    [/^travsr embed list$/, "embed-list", "List the embedding models available?"],
+    [/^travsr lang remove (\S+)$/, "lang-remove", "Stop full analysis for this language in this repository?", "language"],
+    [/^travsr repos --prune$/, "repos-prune", "Remove every registry entry whose index no longer exists?"],
+    [/^travsr repos --remove (\S+)$/, "repos-remove", "Remove this repository from the registry? Its index files are left alone.", "name"],
+  ];
+  function actionFor(cmd) {
+    for (const [re, name, ask, key] of ACTIONS) {
+      const m = re.exec(String(cmd || "").trim());
+      if (m) return { name, ask, params: key ? { [key]: m[1] } : {} };
+    }
+    return null;
+  }
+  let sessionP = null;
+  /** Whether the buttons may run commands here, and the token for it. */
+  function session() {
+    if (!sessionP) sessionP = api("/api/session").catch(() => ({ actions: false }));
+    return sessionP;
+  }
+  /** True when `cmd` is one a button can run on this server. */
+  async function canRun(cmd) {
+    return !!actionFor(cmd) && !!(await session()).actions;
+  }
+
+  /**
+   * Confirm, run `cmd` through /api/action in repository `repoName`, and show
+   * its output in a dialog. Resolves to the response, or null if cancelled.
+   */
+  async function runCommand(cmd, repoName, root) {
+    const a = actionFor(cmd);
+    const s = await session();
+    if (!a || !s.actions) return null;
+    if (!window.confirm(a.ask + "\n\nRuns: " + cmd + (root ? "\nIn: " + root : ""))) return null;
+    const dlg = document.createElement("div");
+    dlg.className = "tsr-modal";
+    dlg.setAttribute("role", "dialog");
+    dlg.setAttribute("aria-modal", "true");
+    dlg.innerHTML = '<div class="tsr-modal-box"><div class="tsr-modal-head"><code></code><span class="tsr-modal-state">running <span class="tsr-modal-t">0 s</span></span></div>' +
+      '<pre class="tsr-modal-out">Running…</pre><div class="tsr-modal-foot"><button class="btn" data-m-copy disabled>Copy output</button><button class="btn primary" data-m-close>Close</button></div></div>';
+    dlg.querySelector("code").textContent = "$ " + cmd;
+    document.body.append(dlg);
+    const started = Date.now();
+    const tick = setInterval(() => {
+      const t = dlg.querySelector(".tsr-modal-t");
+      if (t) t.textContent = Math.round((Date.now() - started) / 1000) + " s";
+    }, 1000);
+    let text = "";
+    const done = new Promise((resolve) => {
+      dlg.addEventListener("click", async (e) => {
+        if (e.target.closest("[data-m-close]") || e.target === dlg) { dlg.remove(); resolve(); }
+        else if (e.target.closest("[data-m-copy]")) {
+          try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch (_) { /* clipboard refused */ }
+        }
+      });
+    });
+    let result = null;
+    try {
+      const resp = await fetch("/api/action/" + a.name + "?" + new URLSearchParams(Object.assign({ repo: repoName }, a.params)), {
+        method: "POST",
+        headers: { "X-Travsr-Token": s.token },
+      });
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.error || resp.status + " " + resp.statusText);
+      result = body;
+      text = (body.stderr ? body.stderr.replace(/\s+$/, "") + "\n" : "") + (body.stdout || "").replace(/\s+$/, "");
+      const ok = body.code === 0;
+      dlg.querySelector(".tsr-modal-state").textContent =
+        (body.code == null ? "still running" : "exit " + body.code) + " · " + Math.round(body.millis / 1000) + " s";
+      dlg.querySelector(".tsr-modal-state").className = "tsr-modal-state " + (ok ? "ok" : "bad");
+      dlg.querySelector(".tsr-modal-out").textContent = text || "(no output)";
+      dlg.querySelector("[data-m-copy]").disabled = !text;
+    } catch (e) {
+      dlg.querySelector(".tsr-modal-state").textContent = "not run";
+      dlg.querySelector(".tsr-modal-state").className = "tsr-modal-state bad";
+      dlg.querySelector(".tsr-modal-out").textContent = e.message;
+    } finally {
+      clearInterval(tick);
+    }
+    await done;
+    return result;
+  }
+
   // ── Execution path ───────────────────────────────────────────────────────
   // get_execution_path answers one of:
   //   path (N steps, source to sink):        then one `<sig> (<kind>) <dash> <path>` per step,
@@ -513,7 +607,7 @@ window.TravsrUi = (function () {
   return {
     esc, api, tool, cli, holdCliUntil, init, setConnection, withRepo, editorLink, watch,
     stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
-    suggest, suggestSymbols, suggestFiles, parseExecutionPath,
+    suggest, suggestSymbols, suggestFiles, parseExecutionPath, canRun, runCommand,
     get repo() { return repo; }, get repoRow() { return repoRow(); }, get repos() { return repos; },
   };
 })();

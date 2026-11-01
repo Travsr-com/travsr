@@ -282,7 +282,7 @@ fn shell_line(args: &[String]) -> String {
 }
 
 /// At most [`MAX_OUTPUT`] bytes of `bytes`, cut on a character boundary.
-fn capped(bytes: &[u8]) -> (String, bool) {
+pub(super) fn capped(bytes: &[u8]) -> (String, bool) {
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= MAX_OUTPUT {
         return (text.into_owned(), false);

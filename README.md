@@ -621,10 +621,19 @@ returns for the same arguments, and the Health page runs the same read-only
 CLI commands the extension runs (`daemon status`, `lang list --json`, ...).
 Graph queries go to the repository's running daemon, as `travsr status` does;
 with no daemon running they read the index directly, read-only, and the page
-says so. `travsr ui` never writes the index: one that needs a schema upgrade is
+says so. Reading never writes the index: one that needs a schema upgrade is
 reported with the command to run (`travsr init`) instead of being migrated.
-The pages are read-only: where the extension has an action button (Start
-daemon, Reindex, Install analyzer), the page copies the command to run instead.
+
+The action buttons run their command in the selected repository, after you
+confirm, and show its output: Start / Stop / Restart daemon, Reindex and Set up
+again (`travsr init`), Full rebuild (`init --force`), Run fsck and Compact
+(`fsck`, `fsck --fix`), Register all (`connect`), Disable a language
+(`lang remove`), the Sidecars Install and Change model (`embed init`,
+`embed list`), and on the Repos page Prune stale and remove an entry. Only
+that fixed list runs, one at a time, and only from a page this server served:
+each request carries a per-session token other websites cannot read, and a
+request from another origin is refused. With `--allow-remote` the buttons copy
+the command instead and nothing runs.
 "Open in editor" links open the file in VS Code when it is installed.
 
 Open pages redraw themselves when the index changes (after a commit, a save

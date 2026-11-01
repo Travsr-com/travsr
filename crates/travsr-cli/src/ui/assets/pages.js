@@ -223,7 +223,7 @@
       const LABEL = { index_missing: "index deleted", not_indexed: "never indexed" };
       const stale = rows.filter((r) => !r.exists).length;
       page.innerHTML = '<h2>Registered repos</h2><p class="sub">' + rows.length + " repo(s) in ~/.travsr/registry.json · " + stale + " stale.</p>" +
-        '<div class="toolbar"><button class="btn ' + (stale > 0 ? "primary" : "") + '" data-copy="travsr repos --prune" title="Copy: travsr repos --prune">Prune stale (' + stale + ")</button>" +
+        '<div class="toolbar"><button class="btn ' + (stale > 0 ? "primary" : "") + '" data-run data-copy="travsr repos --prune" title="travsr repos --prune">Prune stale (' + stale + ")</button>" +
         '<button class="btn" id="refreshBtn">Refresh</button></div>' +
         "<table><thead><tr><th>Name</th><th>DB Path</th><th>Status</th><th></th></tr></thead><tbody>" +
         (rows.map((r) => {
@@ -234,7 +234,7 @@
           return '<tr><td class="mono">' + (open ? '<a href="' + esc("/health?repo=" + encodeURIComponent(open.name)) + '">' + esc(r.name) + "</a>" : esc(r.name)) + "</td>" +
             '<td class="mono muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis" title="' + esc(r.path) + '">' + esc(r.path) + "</td>" +
             "<td>" + (r.exists ? '<span class="badge ok">active</span>' : '<span class="badge stale">' + esc(LABEL[r.status] || "stale") + "</span>") + "</td>" +
-            '<td><button class="x-btn" data-copy="travsr repos --remove ' + esc(r.name) + '" title="Copy: travsr repos --remove ' + esc(r.name) + '">✕</button></td></tr>';
+            '<td><button class="x-btn" data-run data-copy="travsr repos --remove ' + esc(r.name) + '" title="Remove from the registry: travsr repos --remove ' + esc(r.name) + '">✕</button></td></tr>';
         }).join("\n") || '<tr><td colspan="4" class="empty">No repos registered.</td></tr>') + "</tbody></table>";
     }
     page.addEventListener("click", (e) => { if (e.target.id === "refreshBtn") render(); });
@@ -242,12 +242,21 @@
     render();
   }
 
-  // Shared: every "copy the command" button.
+  // Shared: every command button. One marked data-run runs its command here
+  // when the server allows it (loopback, no --allow-remote); the rest copy.
   page.addEventListener("click", async (e) => {
     const b = e.target.closest("[data-copy]");
     if (!b) return;
     e.preventDefault();
     const cmd = b.getAttribute("data-copy");
+    if (b.hasAttribute("data-run") && ui.repo && await ui.canRun(cmd)) {
+      const row = ui.repoRow;
+      if (await ui.runCommand(cmd, ui.repo, row && row.root)) {
+        // A page that was waiting for an index has one now.
+        if (refreshView && !b.classList.contains("vact")) refreshView(); else location.reload();
+      }
+      return;
+    }
     const label = b.textContent;
     try { await navigator.clipboard.writeText(cmd); b.textContent = "Copied"; } catch (_) { window.prompt("Run this in a terminal:", cmd); }
     setTimeout(() => { b.textContent = label; }, 1200);
@@ -1018,7 +1027,7 @@
     if (path !== "/repos" && (!row || !row.indexed)) {
       page.innerHTML = '<div class="banner idle verdict"><strong>No graph yet</strong><span>' +
         (row ? esc(row.name) + " is not indexed yet. Run travsr init in " + esc(row.root) + "." : "No indexed repositories found. Run travsr init in a git repository.") +
-        '</span><button class="btn primary vact" data-copy="travsr init">Index this repo</button></div>';
+        '</span><button class="btn primary vact" data-run data-copy="travsr init">Index this repo</button></div>';
       return;
     }
     (VIEWS[path] || callers)();

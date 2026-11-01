@@ -381,8 +381,9 @@ enum Command {
     },
     /// Browse the code graph in a web browser: repo status, the repo map and
     /// symbol graph, callers, dependencies, blast radius, the context agents
-    /// get, and the read-only CLI commands. Read-only; serves on this machine
-    /// only unless --allow-remote is given.
+    /// get, and the read-only CLI commands. Its action buttons (daemon,
+    /// reindex, fsck, connect) run after a confirm. Serves on this machine
+    /// only unless --allow-remote is given, which also turns the buttons off.
     Ui {
         /// Address to bind on: an IP address, or localhost. Must be a
         /// loopback address unless --allow-remote is also given.
