@@ -587,6 +587,11 @@ registered one:
 - **Health:** the extension's Health page: verdict, metric tiles, daemon,
   index freshness, sidecars, storage and integrity, languages, repositories,
   recent activity and the daemon log with its filters.
+- **Architecture:** how the repository is put together, from the
+  `get_architecture_brief` facts agents get: components stacked in layers
+  from foundation to entry point, dependency cycles, the dependency edges by
+  weight, and what each component owns. Click a component to see what it
+  depends on and what depends on it.
 - **Graph:** the extension's graph view itself (repo map, symbol graph, blast
   view, definition peek, DOT/JSON/PNG export).
 - **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's

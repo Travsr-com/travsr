@@ -163,6 +163,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/blast", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/context", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/path", get(|| async { asset(HTML, PAGES_HTML) }))
+        .route("/architecture", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/terminal", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/repos", get(|| async { asset(HTML, PAGES_HTML) }))
         // Assets.
@@ -442,7 +443,7 @@ fn resolve_repo(state: &UiState, name: Option<&str>) -> Result<NamedRepo, ApiErr
 }
 
 /// Where an answer came from, so the page can say when no daemon is running.
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Route {
     Daemon,
@@ -680,13 +681,18 @@ async fn tool(
     // as the extension's own `travsr mcp --stdio` child answers them; the
     // daemon refuses them (travsr_mcp::DIRECT_ONLY_TOOLS says why).
     let use_daemon = !travsr_mcp::DIRECT_ONLY_TOOLS.contains(&tool.as_str());
-    let deadline = if tool == "get_context" {
+    // Both walk the whole graph rather than read around one symbol.
+    let deadline = if matches!(tool.as_str(), "get_context" | "get_architecture_brief") {
         CONTEXT_DEADLINE
     } else {
         QUERY_DEADLINE
     };
-    let (payload, route): (ToolPayload, Route) = run_query_via(
-        repo,
+    let direct_args = ToolQueryArgs {
+        tool: args.tool.clone(),
+        args: args.args.clone(),
+    };
+    let (mut payload, mut route): (ToolPayload, Route) = run_query_via(
+        repo.clone(),
         "tool",
         wire,
         move |store| Ok(query::tool_query(store, &args)),
@@ -694,6 +700,26 @@ async fn tool(
         deadline,
     )
     .await?;
+    // A daemon built before this tool joined BROWSE_TOOLS refuses it by name.
+    // It restarts itself when the binary's version changes, but two builds of
+    // one version (a source checkout) leave the older daemon running, so the
+    // page asks the index itself rather than fail.
+    if route == Route::Daemon
+        && payload
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("unknown tool"))
+    {
+        (payload, route) = run_query_via(
+            repo,
+            "tool",
+            serde_json::Value::Null,
+            move |store| Ok(query::tool_query(store, &direct_args)),
+            false,
+            deadline,
+        )
+        .await?;
+    }
     if let Some(e) = payload.error {
         return Err(ApiError(StatusCode::BAD_REQUEST, e));
     }
@@ -916,6 +942,7 @@ mod tests {
     async fn every_page_in_the_nav_is_served() {
         for page in [
             "/health",
+            "/architecture",
             "/graph",
             "/callers",
             "/dependencies",

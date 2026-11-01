@@ -7,6 +7,7 @@
 window.TravsrUi = (function () {
   const PAGES = [
     ["/health", "Health"],
+    ["/architecture", "Architecture"],
     ["/graph", "Graph"],
     ["/callers", "Callers"],
     ["/dependencies", "Dependencies"],

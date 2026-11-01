@@ -321,7 +321,8 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 
 /// The read-only single-repo tools `travsr ui` (#1036) serves besides MCP:
 /// the ones the VS Code extension's Health, Graph, Callers, Dependencies,
-/// Blast radius, Repos and Context Explorer pages call. Nothing here writes.
+/// Blast radius, Repos and Context Explorer pages call, plus the architecture
+/// brief its Architecture page draws. Nothing here writes.
 ///
 /// Both surfaces dispatch through [`browse_tool_text`], so the browser and an
 /// MCP client asking the same question get the same text by construction,
@@ -341,6 +342,7 @@ pub const BROWSE_TOOLS: &[&str] = &[
     "repos_list",
     "repo_languages",
     "get_context",
+    "get_architecture_brief",
 ];
 
 /// The [`BROWSE_TOOLS`] that inspect the index rather than read the graph:
@@ -450,6 +452,12 @@ fn browse_tool_text(
         // #636: read-only observability tools.
         "get_index_status" => crate::observability::get_index_status(store),
         "get_graph_health" => crate::observability::get_graph_health(store),
+        // The Architecture page.
+        "get_architecture_brief" => {
+            let provenance = args["provenance"].as_str().unwrap_or("ratified");
+            let token_budget = args["token_budget"].as_u64().unwrap_or(8_000) as usize;
+            tools::get_architecture_brief(store, provenance, token_budget)
+        }
         // The Context Explorer: what an agent would be handed for a question.
         "get_context" => {
             let query = args["query"].as_str().unwrap_or("");
@@ -544,11 +552,6 @@ fn handle_tool_call(
             let fixed = args["fixed"].as_bool().unwrap_or(false);
             let context = args["context"].as_u64().unwrap_or(0) as u32;
             tools::find_pattern(store, pattern, scope, fixed, context)
-        }
-        "get_architecture_brief" => {
-            let provenance = args["provenance"].as_str().unwrap_or("ratified");
-            let token_budget = args["token_budget"].as_u64().unwrap_or(8_000) as usize;
-            tools::get_architecture_brief(store, provenance, token_budget)
         }
         "get_subsystem_brief" => {
             let entry = args["entry"].as_str().unwrap_or("");
@@ -2127,6 +2130,10 @@ mod tests {
             (
                 "get_context",
                 serde_json::json!({ "query": "run", "token_budget": "800", "include_snippets": "true" }),
+            ),
+            (
+                "get_architecture_brief",
+                serde_json::json!({ "provenance": "", "token_budget": "4000" }),
             ),
         ] {
             let via_ui = browse_tool_call(&store, tool, &args).expect(tool);

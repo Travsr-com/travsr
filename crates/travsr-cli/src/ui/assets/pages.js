@@ -828,7 +828,163 @@
     run();
   }
 
-  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
+  // ── Architecture ───────────────────────────────────────────────────────
+  // get_architecture_brief, the facts agents get for explaining how a repo is
+  // put together, drawn: components in layers from foundation to entry point,
+  // dependency cycles, the weighted edges, and what each component owns.
+  //
+  // The brief is sectioned text:
+  //   ## Shape        - 21 components, 50 edges, 7 layers
+  //   ## Cycles       - a <-> b   (or a -> b -> c -> a)
+  //   ## Components   - name | layer N | X dependents | depends on Y | F files | S symbols
+  //   ## Dependency edges   - a -> b (W, code+manifest)
+  //   ## What each component owns   ### name, then - key: value
+  //   ## Freshness, ## What this brief cannot tell you   - lines
+  function parseArchitecture(raw) {
+    const out = { header: [], shape: "", cycles: [], comps: [], edges: [], owns: {}, notes: [], caveats: [] };
+    let sec = "";
+    let owner = null;
+    for (const line of ui.envelopeBody(raw).split("\n").map((l) => l.trim())) {
+      if (!line) continue;
+      const h = /^##\s+(.+)$/.exec(line);
+      if (h) { sec = h[1].toLowerCase(); owner = null; continue; }
+      const h3 = /^###\s+(.+)$/.exec(line);
+      if (h3) { owner = h3[1]; out.owns[owner] = []; continue; }
+      if (/^\[note:/.test(line)) { out.notes.push(line.replace(/^\[note:\s*/, "").replace(/\]$/, "")); continue; }
+      const item = line.replace(/^-\s+/, "");
+      if (!sec) { if (line !== "ARCHITECTURE BRIEF") out.header.push(line); }
+      else if (sec.startsWith("shape")) out.shape += (out.shape ? "; " : "") + item;
+      else if (sec.startsWith("cycles")) out.cycles.push(item.split(/\s*<?->\s*/).filter(Boolean));
+      else if (sec.startsWith("components")) {
+        const p = item.split("|").map((x) => x.trim());
+        const num = (re, s) => { const m = re.exec(s || ""); return m ? Number(m[1]) : 0; };
+        if (p.length >= 6) {
+          out.comps.push({ name: p[0], layer: num(/layer (\d+)/, p[1]), dependents: num(/(\d+)/, p[2]), deps: num(/(\d+)/, p[3]), files: num(/(\d+)/, p[4]), symbols: num(/(\d+)/, p[5]) });
+        }
+      } else if (sec.startsWith("dependency edges")) {
+        const m = /^(.+?)\s+->\s+(.+?)\s+\((\d+),\s*([^)]+)\)$/.exec(item);
+        if (m) out.edges.push({ from: m[1], to: m[2], weight: Number(m[3]), source: m[4].trim() });
+      } else if (sec.startsWith("what each component owns")) {
+        if (owner) out.owns[owner].push(item);
+      } else if (sec.startsWith("what this brief cannot")) out.caveats.push(item);
+    }
+    return out;
+  }
+
+  function architectureView() {
+    document.title = "Travsr: Architecture";
+    const prov0 = params.get("provenance") === "all" ? "all" : "ratified";
+    page.innerHTML =
+      '<div class="phead"><div><h2>Architecture</h2><p class="sub" style="margin:2px 0 0">How this repository is put together: components in layers from foundation to entry point, what depends on what, and any cycles.</p></div>' +
+      '<div class="phead-a"><label class="sel">Edges <select id="a-prov" title="Which dependencies to trust">' +
+      '<option value="ratified"' + (prov0 === "ratified" ? " selected" : "") + '>ratified</option>' +
+      '<option value="all"' + (prov0 === "all" ? " selected" : "") + ">all, incl. live</option></select></label>" +
+      '<button class="btn" id="a-refresh">Refresh</button></div></div><div id="out"></div>';
+    const provEl = document.getElementById("a-prov");
+    let brief = null;
+    let selected = params.get("c") || "";
+
+    async function load() {
+      const out = document.getElementById("out");
+      out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Reading the architecture…</p>';
+      try {
+        const raw = await ui.tool("get_architecture_brief", { provenance: provEl.value === "all" ? "" : "ratified", token_budget: "32000" });
+        brief = parseArchitecture(raw);
+        if (selected && !brief.comps.some((c) => c.name === selected)) selected = "";
+        render();
+      } catch (e) {
+        out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+      }
+    }
+    refreshView = () => load();
+
+    const shortName = (n) => n.split("/").pop();
+
+    function render() {
+      const b = brief;
+      const out = document.getElementById("out");
+      if (!b.comps.length) {
+        out.innerHTML = '<div class="note-box">' + esc(b.shape || "No components: this index has no indexed source files.") + "</div>";
+        return;
+      }
+      const inCycle = new Set(b.cycles.flat());
+      const depsOf = new Set(b.edges.filter((e) => e.from === selected).map((e) => e.to));
+      const usersOf = new Set(b.edges.filter((e) => e.to === selected).map((e) => e.from));
+      const layers = Math.max(...b.comps.map((c) => c.layer));
+      const card = (k, v, cls, note) => '<div class="card' + (cls ? " " + cls : "") + '"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" + (note ? '<div class="s">' + esc(note) + "</div>" : "") + "</div>";
+
+      let html = '<div class="cards a-cards">' +
+        card("Components", String(b.comps.length)) +
+        card("Dependencies", String(b.edges.length)) +
+        card("Layers", String(layers + 1), "", "0 is the foundation") +
+        card("Cycles", String(b.cycles.length), b.cycles.length ? "bad" : "", b.cycles.length ? "should be none" : "none") + "</div>";
+      if (b.cycles.length) {
+        html += '<div class="diag error a-cycles"><div class="diag-t">Dependency cycle' + (b.cycles.length > 1 ? "s" : "") + "</div>" +
+          b.cycles.map((cy) => '<div class="a-cycle">' + cy.map((n) => '<button class="link-btn" type="button" data-comp="' + esc(n) + '">' + esc(n) + "</button>").join(' <span class="muted">⇄</span> ') + "</div>").join("") +
+          '<div class="diag-d">Each component reaches the other through its dependencies, so neither can be built, tested or reasoned about alone. Select one to see the edges involved.</div></div>';
+      }
+
+      // Layers, foundation at the bottom as in a stack diagram.
+      html += '<h3 class="a-h">Layers <span class="muted">(click a component)</span></h3><div class="a-layers">';
+      for (let l = layers; l >= 0; l--) {
+        const row = b.comps.filter((c) => c.layer === l).sort((x, y) => y.dependents - x.dependents || x.name.localeCompare(y.name));
+        html += '<div class="a-layer"><div class="a-ln" title="layer ' + l + '">' + l + '</div><div class="a-row">' +
+          row.map((c) => {
+            const cls = ["a-comp", c.name === selected ? "sel" : "", depsOf.has(c.name) ? "dep" : "", usersOf.has(c.name) ? "user" : "", inCycle.has(c.name) ? "cyc" : ""].filter(Boolean).join(" ");
+            return '<button class="' + cls + '" type="button" data-comp="' + esc(c.name) + '" title="' + esc(c.name) + '">' +
+              '<span class="a-name">' + esc(shortName(c.name)) + "</span>" +
+              '<span class="a-meta">' + c.dependents + " in · " + c.deps + " out · " + c.files + " files</span></button>";
+          }).join("") + "</div></div>";
+      }
+      html += '</div><div class="a-legend"><span><i class="sel"></i>selected</span><span><i class="dep"></i>it depends on</span><span><i class="user"></i>depends on it</span><span><i class="cyc"></i>in a cycle</span></div>';
+
+      // Detail for the selected component.
+      if (selected) {
+        const c = b.comps.find((x) => x.name === selected);
+        const own = b.owns[selected] || [];
+        html += '<div class="hsec a-detail"><div class="a-dhead"><h3>' + esc(selected) + "</h3>" +
+          '<button class="link-btn" type="button" data-comp="">clear</button></div><div class="a-dbody">' +
+          '<p class="sub">Layer ' + c.layer + " · " + c.files + " files · " + c.symbols + " symbols · " + c.dependents + " dependents · depends on " + c.deps + "</p>" +
+          own.map((o) => {
+            const kv = /^([^:]+):\s*(.+)$/.exec(o);
+            return kv ? '<div class="a-own"><span class="a-k">' + esc(kv[1]) + '</span><span class="a-v">' + esc(kv[2]) + "</span></div>" : '<div class="a-own">' + esc(o) + "</div>";
+          }).join("") + "</div></div>";
+      }
+
+      // Edges, heaviest first; only the selected component's when one is.
+      const shown = selected ? b.edges.filter((e) => e.from === selected || e.to === selected) : b.edges;
+      const maxW = Math.max(1, ...b.edges.map((e) => e.weight));
+      html += '<h3 class="a-h">Dependencies' + (selected ? " of " + esc(shortName(selected)) : "") + ' <span class="badge dim">' + shown.length + "</span></h3>" +
+        '<table class="a-edges"><thead><tr><th>From</th><th></th><th>To</th><th>Weight</th><th>Seen in</th></tr></thead><tbody>' +
+        shown.map((e) => {
+          const bad = inCycle.has(e.from) && inCycle.has(e.to);
+          return '<tr' + (bad ? ' class="cyc"' : "") + '><td><button class="link-btn" type="button" data-comp="' + esc(e.from) + '">' + esc(e.from) + '</button></td><td class="muted">→</td>' +
+            '<td><button class="link-btn" type="button" data-comp="' + esc(e.to) + '">' + esc(e.to) + "</button></td>" +
+            '<td class="a-w"><span class="a-bar"><span style="width:' + Math.max(3, (e.weight / maxW) * 100).toFixed(0) + '%"></span></span> ' + e.weight + "</td>" +
+            '<td class="muted">' + esc(e.source) + "</td></tr>";
+        }).join("") + "</tbody></table>" +
+        '<p class="sub" style="font-size:11.5px">Weight is the number of distinct file pairs that cross; <em>manifest</em> means declared in a package manifest, <em>code</em> means resolved in the code.</p>';
+
+      html += b.notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("");
+      if (b.caveats.length) {
+        html += '<details class="a-caveats"><summary>What this view cannot tell you</summary><ul>' + b.caveats.map((c) => "<li>" + esc(c) + "</li>").join("") + "</ul></details>";
+      }
+      out.innerHTML = html;
+    }
+
+    page.addEventListener("click", (e) => {
+      const t = e.target.closest("[data-comp]");
+      if (!t || !brief) return;
+      selected = t.dataset.comp === selected ? "" : t.dataset.comp;
+      setQuery("c", selected);
+      render();
+    });
+    provEl.addEventListener("change", () => { setQuery("provenance", provEl.value === "all" ? "all" : ""); load(); });
+    document.getElementById("a-refresh").addEventListener("click", load);
+    load();
+  }
+
+  const VIEWS = { "/architecture": architectureView, "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
 
   (async function main() {
     const path = location.pathname.replace(/\/+$/, "");
