@@ -125,11 +125,11 @@ pub(super) async fn cli(
 
 /// Allowlisted commands that may run as processes at once, across every
 /// client of this server.
-const CLI_PROCESS_SLOTS: usize = 2;
+pub(super) const CLI_PROCESS_SLOTS: usize = 2;
 /// Longest a request waits for one of those slots.
-const CLI_SLOT_WAIT: Duration = Duration::from_secs(30);
+pub(super) const CLI_SLOT_WAIT: Duration = Duration::from_secs(30);
 
-fn cli_slots() -> &'static tokio::sync::Semaphore {
+pub(super) fn cli_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| tokio::sync::Semaphore::new(CLI_PROCESS_SLOTS))
 }

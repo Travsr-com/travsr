@@ -279,3 +279,33 @@ body:not(.ui-page) #brand .word {
 .ctx-raw { max-height: 70vh; overflow: auto; }
 .ctx-stale { display: flex; align-items: center; gap: 8px; }
 @media (max-width: 760px) { .ctx-form .ctx-q { min-width: 0; flex: 1 1 100%; } .ctx-actions { margin-left: 0; } }
+
+/* ── Terminal (pages.js terminalView) ─────────────────────────────────── */
+.t-tabs { margin: 0 0 12px; }
+.t-form .t-main { flex: 1 1 320px; min-width: 220px; }
+.t-form .t-path { flex: 0 1 220px; min-width: 160px; }
+.t-form select { height: 30px; }
+.t-form input:disabled, .t-form select:disabled { opacity: .45; }
+.t-log { display: flex; flex-direction: column; gap: 12px; margin-top: 6px; }
+.t-entry {
+  border: 1px solid var(--tsr-border-soft); border-radius: 10px; overflow: hidden;
+  background: var(--tsr-surface);
+}
+.t-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 7px 12px;
+  border-bottom: 1px solid var(--tsr-border-soft); font-size: 12px;
+}
+.t-cmd { font: 600 12px var(--tsr-font-mono); color: var(--tsr-accent-text); word-break: break-all; }
+.t-meta { color: var(--tsr-muted); font-size: 11px; white-space: nowrap; }
+.t-meta.bad { color: var(--tsr-error); }
+.t-acts { margin-left: auto; display: flex; gap: 10px; }
+.t-out {
+  margin: 0; padding: 10px 12px; max-height: 60vh; overflow: auto;
+  background: var(--tsr-input); font: 11.5px/1.55 var(--tsr-font-mono);
+  color: var(--tsr-text); white-space: pre;
+}
+.t-out.t-err { color: var(--tsr-secondary); background: var(--tsr-accent-deep); max-height: 9em; white-space: pre-wrap; }
+.t-out a { color: inherit; text-decoration: underline; text-decoration-color: var(--tsr-accent-line); text-underline-offset: 2px; }
+.t-out a.t-sig { color: var(--tsr-accent-text); }
+.t-out a:hover { text-decoration-color: currentColor; }
+@media (max-width: 760px) { .t-form .t-main, .t-form .t-path { min-width: 0; flex: 1 1 100%; } }

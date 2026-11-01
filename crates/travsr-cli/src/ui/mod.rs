@@ -41,6 +41,7 @@ use travsr_mcp::query::{self, StatusPayload, ToolPayload, ToolQueryArgs};
 use crate::daemon_client;
 
 mod files;
+mod terminal;
 
 const HEALTH_HTML: &str = include_str!("assets/health.html");
 const PAGES_HTML: &str = include_str!("assets/pages.html");
@@ -161,6 +162,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/dependencies", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/blast", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/context", get(|| async { asset(HTML, PAGES_HTML) }))
+        .route("/terminal", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/repos", get(|| async { asset(HTML, PAGES_HTML) }))
         // Assets.
         .route("/assets/shell.css", get(|| async { asset(CSS, SHELL_CSS) }))
@@ -192,6 +194,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/api/logs", get(files::logs))
         .route("/api/source", get(files::source))
         .route("/api/files", get(files::files))
+        .route("/api/run/:cmd", get(terminal::run))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }

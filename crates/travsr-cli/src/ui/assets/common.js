@@ -12,6 +12,7 @@ window.TravsrUi = (function () {
     ["/dependencies", "Dependencies"],
     ["/blast", "Blast radius"],
     ["/context", "Context"],
+    ["/terminal", "Terminal"],
     ["/repos", "Repos"],
   ];
 

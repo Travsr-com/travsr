@@ -512,7 +512,158 @@
     run(q0);
   }
 
-  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/context": contextView, "/repos": repos };
+  // ── Terminal ───────────────────────────────────────────────────────────
+  // `travsr ask` and `travsr graph`, run as in a shell (terminal.rs): the
+  // CLI's own output, with symbols and file:line made clickable. The page
+  // sends named fields; the server builds the argv.
+  const SIG_KINDS = "fn|method|struct|enum|trait|impl|class|interface|const|static|type|field|variant|var|test|macro|module|constructor|function";
+  const LINKS = new RegExp(
+    "\\b(" + SIG_KINDS + "):([A-Za-z_$][\\w$.]*)" +                    // signature: fn:name
+    "|((?:[\\w.-]+/)+[\\w.-]+\\.[A-Za-z0-9]+)(?::(\\d+))?",              // path: a/b.rs:12
+    "g");
+
+  /** One line of CLI output as HTML, signatures and paths linked. */
+  function linkify(line) {
+    let html = "";
+    let at = 0;
+    for (const m of line.matchAll(LINKS)) {
+      html += esc(line.slice(at, m.index));
+      if (m[1]) {
+        html += '<a class="t-sig" href="' + esc(ui.withRepo("/graph", { q: m[0] })) + '" title="Show in the graph">' + esc(m[0]) + "</a>";
+      } else {
+        const link = ui.editorLink(m[3], m[4] ? Number(m[4]) : null);
+        html += link ? '<a class="t-path" href="' + esc(link) + '" title="Open in VS Code">' + esc(m[0]) + "</a>" : esc(m[0]);
+      }
+      at = m.index + m[0].length;
+    }
+    return html + esc(line.slice(at));
+  }
+
+  function terminalView() {
+    document.title = "Travsr: Terminal";
+    const start = params.get("cmd") === "graph" ? "graph" : "ask";
+    const depthOpts = [1, 2, 3, 4, 5, 6].map((d) => '<option value="' + d + '"' + (d === 3 ? " selected" : "") + ">" + d + "</option>").join("");
+    page.innerHTML =
+      '<div class="phead"><h2>Terminal</h2></div>' +
+      '<p class="sub" style="margin:-4px 0 14px">Run <code>travsr ask</code> and <code>travsr graph</code> here, exactly as in a shell, in this repository. Read-only: nothing here changes the index.</p>' +
+      '<div class="pills t-tabs" role="tablist">' +
+      '<button class="pill-btn" type="button" role="tab" data-tab="ask">travsr ask</button>' +
+      '<button class="pill-btn" type="button" role="tab" data-tab="graph">travsr graph</button></div>' +
+      // ask
+      '<form class="lookup t-form" id="t-ask" data-cmd="ask">' +
+      '<span class="lookup-box t-main"><input id="t-ask-q" type="search" placeholder="a question, or a symbol name" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<label class="sel" for="t-ask-f">Format</label><select id="t-ask-f"><option value="table">table</option><option value="json">json</option></select>' +
+      '<button class="btn primary" type="submit">Run</button>' +
+      '<button class="btn" type="button" data-examples="1" title="travsr ask --examples">Examples</button></form>' +
+      // graph
+      '<form class="lookup t-form" id="t-graph" data-cmd="graph">' +
+      '<span class="lookup-box t-main"><input id="t-graph-q" type="search" placeholder="symbol or file name" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<span class="lookup-box t-path"><input id="t-graph-p" type="search" placeholder="--path (optional)" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<label class="sel" for="t-graph-d">Depth</label><select id="t-graph-d">' + depthOpts + "</select>" +
+      '<label class="sel" for="t-graph-r">Direction</label><select id="t-graph-r"><option value="deps">deps</option><option value="callers">callers</option><option value="both">both</option></select>' +
+      '<label class="sel" for="t-graph-f">Format</label><select id="t-graph-f"><option value="tree">tree</option><option value="dot">dot</option><option value="json">json</option></select>' +
+      '<label class="ctx-check"><input id="t-graph-all" type="checkbox"> whole repo (--all)</label>' +
+      '<button class="btn primary" type="submit">Run</button></form>' +
+      '<div id="t-log" class="t-log"></div>';
+
+    const forms = { ask: document.getElementById("t-ask"), graph: document.getElementById("t-graph") };
+    const log = document.getElementById("t-log");
+    const allBox = document.getElementById("t-graph-all");
+    const graphOnlyOne = ["t-graph-q", "t-graph-p", "t-graph-d", "t-graph-r"].map((id) => document.getElementById(id));
+
+    // The query box is a symbol on graph, often a symbol on ask; --path is a file.
+    for (const [id, search] of [["t-ask-q", ui.suggestSymbols], ["t-graph-q", ui.suggestSymbols], ["t-graph-p", ui.suggestFiles]]) {
+      const input = document.getElementById(id);
+      ui.suggest(input, { anchor: input.parentElement, search, onPick: () => input.form.requestSubmit() });
+    }
+
+    function tab(name) {
+      for (const [n, f] of Object.entries(forms)) f.hidden = n !== name;
+      document.querySelectorAll(".t-tabs [data-tab]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.tab === name)));
+      setQuery("cmd", name === "ask" ? "" : name);
+    }
+    tab(start);
+
+    allBox.addEventListener("change", () => graphOnlyOne.forEach((el) => { el.disabled = allBox.checked; }));
+
+    function fields(cmd, extra) {
+      if (cmd === "ask") {
+        return Object.assign({ query: document.getElementById("t-ask-q").value, format: document.getElementById("t-ask-f").value }, extra);
+      }
+      if (allBox.checked) return { all: "1", format: document.getElementById("t-graph-f").value };
+      return {
+        query: document.getElementById("t-graph-q").value,
+        path: document.getElementById("t-graph-p").value,
+        depth: document.getElementById("t-graph-d").value,
+        direction: document.getElementById("t-graph-r").value,
+        format: document.getElementById("t-graph-f").value,
+      };
+    }
+
+    async function run(cmd, extra) {
+      const args = fields(cmd, extra);
+      const entry = document.createElement("section");
+      entry.className = "t-entry";
+      entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(cmd) + ' <span class="spinner">⟳</span></span>' +
+        '<span class="t-meta">running <span class="t-time">0 s</span></span></div>';
+      log.prepend(entry);
+      const started = Date.now();
+      const tick = setInterval(() => {
+        const t = entry.querySelector(".t-time");
+        if (t) t.textContent = Math.round((Date.now() - started) / 1000) + " s";
+      }, 1000);
+      try {
+        const r = await ui.api("/api/run/" + cmd, Object.assign({ repo: ui.repo }, args));
+        const ok = r.code === 0;
+        const secs = r.millis / 1000;
+        const out = r.stdout.replace(/\s+$/, "");
+        const notes = r.stderr.replace(/\s+$/, "");
+        entry.innerHTML =
+          '<div class="t-head"><span class="t-cmd">$ ' + esc(r.command) + "</span>" +
+          '<span class="t-meta ' + (ok ? "" : "bad") + '">' + (r.code == null ? "timed out" : "exit " + r.code) + " · " + (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + " s</span>" +
+          '<span class="t-acts"><button class="link-btn" type="button" data-copy-cmd="1">copy command</button>' +
+          '<button class="link-btn" type="button" data-copy-out="1">copy output</button>' +
+          '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
+          (notes ? '<pre class="t-out t-err">' + notes.split("\n").map(linkify).join("\n") + "</pre>" : "") +
+          '<pre class="t-out">' + (out ? out.split("\n").map(linkify).join("\n") : '<span class="muted">(no output)</span>') + "</pre>" +
+          (r.truncated ? '<div class="note-box">Output cut at 2 MB. Run the command in a shell for all of it.</div>' : "");
+        entry.dataset.command = r.command;
+        entry.dataset.output = (notes ? notes + "\n" : "") + out;
+      } catch (e) {
+        entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(cmd) + '</span><span class="t-meta bad">not run</span>' +
+          '<span class="t-acts"><button class="link-btn" type="button" data-close="1">✕</button></span></div>' +
+          '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+      } finally {
+        clearInterval(tick);
+      }
+    }
+
+    for (const f of Object.values(forms)) {
+      f.addEventListener("submit", (e) => { e.preventDefault(); run(f.dataset.cmd); });
+    }
+
+    page.addEventListener("click", async (e) => {
+      const t = e.target.closest("[data-tab],[data-examples],[data-copy-cmd],[data-copy-out],[data-close]");
+      if (!t) return;
+      if (t.dataset.tab) { tab(t.dataset.tab); return; }
+      if (t.dataset.examples) { run("ask", { examples: "1" }); return; }
+      const entry = t.closest(".t-entry");
+      if (t.dataset.close) { entry.remove(); return; }
+      const text = t.dataset.copyCmd ? entry.dataset.command : entry.dataset.output;
+      const label = t.textContent;
+      try { await navigator.clipboard.writeText(text || ""); t.textContent = "copied"; } catch (_) { t.textContent = "copy failed"; }
+      setTimeout(() => { t.textContent = label; }, 1400);
+    });
+
+    // A link like /terminal?cmd=graph&q=foo runs straight away.
+    const q0 = params.get("q");
+    if (q0) {
+      document.getElementById(start === "graph" ? "t-graph-q" : "t-ask-q").value = q0;
+      run(start);
+    }
+  }
+
+  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/context": contextView, "/terminal": terminalView, "/repos": repos };
 
   (async function main() {
     const path = location.pathname.replace(/\/+$/, "");
