@@ -932,9 +932,15 @@ function updateDiagBadge() {
 
 // ── Status bar ────────────────────────────────────────────────────────────────
 function updateStatusBar() {
-  const n = cy.nodes(':visible').not(':parent').length;
-  const e = cy.edges(':visible').length;
-  const tokens = cy.nodes(':visible').not(':parent').reduce((sum, nd) => {
+  // Shown, not `:visible`: Cytoscape counts opacity 0 as invisible, and this
+  // runs right after bloom() has set every element to opacity 0 for its
+  // fade-in, so `:visible` read "0 nodes · 0 edges" whenever fx was on.
+  // Filters hide elements with display/visibility, which is what to count.
+  const shown = (els) => els.filter((el) => el.style('display') !== 'none' && el.style('visibility') !== 'hidden');
+  const nodes = shown(cy.nodes().not(':parent'));
+  const n = nodes.length;
+  const e = shown(cy.edges()).length;
+  const tokens = nodes.reduce((sum, nd) => {
     const d = nd.data();
     return sum + Math.max(1, Math.floor(((d.label || '').length + (d.kind || '').length + (d.path || '').length) / 4));
   }, 0);

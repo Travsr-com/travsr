@@ -890,6 +890,7 @@
       try {
         const raw = await ui.tool("get_architecture_brief", { provenance: provEl.value === "all" ? "" : "ratified", token_budget: "32000" });
         brief = parseArchitecture(raw);
+        labels = uniqueLabels(brief.comps.map((c) => c.name));
         if (selected && !brief.comps.some((c) => c.name === selected)) selected = "";
         render();
       } catch (e) {
@@ -898,7 +899,23 @@
     }
     refreshView = () => load();
 
-    const shortName = (n) => n.split("/").pop();
+    // The shortest tail of each component's path that no other component
+    // shares: a Java tree has many `model` and `service` packages, which the
+    // last segment alone showed as identical cards.
+    let labels = {};
+    function uniqueLabels(names) {
+      const parts = Object.fromEntries(names.map((n) => [n, n.split("/")]));
+      const out = {};
+      for (const n of names) {
+        for (let k = 1; k <= parts[n].length; k++) {
+          const tail = parts[n].slice(-k).join("/");
+          if (!names.some((o) => o !== n && parts[o].slice(-k).join("/") === tail)) { out[n] = tail; break; }
+        }
+        if (!out[n]) out[n] = n;
+      }
+      return out;
+    }
+    const shortName = (n) => labels[n] || n.split("/").pop();
 
     function render() {
       const b = brief;
@@ -953,6 +970,14 @@
 
       // Edges, heaviest first; only the selected component's when one is.
       const shown = selected ? b.edges.filter((e) => e.from === selected || e.to === selected) : b.edges;
+      if (!b.edges.length) {
+        html += '<h3 class="a-h">Dependencies</h3><div class="note-box">No dependencies between components were resolved, so every component sits in layer 0. ' +
+          "Imports that only name packages, or a language whose full analysis has not run (see the Health page's Languages section), leave no edges here; it does not mean the components are independent.</div>";
+        html += b.notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("");
+        if (b.caveats.length) html += '<details class="a-caveats"><summary>What this view cannot tell you</summary><ul>' + b.caveats.map((c) => "<li>" + esc(c) + "</li>").join("") + "</ul></details>";
+        out.innerHTML = html;
+        return;
+      }
       const maxW = Math.max(1, ...b.edges.map((e) => e.weight));
       html += '<h3 class="a-h">Dependencies' + (selected ? " of " + esc(shortName(selected)) : "") + ' <span class="badge dim">' + shown.length + "</span></h3>" +
         '<table class="a-edges"><thead><tr><th>From</th><th></th><th>To</th><th>Weight</th><th>Seen in</th></tr></thead><tbody>' +
