@@ -311,3 +311,40 @@ body:not(.ui-page) #brand .word {
 @media (max-width: 760px) { .t-form .t-main, .t-form .t-path { min-width: 0; flex: 1 1 100%; } }
 .t-tabs { flex-wrap: wrap; }
 .t-help { margin: -4px 0 10px; font-size: 12px; }
+
+/* ── Execution path (pages.js pathView) ───────────────────────────────── */
+.p-form .p-box { flex: 1 1 240px; min-width: 200px; }
+.p-swap { padding: 4px 10px; }
+.p-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 6px 0 12px; }
+.p-head h3 { margin: 0; }
+.p-head .btn { margin-left: auto; text-decoration: none; }
+.p-steps { list-style: none; margin: 0 0 14px; padding: 0; }
+.p-step { position: relative; display: flex; align-items: center; gap: 12px; padding: 7px 0; }
+/* The connector between numbered steps. */
+.p-step::before {
+  content: ""; position: absolute; left: 13px; top: 0; bottom: 0; width: 2px;
+  background: var(--tsr-accent-line);
+}
+.p-step.p-first::before { top: 50%; }
+.p-step.p-last::before { bottom: 50%; }
+.p-step.p-first.p-last::before { display: none; }
+.p-num {
+  position: relative; z-index: 1; flex: 0 0 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center; font: 600 12px var(--tsr-font-mono);
+  background: var(--tsr-surface); color: var(--tsr-accent-text); border: 2px solid var(--tsr-accent);
+}
+.p-step.p-first .p-num, .p-step.p-last .p-num { background: var(--tsr-accent-fill); color: var(--tsr-on-accent); }
+.p-body { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; min-width: 0; }
+.p-body .s-kind, .p-cands .s-kind, .p-near .s-kind {
+  font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.p-name { font: 600 13px var(--tsr-font-mono); text-decoration: none; }
+.p-name:hover { text-decoration: underline; }
+.p-where { font: 11.5px var(--tsr-font-mono); }
+.p-where a { color: var(--tsr-muted); }
+.p-cands { list-style: none; margin: 4px 0 8px; padding: 0; }
+.p-cands li { padding: 4px 0; font-size: 12.5px; }
+.p-cands .link-btn { font: 600 12.5px var(--tsr-font-mono); }
+.p-near { margin-top: 6px; }
+.p-shared { font: 600 12.5px var(--tsr-font-mono); color: var(--tsr-muted); }

@@ -592,6 +592,10 @@ registered one:
 - **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's
   panels of the same names. The lookup boxes suggest matching symbols or
   indexed files as you type.
+- **Path:** the extension's Show Execution Path. Name a source and a sink
+  symbol and see the lowest-cost call chain between them as numbered steps,
+  with the symbols near it, and **Show on graph** to draw it on the Graph
+  page. An ambiguous name lists its candidates to pick from.
 - **Context:** the extension's Context Explorer. Ask a question in plain words
   or name a symbol, and see what `get_context` hands an agent for it: the
   symbols picked and why, each one's relevance, the tokens used against the

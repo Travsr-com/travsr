@@ -162,6 +162,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/dependencies", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/blast", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/context", get(|| async { asset(HTML, PAGES_HTML) }))
+        .route("/path", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/terminal", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/repos", get(|| async { asset(HTML, PAGES_HTML) }))
         // Assets.
@@ -909,6 +910,24 @@ mod tests {
         // A writing tool must not be callable through the page, even by name.
         let resp = get_with_host("/api/tool/synonym_add?repo=x", "localhost").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn every_page_in_the_nav_is_served() {
+        for page in [
+            "/health",
+            "/graph",
+            "/callers",
+            "/dependencies",
+            "/blast",
+            "/path",
+            "/context",
+            "/terminal",
+            "/repos",
+        ] {
+            let resp = get_with_host(page, "localhost").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{page}");
+        }
     }
 
     #[tokio::test]

@@ -204,6 +204,30 @@
     });
   })();
 
+  // GraphPanel.renderPath over HTTP: the path's steps as a graph of their own.
+  async function showPath(from, to) {
+    const title = from + " → " + to;
+    document.title = "Travsr: " + title;
+    let r;
+    try {
+      r = ui.parseExecutionPath(await ui.tool("get_execution_path", { source: from, sink: to }));
+    } catch (_) {
+      return;
+    }
+    const nodes = r.steps.map((s) => ({ id: s.sig, label: s.sig, kind: s.kind, path: s.path, package: "", score: 0, root: true }));
+    const edges = nodes.slice(1).map((n, i) => ({ source: nodes[i].id, target: n.id, kind: "calls" }));
+    post({ command: "render", data: { nodes, edges }, query: title });
+    if (!nodes.length) {
+      const b = document.getElementById("banner");
+      if (b) {
+        b.textContent = r.ambiguous
+          ? "The " + r.ambiguous + " name matches more than one symbol; pick one on the Path page."
+          : r.message || "No path found from " + from + " to " + to + ".";
+        b.classList.add("show");
+      }
+    }
+  }
+
   // Start once the repo is known: the extension opens the graph on the active
   // file or the repo map; here the URL says which (?q=symbol, ?file=path).
   async function start() {
@@ -220,6 +244,16 @@
       return;
     }
     const p = new URLSearchParams(location.search);
+    // ?from=&to= draws an execution path, as the extension's renderPath does:
+    // the route's nodes chained by calls edges, all flagged root.
+    const from = p.get("from");
+    const to = p.get("to");
+    if (from && to) {
+      pending.splice(0);
+      await showPath(from, to);
+      ui.watch(() => showPath(from, to));
+      return;
+    }
     const q = p.get("q");
     const file = p.get("file");
     const initial = q

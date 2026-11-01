@@ -723,7 +723,112 @@
     }
   }
 
-  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/context": contextView, "/terminal": terminalView, "/repos": repos };
+  // ── Execution path ─────────────────────────────────────────────────────
+  // The extension's "Show Execution Path": the lowest-cost call chain from one
+  // symbol to another (get_execution_path), as steps here and drawn on the
+  // Graph page. An ambiguous name lists its candidates to pick from.
+  function pathView() {
+    document.title = "Travsr: Path";
+    const from0 = params.get("from") || "";
+    const to0 = params.get("to") || "";
+    page.innerHTML =
+      '<div class="phead"><h2>Execution path</h2></div>' +
+      '<p class="sub" style="margin:-4px 0 14px">How control gets from one symbol to another: the lowest-cost call chain through the graph, and what sits next to it.</p>' +
+      '<form class="lookup p-form" id="lookup">' +
+      '<label class="sel" for="p-from">From</label><span class="lookup-box p-box"><input id="p-from" type="search" placeholder="source symbol" value="' + esc(from0) + '" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<button class="btn p-swap" type="button" data-swap="1" title="Swap from and to" aria-label="Swap from and to">⇄</button>' +
+      '<label class="sel" for="p-to">To</label><span class="lookup-box p-box"><input id="p-to" type="search" placeholder="sink symbol" value="' + esc(to0) + '" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<button class="btn primary" type="submit">Find path</button></form><div id="out"></div>';
+    const form = document.getElementById("lookup");
+    const fromEl = document.getElementById("p-from");
+    const toEl = document.getElementById("p-to");
+    // A pick fills the box; the search waits until both ends are named.
+    for (const input of [fromEl, toEl]) {
+      ui.suggest(input, { anchor: input.parentElement, search: ui.suggestSymbols, onPick: () => { if (fromEl.value.trim() && toEl.value.trim()) form.requestSubmit(); else (input === fromEl ? toEl : fromEl).focus(); } });
+    }
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      setQuery("from", fromEl.value.trim());
+      setQuery("to", toEl.value.trim());
+      run();
+    });
+
+    function stepRow(s, i, last) {
+      const name = s.sig.includes(":") ? s.sig.slice(s.sig.indexOf(":") + 1) : s.sig;
+      return '<li class="p-step' + (i === 0 ? " p-first" : "") + (last ? " p-last" : "") + '">' +
+        '<span class="p-num">' + (i + 1) + "</span>" +
+        '<span class="p-body"><span class="s-kind">' + esc(s.kind) + "</span> " +
+        '<a class="p-name" href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '" title="Show in the graph">' + esc(name) + "</a>" +
+        '<span class="p-where">' + editorAnchor(s.path, null, s.path) + "</span></span></li>";
+    }
+
+    async function run() {
+      const from = fromEl.value.trim();
+      const to = toEl.value.trim();
+      const out = document.getElementById("out");
+      refreshView = from && to ? () => run() : null;
+      if (!from || !to) {
+        out.innerHTML = '<p class="sub">Name a source and a sink symbol, for example a request handler and the function that writes to the store. Bare names work; a full signature such as <code>fn:charge</code> picks one when a name is shared.</p>';
+        return;
+      }
+      document.title = "Path, " + from + " to " + to;
+      out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Finding a path…</p>';
+      let r;
+      try {
+        r = ui.parseExecutionPath(await ui.tool("get_execution_path", { source: from, sink: to }));
+      } catch (e) {
+        out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+        return;
+      }
+      let html = "";
+      if (r.steps.length) {
+        const graphLink = ui.withRepo("/graph", { from, to });
+        html += '<div class="p-head"><h3>' + esc(r.steps.length - 1) + " step" + (r.steps.length === 2 ? "" : "s") + " from <code>" + esc(from) + "</code> to <code>" + esc(to) + "</code></h3>" +
+          '<a class="btn primary" href="' + esc(graphLink) + '">Show on graph</a></div>' +
+          '<ol class="p-steps">' + r.steps.map((s, i) => stepRow(s, i, i === r.steps.length - 1)).join("") + "</ol>";
+        if (r.nearby.length) {
+          html += '<details class="hsec p-near"><summary><span class="nm">Nearby, not on the path</span> <span class="badge dim">' + r.nearby.length + "</span></summary>" +
+            '<ul class="results">' + r.nearby.map((s) => "<li>" + '<span class="s-kind">' + esc(s.kind) + "</span> " +
+              '<a href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '">' + esc(s.sig) + "</a> " + '<span class="muted">' + editorAnchor(s.path, null, s.path) + "</span></li>").join("") + "</ul></details>";
+        }
+      } else if (r.ambiguous) {
+        // A signature listed twice cannot be picked: the path search takes no
+        // file hint, so re-running with it returns this same list.
+        const seen = {};
+        for (const c of r.candidates) seen[c.sig] = (seen[c.sig] || 0) + 1;
+        const shared = r.candidates.some((c) => seen[c.sig] > 1);
+        html += '<div class="note-box">The ' + esc(r.ambiguous) + " name matches more than one symbol." + (r.candidates.some((c) => seen[c.sig] === 1) ? " Pick one:" : "") + "</div>" +
+          '<ul class="p-cands">' + r.candidates.map((c) => "<li>" +
+            (seen[c.sig] === 1
+              ? '<button class="link-btn" type="button" data-pick="' + esc(r.ambiguous) + '" data-sig="' + esc(c.sig) + '">' + esc(c.sig) + "</button>"
+              : '<span class="p-shared" title="Shared by several files; cannot be told apart here">' + esc(c.sig) + "</span> <span class=\"muted\">(shared name)</span>") +
+            ' <span class="s-kind">' + esc(c.kind) + '</span> <span class="muted">' + editorAnchor(c.path, null, c.path) + "</span></li>").join("") + "</ul>" +
+          (shared ? '<p class="sub" style="font-size:11.5px">A shared name is defined the same way in several files, and the path search takes no file hint. Start or end at a symbol next to it instead, such as one of its callers (Callers page) or something it calls.</p>' : "");
+      } else {
+        html += '<div class="diag ' + (/^no path found/.test(r.message) ? "warn" : "error") + '"><div class="diag-t">' + esc(r.message || "No path found.") + "</div></div>";
+      }
+      html += r.notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("");
+      out.innerHTML = html;
+    }
+
+    page.addEventListener("click", (e) => {
+      const t = e.target.closest("[data-swap],[data-pick]");
+      if (!t) return;
+      if (t.dataset.swap) {
+        const f = fromEl.value;
+        fromEl.value = toEl.value;
+        toEl.value = f;
+        if (fromEl.value.trim() && toEl.value.trim()) form.requestSubmit();
+        return;
+      }
+      (t.dataset.pick === "source" ? fromEl : toEl).value = t.dataset.sig;
+      form.requestSubmit();
+    });
+
+    run();
+  }
+
+  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
 
   (async function main() {
     const path = location.pathname.replace(/\/+$/, "");

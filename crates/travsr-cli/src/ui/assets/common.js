@@ -11,6 +11,7 @@ window.TravsrUi = (function () {
     ["/callers", "Callers"],
     ["/dependencies", "Dependencies"],
     ["/blast", "Blast radius"],
+    ["/path", "Path"],
     ["/context", "Context"],
     ["/terminal", "Terminal"],
     ["/repos", "Repos"],
@@ -323,6 +324,46 @@ window.TravsrUi = (function () {
     return repoRow();
   }
 
+  // ── Execution path ───────────────────────────────────────────────────────
+  // get_execution_path answers one of:
+  //   path (N steps, source to sink):        then one `<sig> (<kind>) <dash> <path>` per step,
+  //                                           and maybe `nearby context (..., NOT on it):` + lines
+  //   source|sink '<x>' is ambiguous, ...:    then `  <sig> (<kind>) at <path>` per candidate
+  //   no path found: ... / could not resolve ...
+  // The step line is the extension's parseExecutionPath shape (commands.ts).
+  const PATH_SEP = " " + String.fromCharCode(0x2014) + " ";
+  function parseExecutionPath(raw) {
+    const text = String(raw || "");
+    const body = envelopeBody(text);
+    const notes = text.slice(text.lastIndexOf("</travsr-data>") + 1).split("\n")
+      .map((l) => l.trim()).filter((l) => /^\[note:/.test(l)).map((l) => l.replace(/^\[note:\s*/, "").replace(/\]$/, ""));
+    const out = { steps: [], nearby: [], candidates: [], ambiguous: null, message: "", header: "", notes };
+    let section = "head";
+    const step = (line) => {
+      const sep = line.lastIndexOf(PATH_SEP);
+      if (sep <= 0) return null;
+      const m = /^(.+?)\s+\(([\w ]+)\)$/.exec(line.slice(0, sep).replace(/^\[[^\]]+\]\s*/, ""));
+      return m ? { sig: m[1], kind: m[2], path: line.slice(sep + PATH_SEP.length).trim() } : null;
+    };
+    for (const raw of body.split("\n")) {
+      const line = raw.trim();
+      if (!line) continue;
+      const amb = /^(source|sink) '(.+?)' is ambiguous/.exec(line);
+      if (amb) { out.ambiguous = amb[1]; out.message = line; section = "candidates"; continue; }
+      if (/^path \(/.test(line)) { out.header = line.replace(/:$/, ""); section = "steps"; continue; }
+      if (/^nearby context/.test(line)) { section = "nearby"; continue; }
+      if (section === "candidates") {
+        const c = /^(.+?)\s+\(([\w ]+)\)\s+at\s+(.+)$/.exec(line);
+        if (c) out.candidates.push({ sig: c[1], kind: c[2], path: c[3] });
+        continue;
+      }
+      const s = section === "steps" || section === "nearby" ? step(line) : null;
+      if (s) out[section === "steps" ? "steps" : "nearby"].push(s);
+      else if (section === "head") out.message += (out.message ? " " : "") + line;
+    }
+    return out;
+  }
+
   // ── Suggestions under a lookup box ──────────────────────────────────────
   // search_symbol answers one line per symbol:
   //   fn:browse_tool_call (function) <dash> crates/travsr-mcp/src/server.rs:370
@@ -471,7 +512,7 @@ window.TravsrUi = (function () {
   return {
     esc, api, tool, cli, holdCliUntil, init, setConnection, withRepo, editorLink, watch,
     stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
-    suggest, suggestSymbols, suggestFiles,
+    suggest, suggestSymbols, suggestFiles, parseExecutionPath,
     get repo() { return repo; }, get repoRow() { return repoRow(); }, get repos() { return repos; },
   };
 })();
