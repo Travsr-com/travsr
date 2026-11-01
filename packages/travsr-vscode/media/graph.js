@@ -2284,7 +2284,13 @@ function packTiles(nodes) {
     return { ...n, w, h: Math.round(w * 0.62) };
   });
   sized.sort((a, b) => b.w - a.w); // largest first → better row utilisation
-  const MAXW = 640, GAP = 50;
+  // Row width follows the canvas shape, so many tiles fill a wide panel
+  // instead of stacking into a tall column that fit() shrinks until labels
+  // drop below min-zoomed-font-size. 640 stays the floor for few tiles.
+  const GAP = 50;
+  const area = sized.reduce((s, t) => s + (t.w + GAP) * (t.h + GAP + 14), 0);
+  const aspect = (cy && cy.width() && cy.height()) ? cy.width() / cy.height() : 1.6;
+  const MAXW = Math.max(640, Math.round(Math.sqrt(area * aspect)));
   const rows = [[]], rws = [0];
   sized.forEach(t => {
     const last = rows.length - 1;

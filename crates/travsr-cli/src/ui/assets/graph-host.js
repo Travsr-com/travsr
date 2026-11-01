@@ -152,6 +152,27 @@
       // read on either theme (graph.js outlines them near-black for dark).
       .selector("node, node[?root], node.lbl-keep, node:selected")
       .style({ color: v("--tsr-text", "#F0EBE6"), "text-outline-color": v("--tsr-bg", "#1A1A1A") })
+      // Repo map tiles: a filled card in the accent with a label that stays
+      // on at any zoom, since the map is read by its names. graph.js's 11%
+      // fill and 8px label cut-off left a wide repo as bare edges.
+      .selector('node[kind="pkg"]')
+      .style({
+        "background-color": accent, "background-opacity": light ? 0.12 : 0.16,
+        "border-color": accent, "border-width": 2,
+        color: v("--tsr-text", "#F0EBE6"), "min-zoomed-font-size": 0, "font-size": "13px",
+        // Folder paths have no spaces to wrap at and spilled into neighbours.
+        "text-overflow-wrap": "anywhere",
+      })
+      // Import counts between tiles and file groups: quieter lines, and the
+      // count only once zoomed in far enough to read it.
+      .selector("edge[wgt]")
+      .style({
+        opacity: 0.55, "min-zoomed-font-size": 9,
+        color: v("--tsr-muted", "#9B9590"),
+        // graph.js boxes the count in near-black, which showed as grey
+        // squares strewn over the light canvas.
+        "text-background-color": v("--tsr-bg", "#1A1A1A"),
+      })
       .selector(":parent")
       .style({
         "background-color": light ? "#EDE8E3" : "#242424",

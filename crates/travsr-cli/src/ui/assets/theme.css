@@ -172,6 +172,26 @@ body:not(.ui-page) #minimapBox { background: var(--tsr-surface); }
 body.vscode-light:not(.ui-page) #minimap { filter: invert(1) hue-rotate(180deg); }
 body:not(.ui-page) #zoomCtl .btn { background: var(--tsr-surface); color: var(--tsr-text); }
 body:not(.ui-page) .pk-ln.hl { background: var(--tsr-accent-deep); }
+body:not(.ui-page) #breadcrumb,
+body:not(.ui-page) #statusbar { background: var(--tsr-bg); border-color: var(--tsr-border-soft); }
+body:not(.ui-page) #statusbar #fresh { color: var(--tsr-success); }
+body:not(.ui-page) #statusbar .dot-pulse { background: var(--tsr-success); }
+body:not(.ui-page) #disambig-bar { background: var(--tsr-surface); border-color: var(--tsr-accent-line); }
+body:not(.ui-page) #detail,
+body:not(.ui-page) #peek { background: var(--tsr-surface); color: var(--tsr-text); }
+body:not(.ui-page) #peekBody pre { color: var(--tsr-text); }
+body:not(.ui-page) #tip, body:not(.ui-page) #db-tip { background: var(--tsr-surface); color: var(--tsr-muted); }
+body:not(.ui-page) #banner { background: var(--tsr-surface); color: var(--tsr-accent-text); border-color: var(--tsr-accent-line); }
+body:not(.ui-page) kbd { background: var(--tsr-input); color: var(--tsr-text); }
+body:not(.ui-page) #node-search { background: var(--tsr-surface); }
+body:not(.ui-page) #node-search-input { background: var(--tsr-input); color: var(--tsr-text); }
+/* Shadows tuned for the dark panel read as smudges on cream. */
+body.vscode-light:not(.ui-page) #topbar,
+body.vscode-light:not(.ui-page) #detail,
+body.vscode-light:not(.ui-page) #peek,
+body.vscode-light:not(.ui-page) #hint,
+body.vscode-light:not(.ui-page) #tip,
+body.vscode-light:not(.ui-page) #banner { box-shadow: 0 4px 16px rgba(60, 40, 20, .10); }
 body:not(.ui-page) #brand .word {
   background: none; -webkit-text-fill-color: currentColor; color: var(--tsr-text);
   font-family: var(--tsr-font-serif); font-weight: 400;
