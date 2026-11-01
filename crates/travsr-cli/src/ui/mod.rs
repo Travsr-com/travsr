@@ -190,6 +190,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/api/cli/:name", get(files::cli))
         .route("/api/logs", get(files::logs))
         .route("/api/source", get(files::source))
+        .route("/api/files", get(files::files))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }

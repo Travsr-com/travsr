@@ -30,6 +30,19 @@
       '<button class="btn primary" type="submit">Show</button></form>';
   }
 
+  // Suggestions under the lookup box (common.js); a pick submits the form,
+  // the same as typing the name and pressing Show.
+  function suggestInto(id, search) {
+    const input = document.getElementById(id);
+    const form = document.getElementById("lookup");
+    // A wrapper so the list hangs under the box, not under the label.
+    const box = document.createElement("span");
+    box.className = "lookup-box";
+    input.replaceWith(box);
+    box.append(input);
+    ui.suggest(input, { anchor: box, search, onPick: () => form.requestSubmit() });
+  }
+
   function editorAnchor(path, line, text) {
     const link = ui.editorLink(path, line);
     return link ? '<a href="' + esc(link) + '" title="Open in VS Code">' + esc(text) + "</a>" : esc(text);
@@ -48,8 +61,10 @@
   // ── Callers ────────────────────────────────────────────────────────────
   async function callers() {
     document.title = "Travsr: Callers";
-    const symbol = params.get("symbol") || "";
+    // ?q= as well, the parameter the Graph page takes.
+    const symbol = params.get("symbol") || params.get("q") || "";
     page.innerHTML = "<h2>Callers</h2>" + lookup("sym", "Symbol", "symbol name, e.g. VecIndex.knn", symbol) + '<div id="out"></div>';
+    suggestInto("sym", ui.suggestSymbols);
     document.getElementById("lookup").addEventListener("submit", (e) => {
       e.preventDefault();
       const v = document.getElementById("sym").value.trim();
@@ -60,7 +75,7 @@
     async function run(sym, quiet) {
       refreshView = () => run(sym, true);
       const out = document.getElementById("out");
-      if (!sym) { out.innerHTML = '<p class="sub">Type a symbol and press Show.</p>'; return; }
+      if (!sym) { out.innerHTML = '<p class="sub">Type a few letters of a symbol and pick one, or type its name and press Show.</p>'; return; }
       document.title = "Callers, " + sym;
       if (!quiet) out.innerHTML = '<h3 style="margin:0 0 12px">Callers of <code>' + esc(sym) + '</code></h3><p class="sub"><span class="spinner">⟳</span> Loading…</p>';
       try {
@@ -82,6 +97,7 @@
     document.title = "Travsr: Dependencies";
     const file = params.get("file") || "";
     page.innerHTML = "<h2>Dependencies</h2>" + lookup("file", "File", "repo-relative path, e.g. src/main.rs", file) + '<div id="out"></div>';
+    suggestInto("file", ui.suggestFiles);
     document.getElementById("lookup").addEventListener("submit", (e) => {
       e.preventDefault();
       const v = document.getElementById("file").value.trim();
@@ -91,7 +107,7 @@
     async function run(target, quiet) {
       refreshView = () => run(target, true);
       const out = document.getElementById("out");
-      if (!target) { out.innerHTML = '<p class="sub">Type a file path and press Show.</p>'; return; }
+      if (!target) { out.innerHTML = '<p class="sub">Type part of a file name and pick one, or type its path and press Show.</p>'; return; }
       document.title = "Dependencies, " + target;
       if (!quiet) out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Loading…</p>';
       try {
@@ -130,6 +146,7 @@
     document.title = "Travsr: Blast radius";
     const file = params.get("file") || "";
     page.innerHTML = "<h2>Blast radius</h2>" + lookup("file", "File", "repo-relative path, e.g. src/main.rs", file) + '<div id="out"></div>';
+    suggestInto("file", ui.suggestFiles);
     let mode = "tree-sitter";
     let lang = { semantic_available: false, install_hint: "", prerequisites: "" };
     let target = file;
@@ -168,7 +185,7 @@
       // Keeps the chosen analysis mode; only the answer is re-read.
       refreshView = () => (target ? render(true) : undefined);
       const out = document.getElementById("out");
-      if (!target) { out.innerHTML = '<p class="sub">Type a file path and press Show.</p>'; return; }
+      if (!target) { out.innerHTML = '<p class="sub">Type part of a file name and pick one, or type its path and press Show.</p>'; return; }
       document.title = "Blast radius, " + target;
       try { lang = Object.assign(lang, JSON.parse(ui.stripEnvelope(await ui.tool("get_lang_status", { file: target })))); } catch (_) { /* safe defaults */ }
       render();

@@ -321,9 +321,155 @@ window.TravsrUi = (function () {
     return repoRow();
   }
 
+  // ── Suggestions under a lookup box ──────────────────────────────────────
+  // search_symbol answers one line per symbol:
+  //   fn:browse_tool_call (function) <dash> crates/travsr-mcp/src/server.rs:370
+  const SYMBOL_LINE = /^\s*\w+:(.+?) \(([\w ]+)\) \S+ (.+?)(?::(\d+))?\s*$/;
+  const SUGGEST_MAX = 12;
+
+  /** Ranks names that equal, then start with, then contain what was typed. */
+  function byMatch(typed, nameOf) {
+    const low = typed.toLowerCase();
+    const rank = (x) => {
+      const n = nameOf(x).toLowerCase();
+      return n === low ? 0 : n.startsWith(low) ? 1 : n.includes(low) ? 2 : 3;
+    };
+    return (list) => list.map((x, i) => ({ x, r: rank(x), i }))
+      .sort((a, b) => a.r - b.r || a.i - b.i).map((e) => e.x);
+  }
+
+  /** Symbols matching `typed`, as suggestion items. Imports are dropped:
+   *  they are not something to show callers or a graph of. */
+  async function suggestSymbols(typed) {
+    const seen = new Set();
+    const out = [];
+    for (const line of stripEnvelope(await tool("search_symbol", { name: typed })).split("\n")) {
+      const m = SYMBOL_LINE.exec(line);
+      if (!m || m[2] === "import") continue;
+      const name = m[1].split("::").pop();
+      const where = m[3] + (m[4] ? ":" + m[4] : "");
+      if (seen.has(name + "|" + where)) continue;
+      seen.add(name + "|" + where);
+      out.push({ value: name, label: name, kind: m[2], detail: where });
+    }
+    return byMatch(typed, (s) => s.label)(out).slice(0, SUGGEST_MAX);
+  }
+
+  /** Indexed files whose path contains `typed`, file name matches first. */
+  async function suggestFiles(typed) {
+    const r = await api("/api/files", { repo, q: typed });
+    const base = (p) => p.slice(p.lastIndexOf("/") + 1);
+    return byMatch(typed, base)(r.files || []).slice(0, SUGGEST_MAX)
+      .map((p) => ({ value: p, label: base(p), kind: "file", detail: p }));
+  }
+
+  /**
+   * A dropdown of suggestions under `input`, so a symbol or file can be
+   * picked rather than typed in full. `search(typed)` resolves to items
+   * `{value, label, kind, detail}`; picking one puts `value` in the box and
+   * calls `onPick(item)`. Arrow keys and Enter or a click pick; Escape closes.
+   * `anchor` is the positioned box the list hangs under (the input's parent
+   * by default). Register this before any other Enter handler on the input,
+   * so a highlighted pick takes Enter instead of the half-typed text.
+   */
+  function suggest(input, opts) {
+    const anchor = opts.anchor || input.parentElement;
+    anchor.classList.add("suggest-anchor");
+    const list = document.createElement("ul");
+    list.className = "suggest";
+    list.id = (input.id || "q") + "-suggest";
+    list.setAttribute("role", "listbox");
+    list.hidden = true;
+    anchor.append(list);
+    input.setAttribute("aria-controls", list.id);
+    input.setAttribute("aria-autocomplete", "list");
+
+    let items = [];
+    let active = -1;
+    let timer = null;
+    let seq = 0;
+
+    function close() { list.hidden = true; items = []; active = -1; seq++; }
+    function highlight(i) {
+      active = i;
+      [...list.children].forEach((li, j) => li.classList.toggle("active", j === i));
+      if (i >= 0 && list.children[i]) list.children[i].scrollIntoView({ block: "nearest" });
+    }
+    function pick(item) {
+      close();
+      input.value = item.value;
+      opts.onPick(item);
+    }
+    function note(text) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = text;
+      list.replaceChildren(li);
+      items = [];
+      active = -1;
+      list.hidden = false;
+    }
+    function show(found, typed) {
+      if (!found.length) { note("Nothing matches “" + typed + "”"); return; }
+      list.replaceChildren();
+      items = found;
+      active = -1;
+      found.forEach((s, i) => {
+        const li = document.createElement("li");
+        li.setAttribute("role", "option");
+        const name = document.createElement("span");
+        name.className = "s-name";
+        name.textContent = s.label;
+        const kind = document.createElement("span");
+        kind.className = "s-kind";
+        kind.textContent = s.kind;
+        const where = document.createElement("span");
+        where.className = "s-path";
+        // Right-aligned and clipped from the left (CSS rtl) so the file name
+        // stays; the marks keep a trailing ":line" from being reordered.
+        where.textContent = "‎" + s.detail + "‎";
+        where.title = s.detail;
+        li.append(name, kind, where);
+        // mousedown, not click: the input's blur would close the list first.
+        li.addEventListener("mousedown", (e) => { e.preventDefault(); pick(s); });
+        li.addEventListener("mousemove", () => { if (active !== i) highlight(i); });
+        list.append(li);
+      });
+      list.hidden = false;
+    }
+
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      const typed = input.value.trim();
+      if (typed.length < 2) { close(); return; }
+      timer = setTimeout(async () => {
+        const mine = ++seq;
+        // Without the daemon a lookup opens the index (about 2 s on a big
+        // repo); say it is working rather than leave the box looking dead.
+        if (list.hidden || !items.length) note("Searching for “" + typed + "”…");
+        let found;
+        try { found = await opts.search(typed); } catch (_) { if (mine === seq) close(); return; }
+        // Drop a slow answer to an earlier keystroke.
+        if (mine === seq && input.value.trim() === typed) show(found, typed);
+      }, 180);
+    });
+    input.addEventListener("keydown", (e) => {
+      if (list.hidden) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); highlight(Math.min(items.length - 1, active + 1)); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); highlight(Math.max(-1, active - 1)); }
+      else if (e.key === "Escape") { e.preventDefault(); close(); }
+      else if (e.key === "Enter") {
+        if (active >= 0 && items[active]) { e.preventDefault(); e.stopImmediatePropagation(); pick(items[active]); }
+        else close();
+      }
+    });
+    input.addEventListener("blur", () => setTimeout(close, 120));
+  }
+
   return {
     esc, api, tool, cli, holdCliUntil, init, setConnection, withRepo, editorLink, watch,
     stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
+    suggest, suggestSymbols, suggestFiles,
     get repo() { return repo; }, get repoRow() { return repoRow(); }, get repos() { return repos; },
   };
 })();

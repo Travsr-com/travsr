@@ -451,6 +451,55 @@ pub(super) async fn source(
     }))
 }
 
+#[derive(Serialize)]
+pub(super) struct FilesResponse {
+    files: Vec<String>,
+}
+
+/// Most paths `/api/files` returns; the page shows the best dozen of them.
+const FILES_MAX: usize = 50;
+
+/// `GET /api/files?repo=<repo>&q=<text>`: indexed file paths containing
+/// `q` (any case), for the file suggestions on the Dependencies and Blast
+/// radius pages. Paths only, never contents, and only `files` rows, so it
+/// lists nothing the graph does not already name.
+pub(super) async fn files(
+    State(state): State<Arc<UiState>>,
+    Query(params): Query<BTreeMap<String, String>>,
+) -> Result<Json<FilesResponse>, ApiError> {
+    let repo = resolve_repo(&state, params.get("repo").map(String::as_str))?;
+    let q = index_path(params.get("q").map(String::as_str).unwrap_or("").trim());
+    if q.is_empty() {
+        return Ok(Json(FilesResponse { files: Vec::new() }));
+    }
+    let db = repo.db_path();
+    let files = tokio::task::spawn_blocking(move || matching_files(&db, &q, FILES_MAX))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(FilesResponse { files }))
+}
+
+/// Up to `limit` `files.path` values containing `q`, ignoring ASCII case,
+/// those whose file name contains it first, then shortest first. `instr`
+/// rather than `LIKE`, so a `%` or `_` in what was typed matches itself.
+fn matching_files(db: &Path, q: &str, limit: usize) -> rusqlite::Result<Vec<String>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    let mut stmt = conn.prepare(
+        "SELECT path FROM files WHERE instr(lower(path), lower(?1)) > 0
+         ORDER BY instr(lower(replace(path, rtrim(path, replace(path, '/', '')), '')), lower(?1)) = 0,
+                  length(path), path
+         LIMIT ?2",
+    )?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(rusqlite::params![q, limit], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
 /// `rel` in the form the index stores paths (`files.path`, a node's own
 /// path): `/` separators, no leading `./`.
 fn index_path(rel: &str) -> String {
@@ -523,6 +572,44 @@ mod tests {
         assert!(!is_plain_relative("/etc/passwd"));
         #[cfg(windows)]
         assert!(!is_plain_relative("C:\\Windows\\win.ini"));
+    }
+
+    #[test]
+    fn file_matches_put_file_names_first_and_take_wildcards_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        let w = rusqlite::Connection::open(&db).unwrap();
+        w.execute_batch(
+            "CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT, last_indexed_at INTEGER);
+             INSERT INTO files VALUES
+               ('crates/graph/src/lib.rs', 'h', 1),
+               ('src/graph.rs', 'h', 1),
+               ('docs/Graph_notes.md', 'h', 1),
+               ('src/main.rs', 'h', 1),
+               ('src/100%_done.rs', 'h', 1);",
+        )
+        .unwrap();
+        drop(w);
+
+        // File-name matches first (shortest first), then directory matches.
+        assert_eq!(
+            matching_files(&db, "GRAPH", 50).unwrap(),
+            vec![
+                "src/graph.rs",
+                "docs/Graph_notes.md",
+                "crates/graph/src/lib.rs"
+            ]
+        );
+        assert_eq!(
+            matching_files(&db, "graph", 1).unwrap(),
+            vec!["src/graph.rs"]
+        );
+        // `%` and `_` are not LIKE wildcards here.
+        assert_eq!(
+            matching_files(&db, "%_d", 50).unwrap(),
+            vec!["src/100%_done.rs"]
+        );
+        assert!(matching_files(&db, "nothing", 50).unwrap().is_empty());
     }
 
     #[test]

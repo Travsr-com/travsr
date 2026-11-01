@@ -192,9 +192,14 @@ body.vscode-light:not(.ui-page) #peek,
 body.vscode-light:not(.ui-page) #hint,
 body.vscode-light:not(.ui-page) #tip,
 body.vscode-light:not(.ui-page) #banner { box-shadow: 0 4px 16px rgba(60, 40, 20, .10); }
-/* Search suggestions (graph-host.js). */
+/* Suggestions under a lookup box (common.js suggest()): Graph search,
+   Callers, Dependencies, Blast radius. */
+.suggest-anchor { position: relative; }
+.lookup-box { display: flex; min-width: 260px; flex: 0 1 420px; }
+.lookup-box input { flex: 1 1 auto; min-width: 0; }
+@media (max-width: 760px) { .lookup-box { min-width: 0; flex: 1 1 100%; } }
 body:not(.ui-page) #searchWrap { position: relative; }
-#suggest {
+.suggest {
   position: absolute; top: calc(100% + 6px); left: 0; z-index: 40;
   width: 460px; max-width: calc(100vw - 40px); max-height: 360px; overflow-y: auto;
   list-style: none; margin: 0; padding: 4px;
@@ -202,20 +207,20 @@ body:not(.ui-page) #searchWrap { position: relative; }
   box-shadow: 0 12px 32px rgba(0, 0, 0, .35);
   font: 12px var(--tsr-font-sans); color: var(--tsr-text);
 }
-body.vscode-light #suggest { box-shadow: 0 12px 32px rgba(60, 40, 20, .14); }
-#suggest li {
+body.vscode-light .suggest { box-shadow: 0 12px 32px rgba(60, 40, 20, .14); }
+.suggest li {
   display: grid; grid-template-columns: minmax(0, auto) auto 1fr; align-items: baseline; gap: 8px;
   padding: 6px 9px; border-radius: 7px; cursor: pointer;
 }
-#suggest li.active { background: var(--tsr-accent-deep); }
-#suggest li.empty { display: block; cursor: default; color: var(--tsr-muted); }
-#suggest .s-name { font: 600 12px var(--tsr-font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#suggest li.active .s-name { color: var(--tsr-accent-text); }
-#suggest .s-kind {
+.suggest li.active { background: var(--tsr-accent-deep); }
+.suggest li.empty { display: block; cursor: default; color: var(--tsr-muted); }
+.suggest .s-name { font: 600 12px var(--tsr-font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.suggest li.active .s-name { color: var(--tsr-accent-text); }
+.suggest .s-kind {
   font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
   border-radius: 999px; padding: 0 6px; white-space: nowrap;
 }
-#suggest .s-path {
+.suggest .s-path {
   color: var(--tsr-muted); font: 11px var(--tsr-font-mono); text-align: right;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl;
 }
