@@ -12,6 +12,49 @@ All notable changes to Travsr are documented here.
 
 ---
 
+## v1.4.0 - 2026-11-01
+
+> Install with `npm i -g @travsr.com/travsr` or
+> `curl -fsSL https://travsr.com/install.sh | sh`.
+>
+> A fresh build from `master`, carrying everything merged since `v1.3.0`.
+
+### Upgrading from 1.3.0
+
+Enum members are now indexed as `variant:Enum.Member` nodes and the signature
+format moves to v4, so run `travsr init --force` once after upgrading in any
+repository that defines enums. Identifier lookups now match by prefix instead of
+substring by default (see Changed). No config key changes.
+
+### Added
+
+- **`travsr ui` opens the VS Code extension's pages in a browser (#1036).** Health, repo map, graph, Callers, Dependencies, Blast radius, Execution path, Architecture, a Context explorer and a Terminal page for read-only commands such as `travsr ask` and `travsr graph`, all served locally from the CLI. Pages redraw when the index changes, the graph search box suggests symbols, and action buttons run their commands from the page behind an in-page confirmation dialog. The fallback that talks to the index directly never writes.
+- **`travsr connect` configures Open Code and Kilo Code (#999).** The entry it writes points at the running binary's path.
+- **Enum members are first-class graph nodes.** The tree-sitter, TypeScript and Python indexers emit `variant:Enum.Member` nodes and references to members resolve to them.
+- **`get_architecture_brief` includes manifest-declared edges (#1047).**
+- **`find_pattern` shows context lines and marks test files (#1050), and `get_snippets` notes unresolved names and takes a path hint (#1052).**
+- **A long-lived `mcp --stdio` server warns when it is older than the binary on disk (#1049).**
+- **Every MCP tool call is checked against its advertised input schema (#1009).** String integers and booleans are converted before dispatch and negative values are rejected.
+
+### Changed
+
+- **Identifier lookups default to prefix matching, not substring (#1055).** Pass a substring pattern explicitly if you relied on the old behavior.
+- **The blast radius is capped at 500 files by default and keeps the nearest files when cut.** The response names the files a loose path resolved to, says when a loose name search may have missed files, and the VS Code extension shows `N+` when it was cut at `max_files`.
+- **MCP responses are no longer truncated at 4 KB.**
+- **`get_graph_json` is bounded at its node cap and charges its header and returned JSON to `token_budget` (#1054).**
+- **Dependency updates:** rusqlite 0.40, scip 0.10, tabled 0.22, dirs 7, tokenizers 0.23.2, zip 9 and refreshed rustls crates, which also clear RUSTSEC-2026-0367, -0368, -0369, -0385 and -0386.
+
+### Fixed
+
+- **A daemon whose binary was deleted could not be replaced, and a stale daemon could be replaced from the wrong path.** Any client can now replace a daemon whose binary is gone, and only from the binary path it runs.
+- **Blast radius marked an import resolved before its edges were read, and re-walked imports that had already resolved.**
+- **Phase B documents outside the repo (absolute and Windows parent-relative or drive paths) could land in the graph.** They are now kept out, and untracked files are pruned at commit and ranked below tracked ones in name lookups (#1063).
+- **Go imports of modules checked in under a subdirectory did not resolve.**
+- **`get_subsystem_brief` entries and width cut, `get_graph_json` overview ghost imports, and callers of a file with several definitions were wrong (#1061, #1054).**
+- **`ask` and `get_context` ranking fixes.** A bare name that exists only as an import alias is now grounded, the definition the query names is budgeted before the PPR knapsack and labeled exact, anchor noise is dropped from the pool, and an `impl` no longer triggers the bare name rule.
+- **The VS Code extension returned MCP tool errors as data.** They now show as warnings.
+- **Release and CI hardening.** The release preflight requires the tagged commit to be on the default branch, release sanity runs from `release.yml`, and Actions cache use and superseded-run cancellation were tightened.
+
 ## v1.3.0 - 2026-10-13
 
 > Install with `npm i -g @travsr.com/travsr` or
