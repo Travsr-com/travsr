@@ -356,10 +356,12 @@
   function tokenUse(totals) {
     if (!totals) return null;
     const num = (re) => { const m = re.exec(totals); return m ? Number(m[1].replace(/,/g, "")) : 0; };
+    // With code: `[90 nodes, 4 with snippets, ~1404 metadata-tokens + ~95
+    // snippet-tokens (...)]`; without: `[142 nodes, ~2347 tokens]`.
     return {
       nodes: num(/([\d,]+) nodes/),
       snippets: num(/([\d,]+) with snippets/),
-      meta: num(/~([\d,]+) metadata-tokens/),
+      meta: num(/~([\d,]+) metadata-tokens/) || num(/~([\d,]+) tokens\b/),
       code: num(/~([\d,]+) snippet-tokens/),
     };
   }
