@@ -729,17 +729,15 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     let shown = note_arg(symbol);
     let raw = if !raw.is_empty() {
         raw
-    } else if symbol.trim().is_empty()
-        || store
-            .search_nodes_by_name(symbol)
-            .map(|n| n.is_empty())
-            .unwrap_or(true)
-    {
+    } else if symbol.trim().is_empty() || !symbol_present_for_callers(store, symbol) {
         // Not `search_symbol`'s "No symbols matching": that tool matches by
         // word, so it lists `method:T.m` for a `T::m` this one cannot resolve,
-        // and the borrowed sentence denied it.
+        // and the borrowed sentence denied it. #1055: no longer "or containing"
+        // either: a bare identifier is now matched by prefix, not substring, so
+        // a name that merely contains it (`..._run_init`) is not a match, and
+        // the note reads like `find_references`' "No symbol named".
         format!(
-            "[note: No symbol named or containing '{shown}' in the graph. \
+            "[note: No symbol named '{shown}' in the graph. \
              search_symbol matches by word and may find another spelling.]"
         )
     } else {
@@ -904,6 +902,24 @@ fn note_arg(arg: &str) -> String {
         .collect()
 }
 
+/// #1055: whether `symbol` resolves to anything `get_callers` would report on,
+/// using the SAME match as `get_callers_raw`'s partial fallback so the "not
+/// found" and "found but uncalled" notes never disagree with what the body did.
+/// For a bare identifier that is the exact/prefix tier (a name that merely
+/// contains the query is not a match); for a qualified or phrase query it stays
+/// the loose substring match the resolve ladder feeds on.
+fn symbol_present_for_callers(store: &SqliteStore, symbol: &str) -> bool {
+    let nodes = store.search_nodes_by_name(symbol).unwrap_or_default();
+    if is_bare_identifier(symbol) {
+        let q = symbol.to_ascii_lowercase();
+        nodes
+            .iter()
+            .any(|n| name_matches_identifier(&n.vname.signature, &q))
+    } else {
+        !nodes.is_empty()
+    }
+}
+
 /// #974: what `find_references` answers when the name resolved to no
 /// definition. Not `search_symbol`'s "No symbols matching": that tool matches
 /// part of a name and this one needs all of it, so the borrowed sentence denied
@@ -973,6 +989,21 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
                     tracing::warn!("get_callers search error: {e}");
                     return String::new();
                 }
+            };
+            // #1055: for a bare identifier, keep only names that begin with it.
+            // A mid-identifier substring (`run_init` inside `..._run_init`) is
+            // not a partial match of the symbol, and resolving it answered
+            // get_callers for an unrelated function. Unlike `search_symbol`,
+            // there is no fall-back to the loose set here: an empty result means
+            // "no such symbol", which the `get_callers` wrapper reports as such.
+            let partial: Vec<CoreNode> = if is_bare_identifier(symbol) {
+                let q = symbol.to_ascii_lowercase();
+                partial
+                    .into_iter()
+                    .filter(|n| name_matches_identifier(&n.vname.signature, &q))
+                    .collect()
+            } else {
+                partial
             };
             // The `path` hint has to survive this fallback too. It used to be
             // dropped here and the first FTS row won, so a hint naming one file
@@ -1242,6 +1273,38 @@ fn site_marker(site: &travsr_core::RefSite) -> &'static str {
     } else {
         ""
     }
+}
+
+/// #1055: a single source identifier (snake_case / camelCase: letters, digits
+/// and underscores, no separators or spaces), the query shape for which the
+/// prefix tier below is meaningful. A qualified name (`T::m`, `a.b`), an
+/// Objective-C selector, or a multi-word phrase keeps the looser matching and
+/// the resolve ladder; those already carry their own anchor.
+fn is_bare_identifier(query: &str) -> bool {
+    !query.is_empty()
+        && query.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && query.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// #1055: whether `signature` names a symbol an identifier lookup for
+/// `query_lower` (already lowercased) should keep: either the qualified name
+/// (everything after the `kind:` prefix) or the bare leaf begins with the
+/// query.
+///
+/// Anchored at a START, never an interior word boundary. `run_init` sits at a
+/// `_` boundary inside `fn:..._instead_of_run_init`, so a word-boundary test
+/// would resolve that unrelated function, the exact miss this fixes. A prefix
+/// never does. The two anchors cover the two signature shapes: a type-qualified
+/// name matched by its type (`ClassD` -> `ClassD::method`) and a method matched
+/// by its own leaf (`search_nodes_by_name` -> `SqliteStore.search_nodes_by_name`).
+fn name_matches_identifier(signature: &str, query_lower: &str) -> bool {
+    let qualified = signature
+        .split_once(':')
+        .map_or(signature, |(_, rest)| rest);
+    qualified.to_ascii_lowercase().starts_with(query_lower)
+        || simple_name(signature)
+            .to_ascii_lowercase()
+            .starts_with(query_lower)
 }
 
 /// Extract the bare symbol name from a stored signature for textual call-site
@@ -6134,6 +6197,22 @@ fn search_symbol_raw(
     } else {
         nodes
     };
+
+    // #1055: an identifier query (no separators or spaces) defaults to the
+    // exact/prefix tier, so the real definition is not buried under loose
+    // substring and token matches (`handle_tool_call` dragged in `WatcherHandle`,
+    // `callTool`, and VS Code test names). Keep only names that begin with the
+    // query; fall back to the loose set when nothing does, so a result is
+    // narrowed, never hidden. Skipped in `exact` mode, which the store floored.
+    if !exact && is_bare_identifier(name) {
+        let q = name.to_ascii_lowercase();
+        if nodes
+            .iter()
+            .any(|n| name_matches_identifier(&n.vname.signature, &q))
+        {
+            nodes.retain(|n| name_matches_identifier(&n.vname.signature, &q));
+        }
+    }
 
     // #1048: list committed code before untracked, non-ignored scratch files
     // (`bench/`, `DOC/`) that init and the watcher index while they are edited,
@@ -12130,6 +12209,102 @@ mod tests {
         assert!(res_exact.contains("struct:ClassD"));
         assert!(res_exact.contains("fn:ClassD::method"));
         assert!(!res_exact.contains("struct:ClassDConfigurationManager"));
+    }
+
+    /// #1055 Repro A: a default (exact=false) lookup for a whole identifier
+    /// returns the definitions that begin with it, not every symbol that merely
+    /// contains a token of it. `handle_tool_call` must not drag in
+    /// `WatcherHandle`, `call_tool`, or a test name.
+    #[test]
+    fn search_symbol_identifier_query_defaults_to_prefix() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("c", "", path, "rust", sig), kind)
+        };
+        let nodes = [
+            mk("server.rs", "fn:handle_tool_call", "function"),
+            mk("server.rs", "fn:handle_tool_call_global", "function"),
+            mk("sse.rs", "fn:dispatch_tool_call", "function"),
+            mk("watcher.rs", "struct:WatcherHandle", "struct"),
+            mk("mcp.ts", "method:McpClient.call_tool", "method"),
+        ];
+        for n in &nodes {
+            store.put_node(n).unwrap();
+        }
+
+        let out = search_symbol(&store, "handle_tool_call", false);
+        assert!(
+            out.contains("fn:handle_tool_call "),
+            "exact hit kept: {out}"
+        );
+        assert!(
+            out.contains("fn:handle_tool_call_global"),
+            "the prefix hit is a real match and must stay: {out}"
+        );
+        assert!(
+            !out.contains("dispatch_tool_call")
+                && !out.contains("WatcherHandle")
+                && !out.contains("call_tool "),
+            "loose substring/token noise must be dropped by default: {out}"
+        );
+    }
+
+    /// The narrowing tightens, it never hides: a query that nothing begins with
+    /// still returns the loose matches rather than an empty answer.
+    #[test]
+    fn search_symbol_identifier_prefix_falls_back_when_no_prefix_hit() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("c", "", "server.rs", "rust", "fn:handle_tool_call"),
+                "function",
+            ))
+            .unwrap();
+
+        // "tool_call" is a mid-identifier substring of the only symbol, so the
+        // prefix tier is empty and the loose set is returned unchanged.
+        let out = search_symbol(&store, "tool_call", false);
+        assert!(
+            out.contains("fn:handle_tool_call"),
+            "a result must never be hidden by the prefix narrowing: {out}"
+        );
+    }
+
+    /// #1055 Repro B: `get_callers` for an identifier that is only a substring of
+    /// a longer name (`run_init` inside `..._instead_of_run_init`) must report no
+    /// such symbol, not silently answer for the function that contains it.
+    #[test]
+    fn get_callers_substring_identifier_is_not_a_match() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let file = Node::new(VName::new("c", "", "tools.rs", "rust", "file"), "file");
+        let func = Node::new(
+            VName::new(
+                "c",
+                "",
+                "tools.rs",
+                "rust",
+                "fn:phase_b_note_names_pending_references_instead_of_run_init",
+            ),
+            "function",
+        );
+        store.put_node(&file).unwrap();
+        store.put_node(&func).unwrap();
+        store
+            .put_edge(&Edge::new(file.id, func.id, EdgeKind::DefinesBinding))
+            .unwrap();
+
+        let out = get_callers(&store, "run_init", None);
+        assert!(
+            out.contains("[note: No symbol named 'run_init' in the graph."),
+            "a substring-only identifier must read as not found: {out}"
+        );
+        assert!(
+            !out.contains("instead_of_run_init"),
+            "the containing function must not be answered as a caller: {out}"
+        );
     }
 
     #[test]
@@ -22112,7 +22287,7 @@ mod snippet_tests {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let out = get_callers(&store, "NonExistentSymbol", None);
         assert!(
-            out.contains("[note: No symbol named or containing 'NonExistentSymbol' in the graph."),
+            out.contains("[note: No symbol named 'NonExistentSymbol' in the graph."),
             "an unresolved symbol must not read as an empty answer: {out}"
         );
     }
