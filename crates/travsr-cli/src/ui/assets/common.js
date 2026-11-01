@@ -362,36 +362,82 @@ window.TravsrUi = (function () {
   }
 
   /**
-   * Confirm, run `cmd` through /api/action in repository `repoName`, and show
-   * its output in a dialog. Resolves to the response, or null if cancelled.
+   * Ask in a dialog, run `cmd` through /api/action in repository `repoName`,
+   * and show its output in the same dialog. Resolves to the response, or null
+   * if cancelled. In-page rather than window.confirm, so the question, the
+   * command and the folder read like the rest of the UI.
    */
   async function runCommand(cmd, repoName, root) {
     const a = actionFor(cmd);
     const s = await session();
     if (!a || !s.actions) return null;
-    if (!window.confirm(a.ask + "\n\nRuns: " + cmd + (root ? "\nIn: " + root : ""))) return null;
+    // "Question? Detail." -> heading and body.
+    const q = a.ask.indexOf("? ");
+    const title = q > 0 ? a.ask.slice(0, q + 1) : a.ask;
+    const detail = q > 0 ? a.ask.slice(q + 2) : "";
+
     const dlg = document.createElement("div");
     dlg.className = "tsr-modal";
     dlg.setAttribute("role", "dialog");
     dlg.setAttribute("aria-modal", "true");
-    dlg.innerHTML = '<div class="tsr-modal-box"><div class="tsr-modal-head"><code></code><span class="tsr-modal-state">running <span class="tsr-modal-t">0 s</span></span></div>' +
-      '<pre class="tsr-modal-out">Running…</pre><div class="tsr-modal-foot"><button class="btn" data-m-copy disabled>Copy output</button><button class="btn primary" data-m-close>Close</button></div></div>';
-    dlg.querySelector("code").textContent = "$ " + cmd;
+    dlg.innerHTML =
+      '<div class="tsr-modal-box">' +
+      '<div class="tsr-modal-head"><span class="tsr-modal-title"></span><span class="tsr-modal-state"></span></div>' +
+      '<div class="tsr-modal-ask"><p class="tsr-modal-detail"></p>' +
+      '<div class="tsr-modal-kv"><span>Runs</span><code class="tsr-modal-cmd"></code></div>' +
+      '<div class="tsr-modal-kv"><span>In</span><code class="tsr-modal-root"></code></div></div>' +
+      '<pre class="tsr-modal-out" hidden></pre>' +
+      '<div class="tsr-modal-foot">' +
+      '<button class="btn" data-m-cancel>Cancel</button>' +
+      '<button class="btn primary" data-m-run>Run</button>' +
+      '<button class="btn" data-m-copy hidden disabled>Copy output</button>' +
+      '<button class="btn primary" data-m-close hidden>Close</button></div></div>';
+    const $ = (sel) => dlg.querySelector(sel);
+    $(".tsr-modal-title").textContent = title;
+    $(".tsr-modal-detail").textContent = detail;
+    $(".tsr-modal-detail").hidden = !detail;
+    $(".tsr-modal-cmd").textContent = cmd;
+    $(".tsr-modal-root").textContent = root || repoName;
     document.body.append(dlg);
+    $("[data-m-run]").focus();
+
+    // Ask: Run, or Cancel / Escape / a click outside.
+    const go = await new Promise((resolve) => {
+      const key = (e) => {
+        if (e.key === "Escape") { e.preventDefault(); finish(false); }
+        else if (e.key === "Enter" && !e.target.closest("[data-m-cancel]")) { e.preventDefault(); finish(true); }
+      };
+      const click = (e) => {
+        if (e.target.closest("[data-m-run]")) finish(true);
+        else if (e.target.closest("[data-m-cancel]") || e.target === dlg) finish(false);
+      };
+      function finish(v) {
+        dlg.removeEventListener("keydown", key);
+        dlg.removeEventListener("click", click);
+        resolve(v);
+      }
+      dlg.addEventListener("keydown", key);
+      dlg.addEventListener("click", click);
+    });
+    if (!go) { dlg.remove(); return null; }
+
+    // Run: the same dialog becomes the output view.
+    $("[data-m-cancel]").hidden = true;
+    $("[data-m-run]").hidden = true;
+    $(".tsr-modal-detail").hidden = true;
+    // The heading now shows the command, so its row would repeat it.
+    $(".tsr-modal-cmd").parentElement.hidden = true;
+    $(".tsr-modal-title").textContent = "$ " + cmd;
+    $(".tsr-modal-title").classList.add("mono");
+    $(".tsr-modal-state").innerHTML = 'running <span class="tsr-modal-t">0 s</span>';
+    $(".tsr-modal-out").hidden = false;
+    $(".tsr-modal-out").textContent = "Running…";
     const started = Date.now();
     const tick = setInterval(() => {
-      const t = dlg.querySelector(".tsr-modal-t");
+      const t = $(".tsr-modal-t");
       if (t) t.textContent = Math.round((Date.now() - started) / 1000) + " s";
     }, 1000);
     let text = "";
-    const done = new Promise((resolve) => {
-      dlg.addEventListener("click", async (e) => {
-        if (e.target.closest("[data-m-close]") || e.target === dlg) { dlg.remove(); resolve(); }
-        else if (e.target.closest("[data-m-copy]")) {
-          try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch (_) { /* clipboard refused */ }
-        }
-      });
-    });
     let result = null;
     try {
       const resp = await fetch("/api/action/" + a.name + "?" + new URLSearchParams(Object.assign({ repo: repoName }, a.params)), {
@@ -402,20 +448,32 @@ window.TravsrUi = (function () {
       if (!resp.ok) throw new Error(body.error || resp.status + " " + resp.statusText);
       result = body;
       text = (body.stderr ? body.stderr.replace(/\s+$/, "") + "\n" : "") + (body.stdout || "").replace(/\s+$/, "");
-      const ok = body.code === 0;
-      dlg.querySelector(".tsr-modal-state").textContent =
-        (body.code == null ? "still running" : "exit " + body.code) + " · " + Math.round(body.millis / 1000) + " s";
-      dlg.querySelector(".tsr-modal-state").className = "tsr-modal-state " + (ok ? "ok" : "bad");
-      dlg.querySelector(".tsr-modal-out").textContent = text || "(no output)";
-      dlg.querySelector("[data-m-copy]").disabled = !text;
+      $(".tsr-modal-state").textContent =
+        (body.code == null ? "still running" : body.code === 0 ? "done, exit 0" : "failed, exit " + body.code) + " · " + Math.round(body.millis / 1000) + " s";
+      $(".tsr-modal-state").className = "tsr-modal-state " + (body.code === 0 ? "ok" : "bad");
+      $(".tsr-modal-out").textContent = text || "(no output)";
     } catch (e) {
-      dlg.querySelector(".tsr-modal-state").textContent = "not run";
-      dlg.querySelector(".tsr-modal-state").className = "tsr-modal-state bad";
-      dlg.querySelector(".tsr-modal-out").textContent = e.message;
+      $(".tsr-modal-state").textContent = "not run";
+      $(".tsr-modal-state").className = "tsr-modal-state bad";
+      $(".tsr-modal-out").textContent = e.message;
     } finally {
       clearInterval(tick);
     }
-    await done;
+    $("[data-m-copy]").hidden = false;
+    $("[data-m-copy]").disabled = !text;
+    $("[data-m-close]").hidden = false;
+    $("[data-m-close]").focus();
+
+    // Close (button, Escape, a click outside) or copy the output.
+    await new Promise((resolve) => {
+      dlg.addEventListener("keydown", (e) => { if (e.key === "Escape") { dlg.remove(); resolve(); } });
+      dlg.addEventListener("click", async (e) => {
+        if (e.target.closest("[data-m-close]") || e.target === dlg) { dlg.remove(); resolve(); }
+        else if (e.target.closest("[data-m-copy]")) {
+          try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch (_) { /* clipboard refused */ }
+        }
+      });
+    });
     return result;
   }
 

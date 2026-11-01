@@ -423,3 +423,15 @@ body:not(.ui-page) #brand .word {
   background: var(--tsr-input); font: 11.5px/1.55 var(--tsr-font-mono); white-space: pre-wrap; word-break: break-word;
 }
 .tsr-modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--tsr-border-soft); }
+.tsr-modal-title { font: 600 14px var(--tsr-font-sans); color: var(--tsr-text); }
+.tsr-modal-title.mono { font: 600 12.5px var(--tsr-font-mono); color: var(--tsr-accent-text); word-break: break-all; }
+.tsr-modal-ask { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.tsr-modal-detail { margin: 0; font-size: 13px; color: var(--tsr-muted); line-height: 1.5; }
+.tsr-modal-kv { display: flex; align-items: baseline; gap: 10px; }
+.tsr-modal-kv span { flex: 0 0 36px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--tsr-subtle); }
+.tsr-modal-kv code {
+  flex: 1; min-width: 0; padding: 6px 10px; border-radius: 6px; background: var(--tsr-input);
+  border: 1px solid var(--tsr-border-soft); font: 12px var(--tsr-font-mono); color: var(--tsr-text); word-break: break-all;
+}
+.tsr-modal-cmd { color: var(--tsr-accent-text) !important; }
+.tsr-modal-box :focus-visible { outline: 2px solid var(--tsr-accent); outline-offset: 2px; }
