@@ -590,7 +590,14 @@ registered one:
 - **Graph:** the extension's graph view itself (repo map, symbol graph, blast
   view, definition peek, DOT/JSON/PNG export).
 - **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's
-  panels of the same names.
+  panels of the same names. The lookup boxes suggest matching symbols or
+  indexed files as you type.
+- **Context:** the extension's Context Explorer. Ask a question in plain words
+  or name a symbol, and see what `get_context` hands an agent for it: the
+  symbols picked and why, each one's relevance, the tokens used against the
+  budget, the retrieval confidence, and optionally the code. **Copy for chat**
+  copies the exact text an agent receives. Fast with the daemon running; from a
+  cold read-only open of a large index it can take a minute or more.
 
 Every graph answer is the text the matching MCP tool (`search_symbol`,
 `get_callers`, `get_dependencies`, `get_blast_radius`, `get_graph_json`, ...)

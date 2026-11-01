@@ -160,6 +160,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/callers", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/dependencies", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/blast", get(|| async { asset(HTML, PAGES_HTML) }))
+        .route("/context", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/repos", get(|| async { asset(HTML, PAGES_HTML) }))
         // Assets.
         .route("/assets/shell.css", get(|| async { asset(CSS, SHELL_CSS) }))
@@ -469,7 +470,7 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(&travsr_store::SqliteStore) -> anyhow::Result<T> + Send + 'static,
 {
-    run_query_via(repo, tool, args, direct, true).await
+    run_query_via(repo, tool, args, direct, true, QUERY_DEADLINE).await
 }
 
 async fn run_query_via<T, F>(
@@ -478,6 +479,7 @@ async fn run_query_via<T, F>(
     args: serde_json::Value,
     direct: F,
     use_daemon: bool,
+    deadline: std::time::Duration,
 ) -> Result<(T, Route), ApiError>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
@@ -499,10 +501,10 @@ where
     // A page must not wait forever on one answer. The blocking work cannot be
     // cancelled and finishes in the background; the page is told now, and
     // says that this part did not answer rather than spinning.
-    match tokio::time::timeout(QUERY_DEADLINE, work).await {
+    match tokio::time::timeout(deadline, work).await {
         Err(_) => Err(ApiError(
             StatusCode::GATEWAY_TIMEOUT,
-            format!("no answer within {} s", QUERY_DEADLINE.as_secs()),
+            format!("no answer within {} s", deadline.as_secs()),
         )),
         Ok(joined) => joined
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -546,6 +548,12 @@ fn take_daemon_turn() -> Option<std::sync::MutexGuard<'static, ()>> {
 /// Longest one query may hold a page. Graph reads answer in milliseconds; this
 /// bounds the diagnostics that shell out to `git` on a slow or busy machine.
 const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The Context Explorer's `get_context`: seed selection, PPR and packing over
+/// the whole graph, with snippets read from disk. Seconds on a release build
+/// with the daemon, but most of a minute from a cold read-only open of a large
+/// index on a slow machine, so it gets longer than a graph read.
+const CONTEXT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -668,12 +676,18 @@ async fn tool(
     // as the extension's own `travsr mcp --stdio` child answers them; the
     // daemon refuses them (travsr_mcp::DIRECT_ONLY_TOOLS says why).
     let use_daemon = !travsr_mcp::DIRECT_ONLY_TOOLS.contains(&tool.as_str());
+    let deadline = if tool == "get_context" {
+        CONTEXT_DEADLINE
+    } else {
+        QUERY_DEADLINE
+    };
     let (payload, route): (ToolPayload, Route) = run_query_via(
         repo,
         "tool",
         wire,
         move |store| Ok(query::tool_query(store, &args)),
         use_daemon,
+        deadline,
     )
     .await?;
     if let Some(e) = payload.error {
@@ -892,6 +906,23 @@ mod tests {
         // A writing tool must not be callable through the page, even by name.
         let resp = get_with_host("/api/tool/synonym_add?repo=x", "localhost").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_context_explorer_is_served_and_reaches_get_context() {
+        let resp = get_with_host("/context", "localhost").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("/assets/pages.js"));
+        // Past the tool gate: refused for the unknown repo, not the tool.
+        let resp = get_with_host("/api/tool/get_context?repo=nope&query=x", "localhost").await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("unknown tool"), "{body}");
     }
 
     #[tokio::test]

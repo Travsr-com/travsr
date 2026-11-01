@@ -253,7 +253,266 @@
     setTimeout(() => { b.textContent = label; }, 1200);
   });
 
-  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/repos": repos };
+  // ── Context explorer ───────────────────────────────────────────────────
+  // What get_context hands an AI agent for a question (the extension's
+  // Context Explorer): the same tool and arguments an MCP client sends, laid
+  // out so a reader can see why each symbol was picked and what it cost.
+  //
+  // get_context answers sanitized text:
+  //   [index commit: <sha>, embeddings: off]
+  //   [retrieval: exact+lexical | coverage 1/3 | confidence: weak ]
+  //   ## <section>
+  //   <sig> (<kind>) <dash> <path>:<line> [via: caller of x] [score: 0.19]
+  //   <rule>                        (then the snippet, when include_snippets)
+  //   [90 nodes, 4 with snippets, ~1404 metadata-tokens + ~95 snippet-tokens (...)]
+  //   [note: ...]
+  const DASH_SEP = " " + String.fromCharCode(0x2014) + " ";
+  const SNIPPET_RULE = String.fromCharCode(0x2500).repeat(3);
+  const BUDGETS = [1000, 2000, 4096, 8000, 16000];
+
+  /** The sanitizer's entities back to characters (textarea parses, never runs). */
+  function decodeEntities(s) {
+    const t = document.createElement("textarea");
+    t.innerHTML = s;
+    return t.value;
+  }
+
+  /** One `<sig> (<kind>) <dash> <path>:<line> [k: v]...` line, or null. */
+  function parseEntry(line) {
+    const sep = line.lastIndexOf(DASH_SEP);
+    if (sep <= 0 || /^\s/.test(line)) return null;
+    const left = /^(\S.*) \(([^()]+)\)$/.exec(line.slice(0, sep));
+    if (!left) return null;
+    const right = line.slice(sep + DASH_SEP.length);
+    const firstTag = right.indexOf(" [");
+    const loc = (firstTag >= 0 ? right.slice(0, firstTag) : right).trim();
+    const tags = {};
+    right.replace(/\[(\w+): ([^\]]*)\]/g, (_, k, v) => { tags[k] = v.trim(); return ""; });
+    const m = /^(.*?)(?::(\d+))?$/.exec(loc);
+    return { sig: left[1], kind: left[2], path: m[1], line: m[2] ? Number(m[2]) : null,
+      via: tags.via || "", score: tags.score ? Number(tags.score) : null, snippet: "" };
+  }
+
+  function parseContext(raw) {
+    const text = decodeEntities(ui.envelopeBody(raw));
+    const out = { facts: {}, sections: [], notes: [], totals: null, text };
+    let section = null;
+    let entry = null;
+    let inSnippet = false;
+    const endSnippet = () => {
+      if (entry && entry.snippet) entry.snippet = entry.snippet.replace(/\s+$/, "");
+      inSnippet = false;
+    };
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      // Headings, entries and bracket lines start in column 0; snippet code
+      // that happens to look like one is indented.
+      const head = /^##\s+(.+)$/.exec(line);
+      const bracket = /^\[(.*)\]$/.exec(line);
+      const parsed = section ? parseEntry(line) : null;
+      if (head) {
+        endSnippet();
+        section = { title: head[1].trim(), entries: [] };
+        out.sections.push(section);
+        entry = null;
+      } else if (parsed) {
+        // A new entry also ends the snippet above it.
+        endSnippet();
+        entry = parsed;
+        section.entries.push(entry);
+      } else if (t === SNIPPET_RULE && entry) {
+        inSnippet = true;
+      } else if (inSnippet) {
+        if (bracket && !line.startsWith(" ")) { endSnippet(); }
+        else { entry.snippet += line + "\n"; continue; }
+      }
+      if (bracket && !inSnippet && !head) {
+        const body = bracket[1];
+        if (/^note:/i.test(body)) out.notes.push(body.replace(/^note:\s*/i, ""));
+        else if (/\bnodes\b/.test(body) && /tokens/.test(body)) out.totals = body;
+        else {
+          for (const part of body.split(/\s*[|,]\s*/)) {
+            // `key: value`, or the colon-less `coverage 1/3 (...)`.
+            const kv = /^([\w -]+?):\s*(.+)$/.exec(part.trim()) || /^(coverage)\s+(.+)$/.exec(part.trim());
+            if (kv) out.facts[kv[1].trim().toLowerCase()] = kv[2].trim();
+          }
+        }
+      }
+    }
+    endSnippet();
+    return out;
+  }
+
+  /** Token counts out of the totals line, for the budget meter. */
+  function tokenUse(totals) {
+    if (!totals) return null;
+    const num = (re) => { const m = re.exec(totals); return m ? Number(m[1].replace(/,/g, "")) : 0; };
+    return {
+      nodes: num(/([\d,]+) nodes/),
+      snippets: num(/([\d,]+) with snippets/),
+      meta: num(/~([\d,]+) metadata-tokens/),
+      code: num(/~([\d,]+) snippet-tokens/),
+    };
+  }
+
+  function contextView() {
+    document.title = "Travsr: Context";
+    const q0 = params.get("q") || "";
+    const b0 = Number(params.get("budget")) || 4096;
+    const code0 = params.get("code") === "1";
+    page.innerHTML =
+      '<div class="phead"><h2>Context explorer</h2></div>' +
+      '<p class="sub" style="margin:-4px 0 14px">What Travsr hands an AI agent for a question: the symbols it picks, why, and what they cost in tokens. Ask in plain words or name a symbol.</p>' +
+      '<form class="lookup ctx-form" id="lookup">' +
+      '<span class="lookup-box ctx-q"><input id="ctxq" type="search" placeholder="e.g. where is the session token validated?" value="' + esc(q0) + '" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<label class="sel" for="ctxb">Budget</label><select id="ctxb">' +
+      BUDGETS.map((b) => '<option value="' + b + '"' + (b === b0 ? " selected" : "") + ">" + b.toLocaleString() + " tokens</option>").join("") +
+      "</select>" +
+      '<label class="ctx-check"><input id="ctxc" type="checkbox"' + (code0 ? " checked" : "") + "> Include code</label>" +
+      '<button class="btn primary" type="submit">Explore</button></form>' +
+      '<div id="out"></div>';
+    const form = document.getElementById("lookup");
+    const qEl = document.getElementById("ctxq");
+    const bEl = document.getElementById("ctxb");
+    const cEl = document.getElementById("ctxc");
+    let last = null;      // the parsed answer on screen
+    let runId = 0;
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const q = qEl.value.trim();
+      setQuery("q", q);
+      setQuery("budget", bEl.value === "4096" ? "" : bEl.value);
+      setQuery("code", cEl.checked ? "1" : "");
+      run(q);
+    });
+
+    // Tips, not canned questions: an example that suits one repo abstains
+    // in the next.
+    function empty() {
+      return '<p class="sub">Type a question and press Explore.</p><ul class="ctx-tips">' +
+        "<li>Name a function, type or file to see what is gathered around it.</li>" +
+        "<li>Ask in plain words using terms that appear in code names, for example <em>how is the cache invalidated</em>.</li>" +
+        "<li>One concept per question gives the most focused answer; Travsr says when a question spans several.</li>" +
+        "</ul>";
+    }
+
+    async function run(q) {
+      const out = document.getElementById("out");
+      // A changed index offers a re-run rather than repeating a slow query.
+      refreshView = () => {
+        if (!last) return;
+        const bar = document.getElementById("ctxStale");
+        if (bar) bar.hidden = false;
+      };
+      if (!q) { out.innerHTML = empty(); last = null; return; }
+      const mine = ++runId;
+      document.title = "Context, " + q;
+      const started = Date.now();
+      out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Retrieving context… <span id="ctxTime">0 s</span></p>' +
+        '<p class="sub muted" style="font-size:11.5px">Seconds with the daemon running; without it the index is opened cold, which can take a minute or more on a large repo.</p>';
+      const tick = setInterval(() => {
+        const el = document.getElementById("ctxTime");
+        if (el) el.textContent = Math.round((Date.now() - started) / 1000) + " s";
+      }, 1000);
+      try {
+        const raw = await ui.tool("get_context", { query: q, token_budget: bEl.value, include_snippets: cEl.checked ? "true" : "false" });
+        if (mine !== runId) return;
+        last = parseContext(raw);
+        render(q, Number(bEl.value), (Date.now() - started) / 1000);
+      } catch (e) {
+        if (mine !== runId) return;
+        out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div>" +
+          (/no answer within/.test(e.message) ? '<div class="diag-d">Start the daemon (<code>travsr daemon start</code>) for fast answers, or try a smaller budget.</div>' : "") + "</div>";
+      } finally {
+        clearInterval(tick);
+      }
+    }
+
+    function confidenceClass(c) {
+      c = (c || "").toLowerCase();
+      return c.startsWith("strong") ? "ok" : c.startsWith("weak") || c.startsWith("partial") ? "warn" : c ? "bad" : "";
+    }
+
+    function render(q, budget, secs) {
+      const r = last;
+      const out = document.getElementById("out");
+      const use = tokenUse(r.totals);
+      const used = use ? use.meta + use.code : 0;
+      const pct = budget ? Math.min(100, Math.round((used / budget) * 100)) : 0;
+      // No sections means Travsr abstained: no grounded match for the question.
+      const abstained = !r.sections.length;
+      const conf = abstained ? "no match" : r.facts.confidence || "";
+      const count = r.sections.reduce((n, s) => n + s.entries.length, 0);
+      const maxScore = Math.max(0.0001, ...r.sections.flatMap((s) => s.entries.map((e) => e.score || 0)));
+      const card = (k, v, cls, sub) => '<div class="card' + (cls ? " " + cls : "") + '"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" + (sub ? '<div class="s">' + esc(sub) + "</div>" : "") + "</div>";
+
+      let html = '<div id="ctxStale" class="note-box ctx-stale" hidden>The index changed since this answer. <button class="link-btn" type="button" data-rerun="1">Run again</button></div>';
+      html += '<div class="ctx-head"><h3>Context for <code>' + esc(q) + "</code></h3>" +
+        '<span class="ctx-actions"><button class="btn" type="button" data-copy-ctx="1" title="Copy exactly what the agent receives">Copy for chat</button>' +
+        '<button class="btn" type="button" data-raw="1" aria-pressed="false">Raw text</button></span></div>';
+      html += '<div class="cards ctx-cards">' +
+        card("Confidence", conf ? conf.charAt(0).toUpperCase() + conf.slice(1) : "Unknown", confidenceClass(conf) === "ok" ? "" : confidenceClass(conf) === "warn" ? "warn" : conf ? "bad" : "", r.facts.retrieval || "") +
+        card("Symbols", String(use ? use.nodes : count), "", use && use.snippets ? use.snippets + " with code" : "") +
+        card("Tokens", "~" + used.toLocaleString(), pct >= 100 ? "warn" : "", "of " + budget.toLocaleString() + " budget") +
+        card("Coverage", (r.facts.coverage || "–").replace(/\s*\(.*$/, ""), "", (r.facts.coverage || "").replace(/^[^(]*\(?/, "").replace(/\)$/, "")) +
+        card("Answered in", secs < 10 ? secs.toFixed(1) + " s" : Math.round(secs) + " s", "", "embeddings " + (r.facts.embeddings || "off")) +
+        "</div>";
+      if (use && !abstained) {
+        const metaPct = budget ? Math.min(100, (use.meta / budget) * 100) : 0;
+        const codePct = budget ? Math.min(100 - metaPct, (use.code / budget) * 100) : 0;
+        html += '<div class="ctx-meter" title="~' + use.meta + " metadata + ~" + use.code + " code tokens of " + budget + '"><span class="m-meta" style="width:' + metaPct.toFixed(1) + '%"></span><span class="m-code" style="width:' + codePct.toFixed(1) + '%"></span></div>' +
+          '<div class="ctx-legend"><span><i class="m-meta"></i>metadata ~' + use.meta.toLocaleString() + '</span><span><i class="m-code"></i>code ~' + use.code.toLocaleString() + "</span><span>" + pct + "% of budget</span></div>";
+      }
+      html += r.notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("");
+      html += '<pre class="ctx-raw" id="ctxRaw" hidden>' + esc(r.text.trim()) + "</pre>";
+      html += '<div id="ctxParsed">';
+      if (abstained) {
+        html += '<p class="sub" style="margin:12px 0 6px">Travsr found nothing it could ground this question in, so an agent would be told that rather than handed guesses. Its explanation:</p>' +
+          '<pre class="ctx-raw">' + esc(r.text.trim()) + "</pre>";
+      }
+      for (const s of r.sections) {
+        html += '<details class="hsec ctx-sec" open><summary><span class="nm">' + esc(s.title) + '</span> <span class="badge dim">' + s.entries.length + "</span></summary><ul class=\"ctx-list\">";
+        for (const e of s.entries) {
+          const name = e.sig.includes(":") ? e.sig.slice(e.sig.indexOf(":") + 1) : e.sig;
+          const where = e.path + (e.line ? ":" + e.line : "");
+          const bar = e.score != null ? '<span class="ctx-score" title="relevance ' + e.score.toFixed(2) + '"><span style="width:' + Math.max(2, (e.score / maxScore) * 100).toFixed(0) + '%"></span></span>' : "";
+          html += '<li class="ctx-item"><div class="ctx-row">' + bar +
+            '<span class="s-kind">' + esc(e.kind) + "</span>" +
+            '<a class="ctx-name" href="' + esc(ui.withRepo("/graph", { q: e.sig })) + '" title="Show in the graph">' + esc(name) + "</a>" +
+            '<span class="ctx-where">' + editorAnchor(e.path, e.line, where) + "</span>" +
+            (e.via ? '<span class="ctx-via">' + esc(e.via) + "</span>" : "") + "</div>" +
+            (e.snippet ? '<pre class="ctx-code">' + esc(e.snippet) + "</pre>" : "") + "</li>";
+        }
+        html += "</ul></details>";
+      }
+      html += "</div>";
+      out.innerHTML = html;
+    }
+
+    page.addEventListener("click", async (e) => {
+      const t = e.target.closest("[data-copy-ctx],[data-raw],[data-rerun]");
+      if (!t) return;
+      if (t.dataset.rerun) { form.requestSubmit(); return; }
+      if (t.dataset.copyCtx && last) {
+        try { await navigator.clipboard.writeText(last.text.trim()); t.textContent = "Copied"; } catch (_) { t.textContent = "Copy failed"; }
+        setTimeout(() => { t.textContent = "Copy for chat"; }, 1600);
+        return;
+      }
+      if (t.dataset.raw) {
+        const raw = document.getElementById("ctxRaw");
+        const parsed = document.getElementById("ctxParsed");
+        const on = raw.hidden;
+        raw.hidden = !on;
+        parsed.hidden = on;
+        t.setAttribute("aria-pressed", String(on));
+      }
+    });
+
+    run(q0);
+  }
+
+  const VIEWS = { "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/context": contextView, "/repos": repos };
 
   (async function main() {
     const path = location.pathname.replace(/\/+$/, "");

@@ -232,7 +232,7 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 
 /// The read-only single-repo tools `travsr ui` (#1036) serves besides MCP:
 /// the ones the VS Code extension's Health, Graph, Callers, Dependencies,
-/// Blast radius and Repos pages call. Nothing here writes.
+/// Blast radius, Repos and Context Explorer pages call. Nothing here writes.
 ///
 /// Both surfaces dispatch through [`browse_tool_text`], so the browser and an
 /// MCP client asking the same question get the same text by construction,
@@ -251,6 +251,7 @@ pub const BROWSE_TOOLS: &[&str] = &[
     "get_graph_health",
     "repos_list",
     "repo_languages",
+    "get_context",
 ];
 
 /// The [`BROWSE_TOOLS`] that inspect the index rather than read the graph:
@@ -360,6 +361,45 @@ fn browse_tool_text(
         // #636: read-only observability tools.
         "get_index_status" => crate::observability::get_index_status(store),
         "get_graph_health" => crate::observability::get_graph_health(store),
+        // The Context Explorer: what an agent would be handed for a question.
+        "get_context" => {
+            let query = args["query"].as_str().unwrap_or("");
+            // McpClient sends Record<string,string> so numeric args arrive as JSON strings.
+            // Try numeric first (direct callers) then string fallback (VS Code extension path).
+            let token_budget = args["token_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["token_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .unwrap_or(4096) as usize;
+            let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
+            let snippet_budget = args["snippet_budget"]
+                .as_u64()
+                .or_else(|| {
+                    args["snippet_budget"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .map(|v| v as usize);
+            // Use the embed-aware path when the daemon has injected a KNN hook
+            // (i.e. `travsr embed init` + `travsr embed reindex` have been run).
+            // Falls back to fuzzy text search automatically when the hook is absent.
+            match store.embed_knn_fn() {
+                Some(knn) => tools::get_context_embed(
+                    store,
+                    query,
+                    token_budget,
+                    include_snippets,
+                    snippet_budget,
+                    &knn,
+                ),
+                None => {
+                    tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
+                }
+            }
+        }
         _ => return None,
     })
 }
@@ -438,44 +478,6 @@ fn handle_tool_call(
                 width,
                 token_budget,
             )
-        }
-        "get_context" => {
-            let query = args["query"].as_str().unwrap_or("");
-            // McpClient sends Record<string,string> so numeric args arrive as JSON strings.
-            // Try numeric first (direct callers) then string fallback (VS Code extension path).
-            let token_budget = args["token_budget"]
-                .as_u64()
-                .or_else(|| {
-                    args["token_budget"]
-                        .as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .unwrap_or(4096) as usize;
-            let include_snippets = args["include_snippets"].as_bool().unwrap_or(false);
-            let snippet_budget = args["snippet_budget"]
-                .as_u64()
-                .or_else(|| {
-                    args["snippet_budget"]
-                        .as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .map(|v| v as usize);
-            // Use the embed-aware path when the daemon has injected a KNN hook
-            // (i.e. `travsr embed init` + `travsr embed reindex` have been run).
-            // Falls back to fuzzy text search automatically when the hook is absent.
-            match store.embed_knn_fn() {
-                Some(knn) => tools::get_context_embed(
-                    store,
-                    query,
-                    token_budget,
-                    include_snippets,
-                    snippet_budget,
-                    &knn,
-                ),
-                None => {
-                    tools::get_context(store, query, token_budget, include_snippets, snippet_budget)
-                }
-            }
         }
         // DIAGNOSTIC (#462 Phase 0): raw embed-KNN ranking. Hidden — not in
         // tools/list; call by name. No shipping path depends on it.
@@ -1985,6 +1987,10 @@ mod tests {
             ("get_index_status", serde_json::json!({})),
             ("get_graph_health", serde_json::json!({})),
             ("repo_languages", serde_json::json!({})),
+            (
+                "get_context",
+                serde_json::json!({ "query": "run", "token_budget": "800", "include_snippets": "true" }),
+            ),
         ] {
             let via_ui = browse_tool_call(&store, tool, &args).expect(tool);
             let req = RpcRequest {

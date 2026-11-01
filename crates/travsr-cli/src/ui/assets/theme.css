@@ -228,3 +228,54 @@ body:not(.ui-page) #brand .word {
   background: none; -webkit-text-fill-color: currentColor; color: var(--tsr-text);
   font-family: var(--tsr-font-serif); font-weight: 400;
 }
+
+/* ── Context explorer (pages.js contextView) ──────────────────────────── */
+.ctx-form .ctx-q { flex: 1 1 420px; min-width: 260px; }
+.ctx-form select { height: 30px; }
+.ctx-check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--tsr-muted); cursor: pointer; }
+.ctx-check input { accent-color: var(--tsr-accent); min-width: 0; flex: none; width: auto; margin: 0; }
+.ctx-tips { margin: 6px 0 0; padding-left: 18px; color: var(--tsr-muted); font-size: 12.5px; line-height: 1.8; }
+.ctx-tips em { color: var(--tsr-text); }
+.ctx-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 12px; }
+.ctx-head h3 { margin: 0; }
+.ctx-actions { margin-left: auto; display: flex; gap: 8px; }
+.ctx-actions .btn[aria-pressed="true"] { border-color: var(--tsr-accent); color: var(--tsr-accent-text); background: var(--tsr-accent-deep); }
+.ctx-cards .card { flex: 1 1 140px; }
+.ctx-cards .card .v { font-size: 20px; }
+.ctx-cards .card .s { margin-top: 3px; font-size: 10.5px; color: var(--tsr-muted); }
+.ctx-meter {
+  display: flex; height: 8px; margin: 14px 0 6px; border-radius: 999px; overflow: hidden;
+  background: var(--tsr-input); border: 1px solid var(--tsr-border-soft);
+}
+.ctx-meter span { display: block; height: 100%; }
+.m-meta { background: var(--tsr-accent); }
+.m-code { background: var(--tsr-secondary); }
+.ctx-legend { display: flex; gap: 16px; font-size: 11px; color: var(--tsr-muted); margin-bottom: 12px; }
+.ctx-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
+.ctx-sec { margin-top: 12px; }
+.ctx-list { list-style: none; margin: 0; padding: 4px 0; }
+.ctx-item { padding: 6px 12px; border-top: 1px solid var(--tsr-border-soft); }
+.ctx-item:first-child { border-top: 0; }
+.ctx-row { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; font-size: 12.5px; }
+.ctx-score {
+  flex: 0 0 38px; height: 4px; align-self: center; border-radius: 999px;
+  background: var(--tsr-input); overflow: hidden;
+}
+.ctx-score span { display: block; height: 100%; background: var(--tsr-accent); }
+.ctx-row .s-kind {
+  font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.ctx-name { font: 600 12.5px var(--tsr-font-mono); text-decoration: none; }
+.ctx-name:hover { text-decoration: underline; }
+.ctx-where { font: 11.5px var(--tsr-font-mono); }
+.ctx-where a { color: var(--tsr-muted); }
+.ctx-via { font-size: 11px; color: var(--tsr-subtle); font-style: italic; }
+.ctx-code, .ctx-raw {
+  margin: 8px 0 2px; padding: 10px 12px; border-radius: 8px; overflow-x: auto;
+  background: var(--tsr-input); border: 1px solid var(--tsr-border-soft);
+  font: 11.5px/1.55 var(--tsr-font-mono); color: var(--tsr-text); white-space: pre;
+}
+.ctx-raw { max-height: 70vh; overflow: auto; }
+.ctx-stale { display: flex; align-items: center; gap: 8px; }
+@media (max-width: 760px) { .ctx-form .ctx-q { min-width: 0; flex: 1 1 100%; } .ctx-actions { margin-left: 0; } }
