@@ -62,6 +62,12 @@ pub struct AstSkeleton {
     /// Unresolved direct callee identifiers within the body (structural, not semantic).
     /// Capped at 20. Member calls are de-qualified: `self.foo()` → `foo`.
     pub callees: Vec<String>,
+    /// Leading doc comment (`///`, `/** */`, Python docstring) as one continuous,
+    /// sentence-truncated string. `None` when the declaration has no doc comment.
+    /// Used by `render()` so the human-readable `doc:` field is real prose, not a
+    /// subsampled mix of fractured comment lines. Embedding text still draws from
+    /// `comments` (which includes these lines), so this adds no embedding signal.
+    pub doc: Option<String>,
     /// Doc comments (preceding siblings) + body comments (DFS within body), stripped
     /// of comment markers. Collected in source order; up to 60 entries pre-subsampling.
     /// Even subsampling is applied at render/embed time so coverage spans the full body.
@@ -89,7 +95,11 @@ impl AstSkeleton {
         if !self.callees.is_empty() {
             out.push(format!("  calls: {}", self.callees.join(", ")));
         }
-        if !self.comments.is_empty() {
+        if let Some(doc) = &self.doc {
+            // Leading doc comment, as continuous prose: preferred over inline samples.
+            out.push(format!("  doc: {doc}"));
+        } else if !self.comments.is_empty() {
+            // No doc comment: fall back to sampled inline comments, source order.
             let sampled = subsample_comments(&self.comments, 15);
             out.push(format!("  doc: {}", sampled.join(" | ")));
         }
@@ -236,6 +246,118 @@ fn subsample_comments(comments: &[String], max_count: usize) -> Vec<&str> {
     }
     let step = (comments.len() / max_count).max(1);
     comments.iter().step_by(step).map(|s| s.as_str()).collect()
+}
+
+/// Hard character cap for the rendered doc comment when no sentence boundary is near.
+const DOC_MAX_CHARS: usize = 400;
+
+/// Join doc-comment lines into one continuous string (markers already stripped),
+/// collapse internal whitespace, and truncate at the first sentence boundary
+/// (`. ` / `! ` / `? `) at or before `DOC_MAX_CHARS`, else a hard char cap.
+/// Returns `None` when the lines carry no text.
+fn join_doc_comment(lines: &[String]) -> Option<String> {
+    let joined: String = lines
+        .iter()
+        .flat_map(|s| s.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.is_empty() {
+        return None;
+    }
+    Some(truncate_at_sentence(&joined))
+}
+
+/// A token that ends in `.` without ending a sentence: a known Latin abbreviation
+/// (`etc`, `vs`, `cf`, `resp`, …), any token carrying an internal `.` (`e.g`, `i.e`,
+/// a version like `v1.2`), or a lone letter (`C`, an initial). Used so a `. ` inside
+/// such a token is not mistaken for a sentence boundary.
+fn is_abbreviation(tok: &str) -> bool {
+    const ABBR: &[&str] = &[
+        "etc", "vs", "cf", "resp", "approx", "incl", "excl", "viz", "fig",
+    ];
+    if tok.contains('.') {
+        return true;
+    }
+    let mut chars = tok.chars();
+    if let Some(c) = chars.next() {
+        if chars.next().is_none() && c.is_alphabetic() {
+            return true;
+        }
+    }
+    ABBR.contains(&tok.to_ascii_lowercase().as_str())
+}
+
+/// Cut `s` at the end of its first sentence if that falls at or before
+/// `DOC_MAX_CHARS`; otherwise truncate at `DOC_MAX_CHARS` on a char boundary.
+/// A `.` closing a known abbreviation (`e.g.`, `etc.`) is not a sentence end.
+fn truncate_at_sentence(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let sentence_end = bytes.iter().enumerate().find_map(|(i, &b)| {
+        let terminator = b == b'.' || b == b'!' || b == b'?';
+        let boundary = i + 1 >= bytes.len() || bytes[i + 1] == b' ';
+        if !(terminator && boundary) {
+            return None;
+        }
+        // `. ` ending an abbreviation is not a sentence break; keep scanning.
+        if b == b'.' {
+            let start = bytes[..i]
+                .iter()
+                .rposition(|&c| c == b' ')
+                .map_or(0, |p| p + 1);
+            if let Ok(tok) = std::str::from_utf8(&bytes[start..i]) {
+                if is_abbreviation(tok) {
+                    return None;
+                }
+            }
+        }
+        Some(i + 1)
+    });
+    let cut = match sentence_end {
+        Some(e) if e <= DOC_MAX_CHARS => e,
+        _ => {
+            let mut c = DOC_MAX_CHARS.min(s.len());
+            while c > 0 && !s.is_char_boundary(c) {
+                c -= 1;
+            }
+            c
+        }
+    };
+    s[..cut].trim_end().to_string()
+}
+
+/// A section banner (`// ── petgraph construction ──────`), not prose. A `//` rule
+/// shares the `line_comment` kind with a `///` doc on most grammars, so the doc walk
+/// picks it up; it must be dropped before it becomes the `doc:` field or crowds out a
+/// real body comment.
+fn is_banner_line(line: &str) -> bool {
+    // Box-drawing rules are never prose; ASCII rules need a 4+ run to avoid `---` in text.
+    line.contains('─')
+        || line.contains('═')
+        || line.contains("====")
+        || line.contains("----")
+        || line.contains("****")
+}
+
+/// The leading doc comment for `decl` as continuous prose: preceding
+/// `///` / `/** */` sibling comments for most languages, or the first-statement
+/// docstring for Python. `None` when the declaration has no doc comment.
+fn leading_doc_comment(decl: TsNode<'_>, src: &[u8], ck: &[&str], lang: &Lang) -> Option<String> {
+    match lang {
+        Lang::Python => {
+            let body = decl.child_by_field_name("body")?;
+            let docstring = collect_python_docstring(body, src)?;
+            join_doc_comment(&[docstring])
+        }
+        _ => {
+            // Drop section-banner lines so a `// ── X ──` rule above the declaration
+            // neither becomes the doc nor suppresses the real body-comment fallback.
+            let lines: Vec<String> = doc_comments_from(decl, src, ck, true)
+                .into_iter()
+                .filter(|l| !is_banner_line(l))
+                .collect();
+            join_doc_comment(&lines)
+        }
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -692,7 +814,7 @@ fn find_decl_dfs<'a>(node: TsNode<'a>, target_row: usize, kinds: &[&str]) -> Opt
 fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> AstSkeleton {
     let token_estimate = ((decl.end_byte() - decl.start_byte()) / 4).max(512);
     let ck = comment_kinds_for(lang);
-    match lang {
+    let mut skel = match lang {
         Lang::Rust => extract_rust(decl, src, &node.kind, token_estimate, ck),
         Lang::TypeScript { .. } => extract_typescript(decl, src, &node.kind, token_estimate, ck),
         Lang::Python => extract_python(decl, src, &node.kind, token_estimate, ck),
@@ -708,7 +830,11 @@ fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> A
         Lang::Scala => extract_scala(decl, src, &node.kind, token_estimate, ck),
         Lang::Php => extract_php(decl, src, &node.kind, token_estimate, ck),
         Lang::ObjectiveC => extract_objc(decl, src, &node.kind, token_estimate, ck),
-    }
+    };
+    // Extractors leave `doc` as None and merge all comments into `comments`
+    // (so embedding text is unchanged). Fill the human-readable doc comment here.
+    skel.doc = leading_doc_comment(decl, src, ck, lang);
+    skel
 }
 
 // ── Rust ──────────────────────────────────────────────────────────────────────
@@ -816,6 +942,7 @@ fn extract_rust(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -959,6 +1086,7 @@ fn extract_typescript(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1044,6 +1172,7 @@ fn extract_python(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1175,6 +1304,7 @@ fn extract_go(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1279,6 +1409,7 @@ fn extract_java(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1340,6 +1471,7 @@ fn extract_kotlin(
         return_type: None, // shown in signature; no dedicated field in tree-sitter-kotlin-ng
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1422,6 +1554,7 @@ fn extract_c(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1495,6 +1628,7 @@ fn extract_cpp(
         return_type: None,
         fields,
         callees: vec![],
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1584,6 +1718,7 @@ fn extract_csharp(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1716,6 +1851,7 @@ fn extract_swift(
         return_type,
         fields,
         callees: vec![], // call_expression in Swift has no named fields
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1859,6 +1995,7 @@ fn extract_dart(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1928,6 +2065,7 @@ fn extract_ruby(
         return_type: None, // Ruby is dynamically typed
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -1996,6 +2134,7 @@ fn extract_scala(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -2076,6 +2215,7 @@ fn extract_php(
         return_type,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -2151,6 +2291,7 @@ fn extract_objc(
         return_type: None,
         fields,
         callees,
+        doc: None,
         comments,
         token_estimate,
     }
@@ -2292,6 +2433,28 @@ fn strip_comment_marker(s: &str) -> String {
 /// Walk `prev_named_sibling()` from `decl` to collect adjacent doc-comment nodes.
 /// Stops at the first non-comment named sibling. Results are reversed to source order.
 fn collect_doc_comments(decl: TsNode<'_>, src: &[u8], comment_kinds: &[&str]) -> Vec<String> {
+    doc_comments_from(decl, src, comment_kinds, false)
+}
+
+/// True for attribute / decorator / annotation node kinds that sit between a
+/// declaration and its doc comment (`attribute_item`, `decorator`, `annotation`,
+/// `attribute_list`, …). Matched by substring so it spans every grammar.
+fn is_decorator_kind(kind: &str) -> bool {
+    kind.contains("attribute") || kind.contains("decorator") || kind.contains("annotation")
+}
+
+/// Collect the doc comment preceding `decl`, in source order, markers stripped.
+///
+/// With `skip_decorators`, step over attribute/decorator/annotation siblings that
+/// sit between the declaration and its doc comment (e.g. a Rust `#[allow(...)]`
+/// above the `///`). The embedding path passes `false` so its comment bytes are
+/// unchanged; the human-readable `doc:` field passes `true` so the comment is found.
+fn doc_comments_from(
+    decl: TsNode<'_>,
+    src: &[u8],
+    comment_kinds: &[&str],
+    skip_decorators: bool,
+) -> Vec<String> {
     // Climb out of same-line wrappers first. `export function f() {}` parses as
     // an `export_statement` containing the `function_declaration`, so the
     // declaration has no previous sibling at all and the comment is a sibling of
@@ -2321,6 +2484,8 @@ fn collect_doc_comments(decl: TsNode<'_>, src: &[u8], comment_kinds: &[&str]) ->
             if !stripped.is_empty() {
                 docs.push(stripped);
             }
+            cursor = sib.prev_named_sibling();
+        } else if skip_decorators && is_decorator_kind(sib.kind()) {
             cursor = sib.prev_named_sibling();
         } else {
             break;
@@ -2467,6 +2632,7 @@ mod tests {
             return_type: Some("Result<()>".to_string()),
             fields: vec![],
             callees: vec!["validate".to_string()],
+            doc: None,
             comments: vec![],
             token_estimate: 512,
         };
@@ -2491,6 +2657,98 @@ mod tests {
         assert!(!r.contains("returns:"));
         assert!(!r.contains("fields:"));
         assert!(!r.contains("calls:"));
+    }
+
+    #[test]
+    fn render_prefers_doc_comment_over_inline() {
+        // Doc comment present: render it as continuous prose, ignore inline samples.
+        let s = AstSkeleton {
+            kind: "function".to_string(),
+            signature: "fn f()".to_string(),
+            doc: Some("Charge the card and record the receipt.".to_string()),
+            comments: vec![
+                "early return on empty".to_string(),
+                "retry once".to_string(),
+            ],
+            ..Default::default()
+        };
+        let r = s.render();
+        assert!(r.contains("doc: Charge the card and record the receipt."));
+        assert!(!r.contains("early return"));
+        assert!(!r.contains(" | ")); // single continuous doc, not a pipe-joined sample
+    }
+
+    #[test]
+    fn render_falls_back_to_inline_in_source_order() {
+        // No doc comment: sampled inline comments, kept in source order.
+        let s = AstSkeleton {
+            kind: "function".to_string(),
+            signature: "fn f()".to_string(),
+            doc: None,
+            comments: vec!["first".to_string(), "second".to_string()],
+            ..Default::default()
+        };
+        let r = s.render();
+        assert!(r.contains("doc: first | second"));
+    }
+
+    #[test]
+    fn join_doc_comment_truncates_at_sentence() {
+        let lines = vec![
+            "Guard against inverted floors.".to_string(),
+            "A second sentence that must be dropped.".to_string(),
+        ];
+        assert_eq!(
+            join_doc_comment(&lines).as_deref(),
+            Some("Guard against inverted floors.")
+        );
+        assert_eq!(join_doc_comment(&[]), None);
+        assert_eq!(join_doc_comment(&["   ".to_string()]), None);
+    }
+
+    #[test]
+    fn truncate_does_not_break_on_abbreviations() {
+        // `e.g.` / `i.e.` / `etc.` are not sentence boundaries: the first real
+        // sentence must survive intact rather than cutting to a dangling fragment.
+        let lines =
+            vec!["First two path segments, e.g. \"crates/travsr\". Dropped tail.".to_string()];
+        assert_eq!(
+            join_doc_comment(&lines).as_deref(),
+            Some("First two path segments, e.g. \"crates/travsr\".")
+        );
+        let lines = vec!["Share of IDF mass, i.e. the subject term. Next.".to_string()];
+        assert_eq!(
+            join_doc_comment(&lines).as_deref(),
+            Some("Share of IDF mass, i.e. the subject term.")
+        );
+    }
+
+    #[test]
+    fn banner_only_doc_falls_back_to_body_comment() {
+        // A `// ── X ──` rule above a declaration with no real doc comment must not
+        // become the doc field or suppress the body-comment fallback (#1056 follow-up).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "// \u{2500}\u{2500} petgraph construction \u{2500}\u{2500}\u{2500}\u{2500}\n\
+             \n\
+             fn build_graph() {\n\
+                 // Determinism: insert nodes in sorted order.\n\
+                 let x = 1;\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("lib.rs", "fn:build_graph", "rust", "function", 3, 6);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        // The banner is dropped, so `doc` is None and render falls back to the body
+        // comment (as it did before #1056) instead of showing a banner-only doc field.
+        assert_eq!(skel.doc, None, "banner must not become the doc field");
+        assert!(
+            skel.render().contains("Determinism"),
+            "render should keep body comment: {}",
+            skel.render()
+        );
     }
 
     // ── SEC guards ────────────────────────────────────────────────────────────
@@ -2565,6 +2823,31 @@ mod tests {
             callees_str.contains("validate") || callees_str.contains("process"),
             "callees: {callees_str}"
         );
+    }
+
+    #[test]
+    fn rust_doc_comment_survives_intervening_attribute() {
+        // Repro for #1056: `#[allow(...)]` between the `///` doc comment and the
+        // `fn` must not hide the doc comment; `doc` is the continuous prose.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "/// Charge the card.\n\
+             /// Records a receipt on success.\n\
+             #[allow(clippy::too_many_arguments)]\n\
+             fn charge() {\n\
+                 // inline body comment\n\
+                 let x = 1;\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("lib.rs", "fn:charge", "rust", "function", 4, 7);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert_eq!(skel.doc.as_deref(), Some("Charge the card."));
+        let r = skel.render();
+        assert!(r.contains("doc: Charge the card."), "render: {r}");
+        assert!(!r.contains("inline body comment"), "render: {r}");
     }
 
     #[test]
