@@ -442,7 +442,10 @@
       card("Schema", s ? String(s.schema) : "—") +
       card("DB size", dbSize) +
       card("Last indexed", lastIndexed, index.isStale === true ? "warn" : undefined, index.isStale === true ? "stale" : undefined) +
-      semanticTile + "</div>" + sections;
+      semanticTile +
+      // The travsr binary serving this page (`travsr --version`); the daemon
+      // restarts itself onto this version when they differ.
+      card("Version", d.binaryVersion || "…", undefined, "travsr") + "</div>" + sections;
   }
 
   function skewBanner(skew) {
