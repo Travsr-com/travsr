@@ -20,6 +20,7 @@ pub fn run(
     pattern: &str,
     scope: Option<String>,
     fixed: bool,
+    context: u32,
     format: OutputFormat,
 ) -> anyhow::Result<()> {
     if pattern.trim().is_empty() {
@@ -47,7 +48,7 @@ pub fn run(
     // `find_pattern` returns the model-facing `<travsr-data>` envelope with
     // source text HTML-entity escaped (`->` → `-&gt;`); that is wrong for a
     // human terminal. `references` / `graph` already print raw — match them.
-    let output = travsr_mcp::find_pattern_raw(&store, pattern, scope.as_deref(), fixed);
+    let output = travsr_mcp::find_pattern_raw(&store, pattern, scope.as_deref(), fixed, context);
 
     match format {
         OutputFormat::Json => {
@@ -57,6 +58,7 @@ pub fn run(
                     "pattern": pattern,
                     "scope": scope,
                     "fixed": fixed,
+                    "context": context,
                     "output": output,
                 })
             );

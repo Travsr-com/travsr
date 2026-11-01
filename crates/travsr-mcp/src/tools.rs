@@ -323,8 +323,21 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
 /// The **live** half stays repo-wide and says so: it reports that an un-ratified
 /// overlay is in play at all, which is true of the whole graph the answer was
 /// drawn from, not of any one file in it.
-fn live_overlay_note(store: &SqliteStore, answer: &str) -> Option<String> {
-    let live = store.count_edges_with_provenance("live").ok().unwrap_or(0);
+fn live_overlay_note(store: &SqliteStore, answer: &str, has_live_row: bool) -> Option<String> {
+    // #1053: the live half says a call "is included and marked `live`", a claim
+    // about THIS answer, so it may only fire when this answer actually rendered a
+    // live edge. The repo-wide count alone fired it beside a not-found or
+    // zero-result answer that holds no such edge at all, which reads as a direct
+    // contradiction. `has_live_row` is that per-answer fact, computed by each
+    // caller in the terms of its own surface: a prose row carries `LIVE_MARKER`,
+    // while the JSON surface carries the edge's `live` provenance, so no single
+    // string test over `answer` can serve both. The count stays repo-wide (the
+    // note says so); the gate decides only whether to speak, not the number.
+    let live = if has_live_row {
+        store.count_edges_with_provenance("live").ok().unwrap_or(0)
+    } else {
+        0
+    };
     // Only files edited since HEAD: the same count `travsr status` gives.
     let pending: u64 = crate::query::pending_refs_in_edited_files(store)
         .into_iter()
@@ -537,7 +550,17 @@ fn repo_head_from_registry_path(db_path: &std::path::Path) -> Option<String> {
 /// `head` is the caller's live short HEAD (or `None` when git-less); split out
 /// as a parameter so the composition is deterministically testable without the
 /// process-global `LAUNCH_CWD`.
-fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> String {
+///
+/// `has_live` is the per-answer live signal (#1053): whether THIS answer drew on
+/// an un-ratified edge. The caller computes it in the terms of its own surface,
+/// because no single test over `body` serves every surface (see the note at the
+/// `live_overlay_note` call below).
+fn append_read_notes(
+    store: &SqliteStore,
+    body: String,
+    head: Option<&str>,
+    has_live: bool,
+) -> String {
     let stored = store
         .get_meta("last_commit")
         .ok()
@@ -548,7 +571,13 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
     // names, and a note already appended is not part of the answer.
     let notes = [
         phase_b_degraded_note(store),
-        live_overlay_note(store, &body),
+        // #1053: `has_live` is passed by the caller, not derived from `body`.
+        // get_callers / find_references flag a live edge with `LIVE_MARKER` in
+        // the body, but get_blast_radius / get_execution_path traverse live edges
+        // and render no marker at all, so a `body.contains(LIVE_MARKER)` gate here
+        // would silence the overlay note on those two surfaces forever. Each
+        // caller instead reports its own per-answer fact.
+        live_overlay_note(store, &body, has_live),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ];
     let mut out = body;
@@ -566,9 +595,9 @@ fn append_read_notes(store: &SqliteStore, body: String, head: Option<&str>) -> S
 /// Production entry: resolves the caller's HEAD from the captured launch cwd
 /// (§ `LAUNCH_CWD`) and appends the advisory notes. Fail-safe — no cwd or no git
 /// means no head note.
-fn with_phase_b_note(store: &SqliteStore, body: String) -> String {
+fn with_phase_b_note(store: &SqliteStore, body: String, has_live: bool) -> String {
     let head = LAUNCH_CWD.get().and_then(|cwd| git_short_head(cwd));
-    append_read_notes(store, body, head.as_deref())
+    append_read_notes(store, body, head.as_deref(), has_live)
 }
 
 /// #661 WS-D: append the index/HEAD mismatch note (#645) **only** — no Phase-B
@@ -615,10 +644,15 @@ fn with_head_note(store: &SqliteStore, body: String) -> String {
 /// (#617) and the index/HEAD mismatch note (#645), each already carried in the
 /// `signals` array the global aggregator merges. `head` is injectable for the
 /// same testability reason as [`append_head_note`].
+///
+/// `has_live` tells the live-overlay note whether this answer's subgraph carries
+/// an un-ratified edge: the JSON surface has no `LIVE_MARKER` to test for, so the
+/// caller derives it from the edges' `live` provenance (#1053).
 fn read_note_signals(
     store: &SqliteStore,
     head: Option<&str>,
     answer: &str,
+    has_live: bool,
 ) -> Vec<serde_json::Value> {
     let stored = store
         .get_meta("last_commit")
@@ -631,7 +665,7 @@ fn read_note_signals(
         // so a renderer or agent reading JSON is told just as plainly that this
         // answer includes un-ratified edges, and scoped against the same kind of
         // evidence (here the serialized nodes, which carry the file paths).
-        live_overlay_note(store, answer),
+        live_overlay_note(store, answer, has_live),
         head.and_then(|h| head_index_mismatch_note(h, &stored)),
     ]
     .into_iter()
@@ -711,10 +745,9 @@ pub fn get_callers(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
     } else {
         format!("[note: '{shown}' is in the graph but nothing calls or contains it.]")
     };
-    with_phase_b_note(
-        store,
-        wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT)),
-    )
+    let body = wrap_envelope(&sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT));
+    let has_live = body.contains(LIVE_MARKER);
+    with_phase_b_note(store, body, has_live)
 }
 
 /// Raw (unsanitized) variant used by global aggregation.
@@ -1352,7 +1385,8 @@ pub fn get_callers_global(
             .and_then(|db| repo_head_from_registry_path(db));
         let raw = get_callers_raw(store, symbol, path);
         answered |= !raw.is_empty();
-        let result = append_read_notes(store, raw, head.as_deref());
+        let has_live = raw.contains(LIVE_MARKER);
+        let result = append_read_notes(store, raw, head.as_deref(), has_live);
         if result.is_empty() || single {
             result
         } else {
@@ -1647,8 +1681,15 @@ pub(crate) fn resolve_alias(
     // definition, and git searches a fixed string about five times faster
     // (90 ms against 420 ms on a 3,000-file repo). `alias_originals` checks
     // each hit exactly.
-    let GrepOutcome::Matches(body) = run_git_grep(&repo_root, &format!("as {symbol}"), &[], true)
-    else {
+    let GrepOutcome::Matches(body) = run_git_grep(
+        store,
+        &repo_root,
+        &format!("as {symbol}"),
+        &[],
+        true,
+        0,
+        false,
+    ) else {
         return Vec::new();
     };
     // Each original with the import line that names its module.
@@ -1970,7 +2011,8 @@ pub fn find_references(store: &SqliteStore, symbol: &str, path: Option<&str>) ->
         raw
     };
     let body = sanitize_mcp_body_with_limit(&raw, FIND_OUTPUT_LIMIT);
-    wrap_envelope(&with_phase_b_note(store, body))
+    let has_live = body.contains(LIVE_MARKER);
+    wrap_envelope(&with_phase_b_note(store, body, has_live))
 }
 
 /// One resolved definition site, for the structured `find_references` result.
@@ -2569,6 +2611,77 @@ fn resolve_repo_root(store: &SqliteStore) -> Option<PathBuf> {
     store.resolve_repo_root()
 }
 
+/// #1048: the repo-relative, forward-slash paths git tracks, or `None` when the
+/// tracked set cannot be determined (no repo_root in meta, git absent, or a
+/// non-git / cloud/SSE context). `None` means "do not reorder" — callers fail
+/// open to the prior ordering rather than guessing.
+///
+/// Used so name lookups prefer committed code over untracked, non-ignored
+/// scratch files (`bench/`, `DOC/`) that init and the watcher index while they
+/// are being edited. Precedent: `query::pending_refs_in_edited_files` already
+/// shells out to git from this crate.
+/// The git-tracked path set paired with the repo root it was taken from. The
+/// root is kept so [`is_untracked_scratch`] can confirm an untracked path is a
+/// real file on disk.
+type TrackedSet = (std::collections::HashSet<String>, PathBuf);
+
+fn tracked_rel_paths(store: &SqliteStore) -> Option<TrackedSet> {
+    let root = resolve_repo_root(store)?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let set: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // An empty set means git ran but tracks nothing (fresh repo) — read as
+    // "unknown" so a bare checkout does not relabel every indexed file untracked.
+    if set.is_empty() {
+        None
+    } else {
+        Some((set, root))
+    }
+}
+
+/// A node path counts as untracked *scratch* only when git does not track it AND
+/// it is a real file on disk. The on-disk check excludes paths git never lists
+/// yet that are not editable files: synthetic VName paths (`<cgo_synthetic>/…`,
+/// RFC-005) and directory-keyed package nodes (e.g. Go `go-pkg`). Without it
+/// those would be mislabelled not-yet-committed and sorted below real results.
+fn is_untracked_scratch(path: &str, tracked: &TrackedSet) -> bool {
+    let (set, root) = tracked;
+    !set.contains(path) && root.join(path).is_file()
+}
+
+/// Stably reorder `nodes` so definitions in git-tracked files come before those
+/// in untracked scratch files (see [`is_untracked_scratch`]), preserving each
+/// group's existing order. No-op when the tracked set is unknown. Returns
+/// whether any untracked node was present, so a caller can note that untracked
+/// (not-yet-committed) results are included.
+fn prefer_tracked_nodes(nodes: &mut [CoreNode], tracked: &Option<TrackedSet>) -> bool {
+    let Some(tracked) = tracked else {
+        return false;
+    };
+    // sort_by_cached_key is stable and computes the key exactly once per node,
+    // so the on-disk check in is_untracked_scratch runs once each (not O(n log n))
+    // while tracked (false) nodes are lifted above untracked (true) ones without
+    // disturbing order within either group.
+    let mut any_untracked = false;
+    nodes.sort_by_cached_key(|n| {
+        let untracked = is_untracked_scratch(&n.vname.path, tracked);
+        any_untracked |= untracked;
+        untracked
+    });
+    any_untracked
+}
+
 /// Textual search: `git grep` over the repo's text files, minus the paths the
 /// walker hard-skips, the paths an ignore file excludes, and known-binary
 /// formats. Deliberately WIDER than the graph's own file set: a shell script, a
@@ -2591,11 +2704,12 @@ pub fn find_pattern(
     pattern: &str,
     scope: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // Wrap with the larger find-output limit (not the 4 KiB scalar cap) so a
     // capped 500-match list and its truncation notice survive intact.
     wrap_envelope(&sanitize_mcp_body_with_limit(
-        &find_pattern_body(store, pattern, scope, fixed),
+        &find_pattern_body(store, pattern, scope, fixed, context),
         FIND_OUTPUT_LIMIT,
     ))
 }
@@ -2616,11 +2730,12 @@ pub fn find_pattern_raw(
     pattern: &str,
     scope: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // #517 DD-4: zero matches stay the empty string here. `find_pattern_global`
     // (`collect_global`) skips a repo on `result.is_empty()` and the CLI prints
     // its own no-match line on it.
-    let body = find_pattern_body(store, pattern, scope, fixed);
+    let body = find_pattern_body(store, pattern, scope, fixed, context);
     if body == NO_MATCHES {
         String::new()
     } else {
@@ -2636,6 +2751,7 @@ fn find_pattern_body(
     pattern: &str,
     scope: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // #517 DD-7: the pattern argument gets its own validator — it is never
     // path-resolved, so the `../` / `%` guards in `validate_mcp_arg` only cost
@@ -2695,7 +2811,7 @@ fn find_pattern_body(
         }
     };
 
-    match run_git_grep(&repo_root, pattern, &pathspecs, fixed) {
+    match run_git_grep(store, &repo_root, pattern, &pathspecs, fixed, context, true) {
         GrepOutcome::Matches(body) => body,
         // #517 DD-4: `find_pattern_raw` turns this back into the empty string
         // its callers key on.
@@ -3182,12 +3298,22 @@ fn argv_chunks(files: &[String]) -> Vec<&[String]> {
 /// thing it exists to rule out. Both passes share a single [`GREP_TIMEOUT`]
 /// budget so the ceiling is per-call, not per-subprocess.
 fn run_git_grep(
+    store: &SqliteStore,
     repo_root: &std::path::Path,
     pattern: &str,
     pathspecs: &[String],
     fixed: bool,
+    context: u32,
+    tag_tests: bool,
 ) -> GrepOutcome {
     use std::process::Command;
+
+    // #1050: after-context, capped. `-A` only (not `-B`): a before-context line
+    // is printed as `path-line-text` and a repo path contains `-`, so it cannot
+    // be told apart from a match line's path; after-context keeps the match line
+    // first in each group, which the renderer below relies on.
+    const MAX_CONTEXT: u32 = 10;
+    let context = context.min(MAX_CONTEXT);
 
     let started = std::time::Instant::now();
     let remaining = || GREP_TIMEOUT.saturating_sub(started.elapsed());
@@ -3198,8 +3324,11 @@ fn run_git_grep(
         cmd.arg("--no-color")
             .arg("-n") // line numbers
             .arg("--column") // column numbers
-            .arg("-I") // skip binary files
-            .arg(format!("--threads={}", git_grep_thread_count()))
+            .arg("-I"); // skip binary files
+        if context > 0 {
+            cmd.arg("-A").arg(context.to_string());
+        }
+        cmd.arg(format!("--threads={}", git_grep_thread_count()))
             .arg(if fixed { "-F" } else { "-E" })
             .arg("-e")
             .arg(pattern)
@@ -3378,46 +3507,64 @@ fn run_git_grep(
             })
     };
 
-    // Each grep line is `path:line:col:text`, so the path is the prefix before
-    // the first ':'.
+    // A match line is `path:line:col:text`, so its path is the prefix before the
+    // first ':'. With `-A`, an after-context line is `path-line-text` and git
+    // splits regions with a bare `--` line. The walk below keeps each match with
+    // its context block: it counts and caps on match lines only (never mid-group
+    // in a way that would misreport the total), drops a whole group whose file
+    // the graph would never corroborate, and tags a match `[test]` when it lands
+    // inside test code (#1050).
     let travsrignore = build_travsrignore_matcher(repo_root);
-    let all: Vec<&str> = all
-        .iter()
-        .map(String::as_str)
-        .filter(|line| {
-            let Some(path) = line.split(':').next().filter(|p| !p.is_empty()) else {
-                return true;
-            };
-            let in_skip_dir = std::path::Path::new(path)
-                .components()
-                .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip));
-            if in_skip_dir {
-                return false;
-            }
-            if is_binary_ext(path) {
-                return false;
-            }
-            match &travsrignore {
-                Some(ig) => !ig
-                    .matched_path_or_any_parents(repo_root.join(path), false)
-                    .is_ignore(),
-                None => true,
-            }
-        })
-        .collect();
-    if all.is_empty() {
-        // The .travsrignore filter emptied a non-empty git-grep match set — the
-        // honest outcome is still "no matches", not an error (§4 W2 edge case).
-        return GrepOutcome::NoMatches;
-    }
+
+    // Three filters, all closing the same gap: git can see files the walker
+    // refuses to index, so a match from one would be a file `find_references`
+    // can never corroborate. (1) `SKIP_DIRS` is hard-excluded ahead of any
+    // ignore file; (2) `BINARY_EXTS` names formats git misclassifies as text;
+    // (3) `.travsrignore` excludes graph files git still tracks.
+    let file_is_excluded = |path: &str| -> bool {
+        if std::path::Path::new(path)
+            .components()
+            .any(|c| SKIP_DIRS.iter().any(|skip| c.as_os_str() == *skip))
+        {
+            return true;
+        }
+        if is_binary_ext(path) {
+            return true;
+        }
+        match &travsrignore {
+            Some(ig) => ig
+                .matched_path_or_any_parents(repo_root.join(path), false)
+                .is_ignore(),
+            None => false,
+        }
+    };
+
+    // #1050: tag a match `[test]` when its line is inside test code. Resolved
+    // once; fail-open — a missing corpus or a DB error yields no tag rather than
+    // a false one or a dropped match.
+    let corpus = if tag_tests {
+        store.get_meta("corpus").ok().flatten().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let line_is_test = |line: &str| -> bool {
+        if corpus.is_empty() {
+            return false;
+        }
+        let mut it = line.splitn(4, ':');
+        let Some(path) = it.next().filter(|p| !p.is_empty()) else {
+            return false;
+        };
+        let Some(line_no) = it.next().and_then(|s| s.parse::<u32>().ok()) else {
+            return false;
+        };
+        store.line_in_test(&corpus, path, line_no).unwrap_or(false)
+    };
+
     // Per-match line-length cap: a single minified/generated line can be
     // hundreds of KB and would otherwise blow the output budget on its own.
     const MAX_MATCH_LINE: usize = 512;
-    let total = all.len();
-    let shown = total.min(MAX_PATTERN_MATCHES);
-    let mut lines: Vec<String> = Vec::with_capacity(shown + 1);
-    lines.push(format!("{total} match(es):"));
-    lines.extend(all.into_iter().take(MAX_PATTERN_MATCHES).map(|l| {
+    let truncate_line = |l: &str| -> String {
         if l.len() > MAX_MATCH_LINE {
             let mut cut = MAX_MATCH_LINE;
             while cut > 0 && !l.is_char_boundary(cut) {
@@ -3427,9 +3574,83 @@ fn run_git_grep(
         } else {
             l.to_string()
         }
-    }));
-    if total > shown {
-        lines.push(format!("[truncated: showing {shown} of {total} matches]"));
+    };
+
+    let mut rendered: Vec<String> = Vec::new();
+    let mut total_matches = 0usize;
+    let mut shown_matches = 0usize;
+    // Path of the group currently being emitted: it tells a context line
+    // (`{path}-…`) apart from the next match line (`{path}:…`) without
+    // re-parsing a hyphenated prefix the path itself may contain.
+    let mut group_path = String::new();
+    // Whether this group's lines are being dropped (excluded file, or past the
+    // match cap). Set on the match line, inherited by its context lines.
+    let mut suppress_group = false;
+    // A `--` from git not yet emitted; written only between two kept groups, so
+    // a dropped group leaves no dangling separator.
+    let mut pending_sep = false;
+
+    for line in &all {
+        if line == "--" {
+            group_path.clear();
+            pending_sep = true;
+            continue;
+        }
+        // Only when `-A` was passed does git emit context lines (and the `--`
+        // separators that reset `group_path` between files). At context=0 there
+        // are none, so every non-separator line is a match line; skipping the
+        // prefix test keeps a sibling path like `LICENSE-APACHE` (which git
+        // sorts right after `LICENSE`) from being mistaken for after-context.
+        let is_context = context > 0
+            && !group_path.is_empty()
+            && line.starts_with(group_path.as_str())
+            && line.as_bytes().get(group_path.len()) == Some(&b'-');
+        if is_context {
+            if !suppress_group {
+                rendered.push(truncate_line(line));
+            }
+            continue;
+        }
+        // Match line: it opens (or reopens) a group.
+        let Some(path) = line.split(':').next().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        group_path = path.to_string();
+        if file_is_excluded(path) {
+            suppress_group = true;
+            continue;
+        }
+        total_matches += 1;
+        if shown_matches >= MAX_PATTERN_MATCHES {
+            // Counted for the truncation note, but neither it nor its context
+            // block is emitted.
+            suppress_group = true;
+            continue;
+        }
+        suppress_group = false;
+        shown_matches += 1;
+        if pending_sep && !rendered.is_empty() {
+            rendered.push("--".to_string());
+        }
+        pending_sep = false;
+        let tag = if line_is_test(line) { "[test] " } else { "" };
+        rendered.push(format!("{tag}{}", truncate_line(line)));
+    }
+
+    if total_matches == 0 {
+        // The skip-dir / binary / .travsrignore filter emptied a non-empty
+        // git-grep match set — the honest outcome is still "no matches", not an
+        // error (§4 W2 edge case).
+        return GrepOutcome::NoMatches;
+    }
+
+    let mut lines: Vec<String> = Vec::with_capacity(rendered.len() + 2);
+    lines.push(format!("{total_matches} match(es):"));
+    lines.append(&mut rendered);
+    if total_matches > shown_matches {
+        lines.push(format!(
+            "[truncated: showing {shown_matches} of {total_matches} matches]"
+        ));
     }
     GrepOutcome::Matches(lines.join("\n"))
 }
@@ -3441,6 +3662,7 @@ pub fn find_pattern_global(
     scope: Option<&str>,
     repo: Option<&str>,
     fixed: bool,
+    context: u32,
 ) -> String {
     // #517 DD-7: same exemption as `find_pattern_raw` — see
     // `validate_mcp_pattern_arg`'s doc comment.
@@ -3461,7 +3683,7 @@ pub fn find_pattern_global(
     // would be a claim about a search that never ran.
     let mut searched = false;
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = find_pattern_body(store, pattern, scope, fixed);
+        let result = find_pattern_body(store, pattern, scope, fixed, context);
         let result = if result == NO_MATCHES {
             searched = true;
             String::new()
@@ -3654,10 +3876,13 @@ pub fn get_blast_radius(
     }
     // #617: append the Phase-B staleness note so a partial radius is not
     // trusted as the complete impact set.
-    with_phase_b_note(
-        store,
-        sanitize_for_mcp(&get_blast_radius_raw(store, file, mode, max_files)),
-    )
+    // #1053: get_blast_radius renders no `LIVE_MARKER`, so its per-answer live
+    // signal is "a real affected set was produced". `get_blast_radius_raw` returns
+    // an empty string only for a seed that was not found, which is exactly the
+    // not-found case the live note must stay off for.
+    let raw = get_blast_radius_raw(store, file, mode, max_files);
+    let has_live = !raw.is_empty();
+    with_phase_b_note(store, sanitize_for_mcp(&raw), has_live)
 }
 
 fn get_blast_radius_raw(
@@ -4090,11 +4315,9 @@ pub fn get_blast_radius_global(
         let head = repos
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
-        let result = append_read_notes(
-            store,
-            get_blast_radius_raw(store, file, mode, max_files),
-            head.as_deref(),
-        );
+        let raw = get_blast_radius_raw(store, file, mode, max_files);
+        let has_live = !raw.is_empty();
+        let result = append_read_notes(store, raw, head.as_deref(), has_live);
         if result.is_empty() || single {
             result
         } else {
@@ -4448,7 +4671,8 @@ pub fn get_architecture_brief(
         }
     }
 
-    // Component-to-component edges, weighted by distinct crossing file pairs.
+    // Component-to-component edges resolved from CODE, weighted by distinct
+    // crossing file pairs.
     let mut weight: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (src, dst) in &pairs {
         let a = subsystem_component_of(src);
@@ -4459,6 +4683,22 @@ pub fn get_architecture_brief(
         *weight.entry((a, b)).or_insert(0) += 1;
     }
 
+    // Dependencies DECLARED in a package manifest (Cargo.toml, ...). A crate used
+    // only through `use` imports, `pub use` re-exports or type-position mentions
+    // resolves no code edge, so travsr-error reported 3 dependents when its
+    // manifest consumers were 6 (#1047). These are a separate, deterministic edge
+    // kind: the brief shows the union of code and manifest edges, and marks where
+    // the two layers disagree.
+    let mut declared_edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for (src, dst) in store.declared_dep_pairs(provenance).unwrap_or_default() {
+        let a = subsystem_component_of(&src);
+        let b = subsystem_component_of(&dst);
+        if a == b || !files.contains_key(&a) || !files.contains_key(&b) {
+            continue;
+        }
+        declared_edges.insert((a, b));
+    }
+
     // Drop supporting directories, but only while that still leaves a graph. A
     // library's only internal consumers can BE its tests and examples, and an
     // empty diagram is worse than a noisy one.
@@ -4467,12 +4707,15 @@ pub fn get_architecture_brief(
         .filter(|c| !is_support_component(c))
         .cloned()
         .collect();
-    let product_edges = weight
-        .keys()
-        .filter(|(a, b)| !is_support_component(a) && !is_support_component(b))
-        .count();
+    let kept = |a: &str, b: &str| !is_support_component(a) && !is_support_component(b);
+    let product_edges = weight.keys().filter(|(a, b)| kept(a, b)).count()
+        + declared_edges
+            .iter()
+            .filter(|(a, b)| kept(a, b) && !weight.contains_key(&(a.clone(), b.clone())))
+            .count();
     let (names, view): (Vec<String>, &str) = if product.len() >= 2 && product_edges >= 1 {
-        weight.retain(|(a, b), _| !is_support_component(a) && !is_support_component(b));
+        weight.retain(|(a, b), _| kept(a, b));
+        declared_edges.retain(|(a, b)| kept(a, b));
         (product, "tests, benchmarks and docs excluded")
     } else {
         (
@@ -4484,9 +4727,16 @@ pub fn get_architecture_brief(
         return sanitize_for_mcp("no components: this index has no indexed source files.");
     }
 
+    // The dependency graph the brief reports is the UNION of resolved code edges
+    // and declared manifest edges, so a declared-only dependency is a first-class
+    // edge in the layering, cycle detection, dependent counts and "used by" lists
+    // rather than an invisible one.
+    let mut edge_set: BTreeSet<(String, String)> = weight.keys().cloned().collect();
+    edge_set.extend(declared_edges.iter().cloned());
+
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut in_deg: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (a, b) in weight.keys() {
+    for (a, b) in &edge_set {
         adj.entry(a.clone()).or_default().push(b.clone());
         in_deg.entry(b.clone()).or_default().insert(a.clone());
     }
@@ -4500,7 +4750,7 @@ pub fn get_architecture_brief(
         }
     }
     let mut cond: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); sccs.len()];
-    for (a, b) in weight.keys() {
+    for (a, b) in &edge_set {
         let (x, y) = (owner[a.as_str()], owner[b.as_str()]);
         if x != y {
             cond[x].insert(y);
@@ -4545,8 +4795,8 @@ pub fn get_architecture_brief(
         "## Shape\n- {} component{}, {} edge{}, {} layer{}\n- {}\n\n",
         names.len(),
         if names.len() == 1 { "" } else { "s" },
-        weight.len(),
-        if weight.len() == 1 { "" } else { "s" },
+        edge_set.len(),
+        if edge_set.len() == 1 { "" } else { "s" },
         max_layer + 1,
         if max_layer == 0 { "" } else { "s" },
         if cycles.is_empty() {
@@ -4560,7 +4810,7 @@ pub fn get_architecture_brief(
         }
     ));
 
-    if weight.is_empty() {
+    if edge_set.is_empty() {
         out.push_str(
             "## No dependencies resolved\nTravsr recorded no cross-component edges here. That \
              usually means full cross-file analysis has not run for this language, not that the \
@@ -4626,7 +4876,7 @@ pub fn get_architecture_brief(
         ranked.len()
     ));
     for c in ranked.iter().take(LIST_CAP) {
-        let deps = weight.keys().filter(|(a, _)| a == *c).count();
+        let deps = edge_set.iter().filter(|(a, _)| a == *c).count();
         out.push_str(&format!(
             "- {} | layer {} | {} dependent{} | depends on {} | {} files | {} symbols\n",
             c,
@@ -4641,17 +4891,33 @@ pub fn get_architecture_brief(
 
     out.push_str(&omitted(LIST_CAP, ranked.len(), "components"));
 
-    let mut ws: Vec<(&(String, String), &usize)> = weight.iter().collect();
-    ws.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    // Each edge is tagged with where it came from. A code edge keeps its
+    // file-pair weight; a manifest-only edge carries none (a declaration is a
+    // single fact, not a count of uses). Code edges sort first, heaviest first;
+    // manifest-only edges follow.
+    let mut es: Vec<(&String, &String, Option<usize>, bool)> = edge_set
+        .iter()
+        .map(|(a, b)| {
+            let w = weight.get(&(a.clone(), b.clone())).copied();
+            let decl = declared_edges.contains(&(a.clone(), b.clone()));
+            (a, b, w, decl)
+        })
+        .collect();
+    es.sort_by(|x, y| y.2.cmp(&x.2).then_with(|| (x.0, x.1).cmp(&(y.0, y.1))));
     out.push_str(&format!(
-        "\n## Dependency edges, heaviest first ({} of {}; weight = distinct file pairs crossing)\n",
-        ws.len().min(LIST_CAP),
-        ws.len()
+        "\n## Dependency edges, heaviest first ({} of {}; code weight = distinct file pairs \
+         crossing, manifest = declared in a package manifest)\n",
+        es.len().min(LIST_CAP),
+        es.len()
     ));
-    for ((a, b), w) in ws.iter().take(LIST_CAP) {
-        out.push_str(&format!("- {a} -> {b} ({w})\n"));
+    for (a, b, w, decl) in es.iter().take(LIST_CAP) {
+        match (w, decl) {
+            (Some(w), true) => out.push_str(&format!("- {a} -> {b} ({w}, code+manifest)\n")),
+            (Some(w), false) => out.push_str(&format!("- {a} -> {b} ({w}, code only)\n")),
+            (None, _) => out.push_str(&format!("- {a} -> {b} (manifest)\n")),
+        }
     }
-    out.push_str(&omitted(LIST_CAP, ws.len(), "edges"));
+    out.push_str(&omitted(LIST_CAP, es.len(), "edges"));
 
     out.push_str(&format!(
         "\n## What each component owns ({} of {})\n",
@@ -4702,7 +4968,11 @@ pub fn get_architecture_brief(
     }
     out.push_str(
         "\n## What this brief cannot tell you\n\
-         - a missing edge means the graph did not resolve it, not that it does not exist\n\
+         - edges are tagged by source: `code` is a resolved reference, `manifest` is a \
+           dependency declared in a package manifest but not seen resolved in code, \
+           `code+manifest` is both; a manifest edge includes dev- and build-dependencies\n\
+         - a missing edge means neither code nor a manifest resolved it, not that it does not \
+           exist\n\
          - type counts are references reaching a type or one of its members, so they rank by \
            use and undercount where analysis is incomplete\n\
          - nothing here states WHY a dependency exists\n",
@@ -5160,26 +5430,133 @@ pub fn get_subsystem_brief(
         return wrap_envelope(&render_brief(&out, brief_byte_limit(token_budget)));
     }
 
-    // Roots: a named symbol, or the component's most-called-into entry points.
+    // Roots: a named symbol, or the component's entry points. An entry point is a
+    // symbol reached from OUTSIDE the component, or a call-graph root inside it (no
+    // in-component caller) that still calls something, e.g. a `main` or a run loop.
+    // Ranking a root ahead of a merely popular helper is what surfaces `Daemon.run`
+    // over setup helpers, and letting a root stand in for an outside caller is what
+    // lets a binary crate like travsr-cli, which nothing calls into, be traced at
+    // all (#1046).
     let roots: Vec<travsr_core::NodeId> = if !component.is_empty() {
-        match external.get(component) {
-            Some(m) => ranked(m).into_iter().take(4).map(|(id, _)| id).collect(),
-            None => {
-                let known: Vec<&str> = external.keys().map(|s| s.as_str()).take(12).collect();
-                return sanitize_for_mcp(&format!(
-                    "no component '{component}' is called from outside. Components with entry \
-                     points: {}",
-                    known.join(", ")
-                ));
-            }
-        }
-    } else {
-        let want = simple_symbol(entry);
-        let mut hit: Vec<travsr_core::NodeId> = by_id
+        let members: Vec<travsr_core::NodeId> = by_id
             .values()
-            .filter(|n| n.vname.signature == entry)
+            .filter(|n| subsystem_component_of(&n.vname.path) == *component)
             .map(|n| n.id)
             .collect();
+        if members.is_empty() {
+            let mut known: Vec<String> = by_id
+                .values()
+                .map(|n| subsystem_component_of(&n.vname.path))
+                .collect();
+            known.sort();
+            known.dedup();
+            known.truncate(12);
+            return sanitize_for_mcp(&format!(
+                "no component '{component}' in the graph. Components: {}",
+                known.join(", ")
+            ));
+        }
+        // A member called by another member of the SAME component is not a root.
+        let mut called_within: HashSet<travsr_core::NodeId> = HashSet::new();
+        for (src, dsts) in &calls {
+            if subsystem_component_of(&by_id[src].vname.path) != *component {
+                continue;
+            }
+            for dst in dsts {
+                if subsystem_component_of(&by_id[dst].vname.path) == *component {
+                    called_within.insert(*dst);
+                }
+            }
+        }
+        let ext = external.get(component);
+        let ext_count =
+            |id: &travsr_core::NodeId| ext.and_then(|m| m.get(id)).copied().unwrap_or(0);
+        let is_root = |id: &travsr_core::NodeId| !called_within.contains(id);
+        // A Cargo build script and an examples/ binary are call-graph roots that
+        // call things, so the root arm below would headline their `main` as a
+        // component entry (build.rs even outranking the real src/main.rs). They
+        // are build-time and demo code, not a subsystem entry point, and nothing
+        // in the graph calls them, so they only ever qualify via the root arm.
+        // Exclude them there; an entry with a genuine outside caller still stands.
+        let is_build_or_example = |id: &travsr_core::NodeId| {
+            let p = &by_id[id].vname.path;
+            p == "build.rs"
+                || p.ends_with("/build.rs")
+                || p.starts_with("examples/")
+                || p.contains("/examples/")
+        };
+        // Candidate entries: reached from outside, or an in-component root that
+        // itself calls out. Pure data nodes and leaves that are never called and
+        // call nothing are neither, and drop out.
+        let mut cand: Vec<travsr_core::NodeId> = members
+            .iter()
+            .copied()
+            .filter(|id| {
+                ext_count(id) > 0
+                    || (is_root(id) && calls.contains_key(id) && !is_build_or_example(id))
+            })
+            .collect();
+        if cand.is_empty() {
+            // Fully cyclic with no external entry: fall back to the old proxy so
+            // the brief still has somewhere to start.
+            match ext {
+                Some(m) => cand = ranked(m).into_iter().map(|(id, _)| id).collect(),
+                None => {
+                    return sanitize_for_mcp(&format!(
+                        "component '{component}' has no traceable entry point: no symbol in it \
+                         is called from outside or is a call-graph root."
+                    ));
+                }
+            }
+        }
+        // How many members this symbol calls: a proxy for how much of the
+        // component it drives. The run loop drives a daemon; a `main` barely calls
+        // anything itself. Ranking a root by external-caller count alone buried
+        // `Daemon.run` (called once) under popular API like `LogTail` (#1046).
+        let out_degree = |id: &travsr_core::NodeId| calls.get(id).map(|v| v.len()).unwrap_or(0);
+        // Roots first; then a named entry (`main`) so a binary crate headlines
+        // its real main over build.rs's; then the biggest driver, so a daemon
+        // headlines its run loop; then outside demand, reach, and finally path
+        // then signature. Path alone is not unique (two symbols share a file) and
+        // signature alone is not either (two `main`s), so both are needed to keep
+        // the order deterministic across the arbitrary member iteration order.
+        cand.sort_by(|a, b| {
+            is_root(b)
+                .cmp(&is_root(a))
+                .then_with(|| {
+                    is_entry_point_signature(&by_id[b].vname.signature)
+                        .cmp(&is_entry_point_signature(&by_id[a].vname.signature))
+                })
+                .then_with(|| out_degree(b).cmp(&out_degree(a)))
+                .then_with(|| ext_count(b).cmp(&ext_count(a)))
+                .then_with(|| reach.get(b).unwrap_or(&0).cmp(reach.get(a).unwrap_or(&0)))
+                .then_with(|| by_id[a].vname.path.cmp(&by_id[b].vname.path))
+                .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+        });
+        cand.truncate(4);
+        cand
+    } else {
+        let want = simple_symbol(entry);
+        // A path-qualified id, exactly as get_graph_json emits it
+        // ("crates/foo/src/main.rs:fn:main"), picks one definition out of the many
+        // that share a bare name like `main` (#1046). Only tried when the entry
+        // looks like a path, so a bare signature never pays for the formatting.
+        let mut hit: Vec<travsr_core::NodeId> = if entry.contains('/') {
+            by_id
+                .values()
+                .filter(|n| format!("{}:{}", n.vname.path, n.vname.signature) == entry)
+                .map(|n| n.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if hit.is_empty() {
+            hit = by_id
+                .values()
+                .filter(|n| n.vname.signature == entry)
+                .map(|n| n.id)
+                .collect();
+        }
         if hit.is_empty() {
             hit = by_id
                 .values()
@@ -5239,7 +5616,19 @@ pub fn get_subsystem_brief(
                 });
             };
             by_reach(&mut crosses);
-            by_reach(&mut internal);
+            // Same-component callees were ranked by global reach, which promotes
+            // ubiquitous leaf helpers (validate_mcp_arg, reach 29) over the actual
+            // stages of the flow (build_seed_set, reach 4) and cut the stages at the
+            // width limit (#1046). A stage fans out; a leaf helper does not. Rank by
+            // out-degree so the width budget is spent on the pipeline, not on shared
+            // utilities. Cross-component calls are never cut, so they keep reach order.
+            let out_degree = |id: &travsr_core::NodeId| calls.get(id).map(|v| v.len()).unwrap_or(0);
+            internal.sort_by(|a, b| {
+                out_degree(b)
+                    .cmp(&out_degree(a))
+                    .then_with(|| reach.get(b).unwrap_or(&0).cmp(reach.get(a).unwrap_or(&0)))
+                    .then_with(|| by_id[a].vname.signature.cmp(&by_id[b].vname.signature))
+            });
             internal.truncate(width);
             // `seen` is global to the walk, so gating the record on it dropped a
             // second call into an already-visited symbol. The spine is a tree and
@@ -5737,7 +6126,7 @@ fn search_symbol_raw(
     // Language tokens like "c", "go", "dart" are short and common identifiers;
     // stripping them from the query then filtering by language produces false
     // "no matches" for queries like "C parser" or "go routine".
-    let nodes = if nodes.is_empty() && lang_filter.is_some() {
+    let mut nodes = if nodes.is_empty() && lang_filter.is_some() {
         match store.search_nodes_fuzzy_filtered(name, None, exact) {
             Ok(n) => n,
             Err(_) => nodes,
@@ -5746,9 +6135,18 @@ fn search_symbol_raw(
         nodes
     };
 
-    let lines: Vec<String> = nodes
+    // #1048: list committed code before untracked, non-ignored scratch files
+    // (`bench/`, `DOC/`) that init and the watcher index while they are edited,
+    // so a real definition is never buried under spike-script copies.
+    let tracked = tracked_rel_paths(store);
+    prefer_tracked_nodes(&mut nodes, &tracked);
+
+    let shown = &nodes[..nodes.len().min(MAX_SEARCH_RESULTS)];
+    let shown_untracked = tracked
+        .as_ref()
+        .is_some_and(|t| shown.iter().any(|n| is_untracked_scratch(&n.vname.path, t)));
+    let lines: Vec<String> = shown
         .iter()
-        .take(MAX_SEARCH_RESULTS)
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
             format!(
@@ -5759,7 +6157,14 @@ fn search_symbol_raw(
             )
         })
         .collect();
-    (nodes.len(), lines.join("\n"))
+    let mut body = lines.join("\n");
+    if shown_untracked {
+        body.push_str(
+            "\n[note: some results are in untracked (not-yet-committed) files, \
+             listed after tracked ones; they leave the graph at the next commit.]",
+        );
+    }
+    (nodes.len(), body)
 }
 
 /// Global variant of `search_symbol`.
@@ -6604,10 +7009,15 @@ fn get_execution_path_with_filter(
     }
     // #617: append the Phase-B staleness note so "no path" is never trusted
     // while the call-edge set is known-incomplete.
-    with_phase_b_note(
-        store,
-        sanitize_for_mcp(&get_execution_path_body(store, source, sink, filter, true)),
-    )
+    // #1053: get_execution_path renders no `LIVE_MARKER`. A real path body begins
+    // with the render header "path (" (see `get_execution_path_body`), while every
+    // not-found / no-path / ambiguous outcome does not. That prefix is the
+    // per-answer live signal, read from the raw body before `sanitize_for_mcp`
+    // wraps it in the `<travsr-data>` envelope. It keeps the overlay note off the
+    // diagnostic answers it would otherwise contradict.
+    let raw = get_execution_path_body(store, source, sink, filter, true);
+    let has_live = raw.starts_with("path (");
+    with_phase_b_note(store, sanitize_for_mcp(&raw), has_live)
 }
 
 /// How one `get_execution_path` endpoint name resolved, after access filtering.
@@ -6968,11 +7378,9 @@ pub fn get_execution_path_global(
         let head = repos
             .get(repo_name)
             .and_then(|db| repo_head_from_registry_path(db));
-        let result = append_read_notes(
-            store,
-            get_execution_path_body(store, source, sink, filter, single),
-            head.as_deref(),
-        );
+        let body = get_execution_path_body(store, source, sink, filter, single);
+        let has_live = body.starts_with("path (");
+        let result = append_read_notes(store, body, head.as_deref(), has_live);
         if result.is_empty() || single {
             result
         } else {
@@ -9449,7 +9857,7 @@ pub fn get_graph_json(store: &SqliteStore, params: &GraphJsonParams<'_>) -> Stri
                 return "{}".to_string();
             }
         }
-        return overview_graph(store, path_prefix, provenance);
+        return overview_graph(store, path_prefix, provenance, *token_budget);
     }
     // Only "" (all kinds) and "file" are valid kind_filter values.
     if !matches!(*kind_filter, "" | "file") {
@@ -9507,8 +9915,70 @@ fn file_label(path: &str) -> &str {
     path.rfind('/').map_or(path, |i| &path[i + 1..])
 }
 
+/// Trim `(nodes, edges)` to the longest emission-order prefix whose JSON fits
+/// `token_budget` tokens (`* TOKEN_CHARS_PER_TOKEN` bytes), always keeping the
+/// first node, dropping any edge whose later endpoint was cut, and reserving
+/// `header_bytes` for the envelope fields serialized alongside. Returns whether
+/// it truncated. `token_budget == 0` means unbounded and leaves the vectors
+/// untouched. This is the single budget pass shared by the symbol-mode graph in
+/// `get_graph_json_raw` and the overview/drill graphs; nodes must therefore be
+/// in a deterministic order so truncation is stable.
+fn apply_overview_budget(
+    nodes_out: &mut Vec<serde_json::Value>,
+    edges_out: &mut Vec<serde_json::Value>,
+    token_budget: usize,
+    header_bytes: usize,
+) -> bool {
+    use std::collections::HashMap;
+    if token_budget == 0 || nodes_out.is_empty() {
+        return false;
+    }
+    let index: HashMap<&str, usize> = nodes_out
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
+        .collect();
+    let at = |e: &serde_json::Value, end: &str| {
+        index
+            .get(e[end].as_str().unwrap_or(""))
+            .copied()
+            .unwrap_or(0)
+    };
+    // Each node is charged its own JSON plus every edge whose later endpoint it
+    // is — an edge survives a prefix cut exactly when that endpoint does. The
+    // `+ 1` on every element covers the comma that `serde_json` writes between
+    // array elements, so the summed cost does not undercount the serialized
+    // length (the fixed `{"nodes":[...],"edges":[...]}` scaffolding is absorbed
+    // by `header_bytes`).
+    let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len() + 1).collect();
+    for e in edges_out.iter() {
+        cost[at(e, "source").max(at(e, "target"))] += e.to_string().len() + 1;
+    }
+    let budget_bytes = token_budget
+        .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
+        .saturating_sub(header_bytes);
+    let mut used = cost[0];
+    let mut keep = 1;
+    while keep < cost.len() && used + cost[keep] <= budget_bytes {
+        used += cost[keep];
+        keep += 1;
+    }
+    if keep < nodes_out.len() {
+        edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
+        nodes_out.truncate(keep);
+        true
+    } else {
+        false
+    }
+}
+
 /// Entry point for `mode="overview"`. Routes by whether path_prefix is set.
-fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> String {
+fn overview_graph(
+    store: &SqliteStore,
+    path_prefix: &str,
+    provenance: &str,
+    token_budget: usize,
+) -> String {
     let file_nodes = match store.nodes_by_kind("file") {
         Ok(n) => n,
         Err(e) => {
@@ -9516,21 +9986,31 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> S
             return r#"{"nodes":[],"edges":[]}"#.to_string();
         }
     };
-    // Resolved cross-file dependency pairs (ref/call + resolves-to) — the same
-    // language-agnostic primitive the repo map uses. Replaces the old
-    // depends+resolves-to-only `file_import_pairs`, which produced ~0 edges here
-    // because top-level-dir buckets collapsed every intra-monorepo edge.
-    let pairs = match store.resolved_dep_pairs(provenance) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
-            vec![]
-        }
-    };
     if path_prefix.is_empty() {
-        repo_overview_graph(&file_nodes, &pairs)
+        // Resolved cross-file dependency pairs (ref/call + resolves-to) — the same
+        // language-agnostic primitive the repo map uses. The region-tile view is an
+        // architecture overview, so call edges belong here as well as imports.
+        let pairs = match store.resolved_dep_pairs(provenance) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("overview_graph: resolved_dep_pairs error: {e}");
+                vec![]
+            }
+        };
+        repo_overview_graph(&file_nodes, &pairs, token_budget)
     } else {
-        package_drill_graph(&file_nodes, &pairs, path_prefix)
+        // #1054: the package drill labels every edge "imports", so it must be fed
+        // import-resolution pairs only. `resolved_dep_pairs` also folds in `ref/call`
+        // edges, and a Phase A bare-name call collision (e.g. `settle()` resolving to
+        // `bench/*.mjs:settle`) then surfaced as a ghost "imports" edge to pkg:bench.
+        let pairs = match store.file_import_pairs(provenance) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("overview_graph: file_import_pairs error: {e}");
+                vec![]
+            }
+        };
+        package_drill_graph(&file_nodes, &pairs, path_prefix, token_budget)
     }
 }
 
@@ -9540,7 +10020,11 @@ fn overview_graph(store: &SqliteStore, path_prefix: &str, provenance: &str) -> S
 /// (crates/mcp -> crates/core) actually appears instead of collapsing into one
 /// `crates` self-edge. Nodes carry `dependents` so renderers can rank by it.
 // O(F + P) where F = file nodes, P = resolved pairs
-fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, String)]) -> String {
+fn repo_overview_graph(
+    file_nodes: &[travsr_core::Node],
+    pairs: &[(String, String)],
+    token_budget: usize,
+) -> String {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     let mut file_paths: HashSet<String> = HashSet::new();
@@ -9582,7 +10066,7 @@ fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, Strin
     let dep_edges: HashSet<(String, String)> = cross.keys().cloned().collect();
     let dependents = repo_region_dependents(&known, &dep_edges);
 
-    let nodes_out: Vec<serde_json::Value> = region_files
+    let mut nodes_out: Vec<serde_json::Value> = region_files
         .iter()
         .map(|(region, file_count)| {
             serde_json::json!({
@@ -9596,7 +10080,7 @@ fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, Strin
         })
         .collect();
 
-    let edges_out: Vec<serde_json::Value> = cross
+    let mut edges_out: Vec<serde_json::Value> = cross
         .iter()
         .map(|((src, dst), count)| {
             serde_json::json!({
@@ -9608,11 +10092,30 @@ fn repo_overview_graph(file_nodes: &[travsr_core::Node], pairs: &[(String, Strin
         })
         .collect();
 
-    match serde_json::to_string(&serde_json::json!({
+    // #1054: honour token_budget. Order nodes by `dependents` descending (tie
+    // broken by id for a stable cut) so a budget prefix keeps the most
+    // depended-on regions rather than the alphabetically-first ones. Reserve
+    // ~48 bytes for the trailing envelope fields (mode + token_budget +
+    // truncated_by_budget).
+    nodes_out.sort_by(|a, b| {
+        b["dependents"]
+            .as_u64()
+            .cmp(&a["dependents"].as_u64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    let truncated_by_budget =
+        apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, 48);
+
+    let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
         "mode":  "overview",
-    })) {
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("repo_overview_graph serialization error: {e}");
@@ -9628,6 +10131,7 @@ fn package_drill_graph(
     file_nodes: &[travsr_core::Node],
     pairs: &[(String, String)],
     path_prefix: &str,
+    token_budget: usize,
 ) -> String {
     use std::collections::{HashMap, HashSet};
 
@@ -9641,13 +10145,16 @@ fn package_drill_graph(
         return r#"{"nodes":[],"edges":[],"mode":"prefix"}"#.to_string();
     }
 
-    let mut nodes_out: Vec<serde_json::Value> = Vec::new();
-    let mut node_ids_out: HashSet<String> = HashSet::new();
+    let mut file_nodes_out: Vec<serde_json::Value> = Vec::new();
 
-    for path in &prefix_paths {
+    // Emit file nodes in a deterministic order: `prefix_paths` is a HashSet, and
+    // once token_budget truncation (below) keeps only a prefix, *which* files
+    // survive must not depend on hash iteration order (#1054).
+    let mut sorted_prefix: Vec<&str> = prefix_paths.iter().copied().collect();
+    sorted_prefix.sort_unstable();
+    for path in &sorted_prefix {
         let json_id = format!("file:{path}");
-        node_ids_out.insert(json_id.clone());
-        nodes_out.push(serde_json::json!({
+        file_nodes_out.push(serde_json::json!({
             "id":    json_id,
             "label": file_label(path),
             "kind":  "file",
@@ -9656,6 +10163,7 @@ fn package_drill_graph(
         }));
     }
 
+    let mut ghost_nodes_out: Vec<serde_json::Value> = Vec::new();
     let mut ghost_pkg_counts: HashMap<String, u32> = HashMap::new();
     let mut edges_out: Vec<serde_json::Value> = Vec::new();
     let mut edge_seen: HashSet<(String, String)> = HashSet::new();
@@ -9696,8 +10204,7 @@ fn package_drill_graph(
             let count = ghost_pkg_counts.entry(ghost_pkg.clone()).or_insert(0);
             *count += 1;
             if *count == 1 {
-                node_ids_out.insert(ghost_id.clone());
-                nodes_out.push(serde_json::json!({
+                ghost_nodes_out.push(serde_json::json!({
                     "id":    ghost_id.clone(),
                     "label": ghost_pkg,
                     "kind":  "ghost",
@@ -9716,12 +10223,36 @@ fn package_drill_graph(
         }
     }
 
-    match serde_json::to_string(&serde_json::json!({
+    // Emit ghost package nodes BEFORE file nodes so a token_budget prefix cut
+    // keeps the cross-boundary dependency targets (and the edges into them)
+    // rather than dropping them with the tail of the file list (#1054). Ghost
+    // nodes are bounded by the distinct external packages imported, so this
+    // still leaves room for files under any sane budget. Sort them by id so the
+    // cut among ghosts is stable regardless of pair iteration order.
+    ghost_nodes_out.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let mut nodes_out = ghost_nodes_out;
+    nodes_out.extend(file_nodes_out);
+
+    // #1054: honour token_budget. Reserve ~48 bytes plus the echoed path_prefix
+    // for the trailing envelope fields (mode + path_prefix + budget fields).
+    let truncated_by_budget = apply_overview_budget(
+        &mut nodes_out,
+        &mut edges_out,
+        token_budget,
+        48 + path_prefix.len(),
+    );
+
+    let mut out = serde_json::json!({
         "nodes":       nodes_out,
         "edges":       edges_out,
         "mode":        "prefix",
         "path_prefix": path_prefix,
-    })) {
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("package_drill_graph serialization error: {e}");
@@ -10226,45 +10757,17 @@ fn get_graph_json_raw(
         };
 
     // #1013: the BFS charges `token_cost`, a fraction of a node's JSON, and
-    // nothing for edges, which are most of the bytes. Charge what is returned:
-    // each node's JSON plus every edge whose later endpoint it is (an edge
-    // survives a prefix cut exactly when that endpoint does), then keep the
-    // longest BFS prefix that fits. The seed always survives.
-    if token_budget > 0 && !nodes_out.is_empty() {
-        let index: HashMap<&str, usize> = nodes_out
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n["id"].as_str().unwrap_or(""), i))
-            .collect();
-        let at = |e: &serde_json::Value, end: &str| {
-            index
-                .get(e[end].as_str().unwrap_or(""))
-                .copied()
-                .unwrap_or(0)
-        };
-        let mut cost: Vec<usize> = nodes_out.iter().map(|n| n.to_string().len()).collect();
-        for e in &edges_out {
-            cost[at(e, "source").max(at(e, "target"))] += e.to_string().len();
-        }
-        // The header returned with the graph comes out of the same budget.
-        let header = coverage.to_string().len()
-            + serde_json::to_string(&ambiguous_candidates).map_or(0, |s| s.len());
-        let budget_bytes = token_budget
-            .saturating_mul(travsr_retrieval::TOKEN_CHARS_PER_TOKEN)
-            .saturating_sub(header);
-        let mut used = cost[0];
-        let mut keep = 1;
-        while keep < cost.len() && used + cost[keep] <= budget_bytes {
-            used += cost[keep];
-            keep += 1;
-        }
-        if keep < nodes_out.len() {
-            truncated_by_budget = true;
-            // The budget, not the node cap, is what bounds this answer.
-            truncated = false;
-            edges_out.retain(|e| at(e, "source").max(at(e, "target")) < keep);
-            nodes_out.truncate(keep);
-        }
+    // nothing for edges, which are most of the bytes. Charge what is returned
+    // (each node's JSON plus every edge whose later endpoint it is) and keep the
+    // longest BFS prefix that fits — the shared overview-budget pass. The seed is
+    // node 0, so it always survives. The header returned with the graph comes out
+    // of the same budget.
+    let header = coverage.to_string().len()
+        + serde_json::to_string(&ambiguous_candidates).map_or(0, |s| s.len());
+    if apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, header) {
+        truncated_by_budget = true;
+        // The budget, not the node cap, is what bounds this answer.
+        truncated = false;
     }
 
     // Additive envelope fields (#318 O5/O6) — first-party consumers read only
@@ -10292,7 +10795,15 @@ fn get_graph_json_raw(
     // incomplete (#617) and index/HEAD drift (#645) are independent and may both
     // apply. Carried as JSON `signals` array items (never appended as prose) so
     // the JSON body still parses; the global aggregator already merges `signals`.
-    let signals = read_note_signals(store, head, &out["nodes"].to_string());
+    // #1053: the live half of the overlay note may speak only when this subgraph
+    // actually carries an un-ratified edge. The JSON body has no `LIVE_MARKER`
+    // (that is a prose-row flag), so the per-answer signal here is an emitted edge
+    // whose `provenance` is `live`, read back from the edges that survived into
+    // the answer.
+    let has_live_edge = out["edges"]
+        .as_array()
+        .is_some_and(|edges| edges.iter().any(|e| e["provenance"] == "live"));
+    let signals = read_note_signals(store, head, &out["nodes"].to_string(), has_live_edge);
     if !signals.is_empty() {
         out["signals"] = serde_json::Value::Array(signals);
     }
@@ -10316,7 +10827,7 @@ pub fn get_graph_json_global(
         direction,
         depth,
         kind_filter,
-        token_budget: _,
+        token_budget,
         mode,
         path_prefix,
         provenance,
@@ -10329,7 +10840,7 @@ pub fn get_graph_json_global(
             }
         }
         // Overview mode: run per-repo and merge package tiles
-        return get_graph_json_global_overview(repos, repo, path_prefix, provenance);
+        return get_graph_json_global_overview(repos, repo, path_prefix, provenance, *token_budget);
     }
     if !(query.is_empty() && *kind_filter == "file") {
         if let Err(reason) = validate_mcp_arg(query) {
@@ -10435,6 +10946,7 @@ fn get_graph_json_global_overview(
     repo: Option<&str>,
     path_prefix: &str,
     provenance: &str,
+    token_budget: usize,
 ) -> String {
     use std::collections::HashMap as HMap;
 
@@ -10458,7 +10970,10 @@ fn get_graph_json_global_overview(
         }
         match SqliteStore::open_read_only(db_path) {
             Ok(store) => {
-                let raw = overview_graph(&store, path_prefix, provenance);
+                // Request each repo's subgraph unbounded; the budget is applied
+                // once to the merged graph below (matches the symbol path above,
+                // which passes 0 for the per-repo budget).
+                let raw = overview_graph(&store, path_prefix, provenance, 0);
                 let parsed: serde_json::Value = match serde_json::from_str(&raw) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -10478,8 +10993,17 @@ fn get_graph_json_global_overview(
         }
     }
 
-    let nodes_out: Vec<&serde_json::Value> = merged_nodes.values().collect();
-    let edges_out: Vec<serde_json::Value> = merged_edges
+    // Order nodes by `dependents` descending (tie broken by id for a stable cut)
+    // so the trim below keeps the most depended-on tiles. Ghost/file nodes from a
+    // drill carry no `dependents`, so they fall back to the deterministic id sort.
+    let mut nodes_out: Vec<serde_json::Value> = merged_nodes.into_values().collect();
+    nodes_out.sort_by(|a, b| {
+        b["dependents"]
+            .as_u64()
+            .cmp(&a["dependents"].as_u64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
+    let mut edges_out: Vec<serde_json::Value> = merged_edges
         .iter()
         .map(|((src, tgt), count)| {
             serde_json::json!({
@@ -10491,11 +11015,22 @@ fn get_graph_json_global_overview(
         })
         .collect();
 
-    match serde_json::to_string(&serde_json::json!({
+    // #1054: honour token_budget on the merged graph. The per-repo subgraphs are
+    // requested unbounded (0 above) and trimmed once here, after the merge, so the
+    // budget bounds the combined result rather than each repo independently.
+    let truncated_by_budget =
+        apply_overview_budget(&mut nodes_out, &mut edges_out, token_budget, 48);
+
+    let mut out = serde_json::json!({
         "nodes": nodes_out,
         "edges": edges_out,
         "mode":  "overview",
-    })) {
+    });
+    if token_budget > 0 {
+        out["token_budget"] = serde_json::json!(token_budget);
+        out["truncated_by_budget"] = serde_json::json!(truncated_by_budget);
+    }
+    match serde_json::to_string(&out) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("get_graph_json_global_overview serialization error: {e}");
@@ -13789,6 +14324,206 @@ mod tests {
         );
     }
 
+    // #1054 P1: the package drill labels every edge "imports", so a Phase A
+    // `ref/call` name-collision edge crossing the prefix boundary (e.g. a bare
+    // `settle()` resolving to `bench/run.mjs:settle`) must NOT surface as a ghost
+    // "imports" edge. Only depends->resolves-to import pairs may produce edges.
+    #[test]
+    fn package_drill_graph_excludes_refcall_ghost_edges() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+
+        // Inside the prefix: a file and a function defined in it.
+        let fmod = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "pkg/a/mod.ts"),
+            "file",
+        );
+        let caller = Node::new(
+            VName::new("", "", "pkg/a/mod.ts", "typescript", "fn:gatherHealth"),
+            "function",
+        );
+        // A genuine cross-boundary import target (a file in another package).
+        let flib = Node::new(
+            VName::new("", "", "lib/x/lib.ts", "typescript", "lib/x/lib.ts"),
+            "file",
+        );
+        let imp = Node::new(
+            VName::new("", "", "lib/x/lib.ts", "typescript", "import:x"),
+            "import",
+        );
+        // A spurious cross-boundary CALL target (a function in bench/).
+        let settle = Node::new(
+            VName::new("", "", "bench/run.mjs", "javascript", "fn:settle"),
+            "function",
+        );
+        for n in [&fmod, &caller, &flib, &imp, &settle] {
+            store.put_node(n).unwrap();
+        }
+        // Real import: pkg/a/mod.ts --depends--> import --resolves-to--> lib/x/lib.ts
+        store
+            .put_edge(&Edge::new(fmod.id, imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(imp.id, flib.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        // Spurious call: fn:gatherHealth (pkg/a/mod.ts) --ref/call--> fn:settle (bench/run.mjs)
+        store
+            .put_edge(&Edge::new(caller.id, settle.id, EdgeKind::RefCall))
+            .unwrap();
+
+        let raw = get_graph_json(
+            &store,
+            &GraphJsonParams {
+                query: "",
+                direction: "both",
+                depth: 2,
+                kind_filter: "",
+                provenance: "",
+                token_budget: 0,
+                mode: "overview",
+                path_prefix: "pkg/a/",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mode"], "prefix");
+        let ids: Vec<&str> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        // The real import's ghost port is present.
+        assert!(
+            ids.contains(&"pkg:lib"),
+            "real import ghost pkg:lib must be present: {ids:?}"
+        );
+        // The ref/call target must NOT become a ghost import node.
+        assert!(
+            !ids.contains(&"pkg:bench"),
+            "ref/call edge must not surface as a ghost import to pkg:bench: {ids:?}"
+        );
+        let edges = v["edges"].as_array().unwrap();
+        assert!(
+            !edges.iter().any(|e| e["target"] == "pkg:bench"),
+            "no edge may target the ref/call ghost pkg:bench: {edges:?}"
+        );
+    }
+
+    // #1054 P2: overview/prefix mode must honour token_budget and emit the
+    // truncated_by_budget signal, like symbol and file mode already do.
+    #[test]
+    fn package_drill_graph_honours_token_budget() {
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        for i in 0..40 {
+            let n = Node::new(
+                VName::new(
+                    "",
+                    "",
+                    format!("pkg/a/file{i:02}.ts"),
+                    "typescript",
+                    format!("pkg/a/file{i:02}.ts"),
+                ),
+                "file",
+            );
+            store.put_node(&n).unwrap();
+        }
+
+        let call = |budget: usize| {
+            get_graph_json(
+                &store,
+                &GraphJsonParams {
+                    query: "",
+                    direction: "both",
+                    depth: 2,
+                    kind_filter: "",
+                    provenance: "",
+                    token_budget: budget,
+                    mode: "overview",
+                    path_prefix: "pkg/a/",
+                },
+            )
+        };
+
+        // Unbounded: all 40 files, no budget fields.
+        let unbounded: serde_json::Value = serde_json::from_str(&call(0)).unwrap();
+        assert_eq!(unbounded["nodes"].as_array().unwrap().len(), 40);
+        assert!(unbounded.get("truncated_by_budget").is_none());
+
+        // Bounded: must truncate, flag it, echo the budget, and stay within a
+        // small factor of budget * TOKEN_CHARS_PER_TOKEN bytes.
+        let budget = 50usize;
+        let raw = call(budget);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["truncated_by_budget"], true, "must flag truncation");
+        assert_eq!(v["token_budget"], budget as u64, "must echo the budget");
+        let n = v["nodes"].as_array().unwrap().len();
+        assert!((1..40).contains(&n), "must keep a non-empty prefix: {n}");
+        assert!(
+            raw.len() <= budget * travsr_retrieval::TOKEN_CHARS_PER_TOKEN + 256,
+            "output {} bytes exceeds budget {} tokens by more than slack",
+            raw.len(),
+            budget
+        );
+    }
+
+    #[test]
+    fn global_overview_honours_token_budget_after_merge() {
+        use travsr_core::{Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            // 40 crate-level components -> 40 pkg tiles once merged.
+            for i in 0..40 {
+                let path = format!("crates/c{i:02}/src/file.rs");
+                let n = Node::new(VName::new("", "", path.clone(), "rust", path), "file");
+                store.put_node(&n).unwrap();
+            }
+        }
+        let key = dir.path().to_string_lossy().to_string();
+        let repos: HashMap<String, PathBuf> = HashMap::from([(key, db)]);
+
+        let call = |budget: usize| {
+            get_graph_json_global(
+                &repos,
+                None,
+                &GraphJsonParams {
+                    query: "",
+                    direction: "both",
+                    depth: 2,
+                    kind_filter: "",
+                    provenance: "",
+                    token_budget: budget,
+                    mode: "overview",
+                    path_prefix: "",
+                },
+            )
+        };
+
+        // Unbounded: all 40 tiles, no budget fields.
+        let unbounded: serde_json::Value = serde_json::from_str(&call(0)).unwrap();
+        assert_eq!(unbounded["nodes"].as_array().unwrap().len(), 40);
+        assert!(unbounded.get("truncated_by_budget").is_none());
+
+        // Bounded: the budget is applied to the MERGED graph, so the SSE/global
+        // path must trim, flag it, echo the budget, and stay within a small factor
+        // of budget * TOKEN_CHARS_PER_TOKEN bytes (#1054).
+        let budget = 50usize;
+        let raw = call(budget);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["truncated_by_budget"], true, "must flag truncation");
+        assert_eq!(v["token_budget"], budget as u64, "must echo the budget");
+        let n = v["nodes"].as_array().unwrap().len();
+        assert!((1..40).contains(&n), "must keep a non-empty prefix: {n}");
+        assert!(
+            raw.len() <= budget * travsr_retrieval::TOKEN_CHARS_PER_TOKEN + 256,
+            "output {} bytes exceeds budget {} tokens by more than slack",
+            raw.len(),
+            budget
+        );
+    }
+
     #[test]
     fn overview_graph_rejects_unknown_mode() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
@@ -14149,6 +14884,102 @@ mod tests {
         );
     }
 
+    /// A synthetic workspace where `alpha`'s Cargo.toml declares `beta` but no
+    /// code edge resolves between them. `beta` must still be a dependency of
+    /// `alpha`, tagged as a manifest edge. #1047: travsr-error showed 3 dependents
+    /// because imports and `pub use` re-exports of it resolved no code edge, even
+    /// though three more crates declared it in Cargo.toml.
+    #[test]
+    fn architecture_brief_counts_a_manifest_declared_dependency() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        // alpha/Cargo.toml --external-dependency--> pkg:beta <--resolves-to--
+        // beta/Cargo.toml(crate:beta). No code edge alpha -> beta.
+        let a_manifest = make_node("crates/alpha/Cargo.toml", "crate:alpha");
+        let b_manifest = make_node("crates/beta/Cargo.toml", "crate:beta");
+        let pkg_beta = make_node("", "pkg:beta@*");
+        let store = make_store(
+            &[
+                a.clone(),
+                b.clone(),
+                a_manifest.clone(),
+                b_manifest.clone(),
+                pkg_beta.clone(),
+            ],
+            &[
+                (a_manifest.id, pkg_beta.id, EdgeKind::ExternalDependency),
+                (b_manifest.id, pkg_beta.id, EdgeKind::ResolvesTo),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("crates/alpha -&gt; crates/beta (manifest)"),
+            "a declared-only dependency must appear tagged `manifest`:\n{out}"
+        );
+        assert!(
+            out.contains("crates/beta | layer 0 | 1 dependent"),
+            "beta must count alpha as a dependent through the manifest edge:\n{out}"
+        );
+        assert!(
+            out.contains("used by: crates/alpha"),
+            "beta's `used by` must list alpha:\n{out}"
+        );
+    }
+
+    /// When a dependency is both declared in the manifest and resolved in code,
+    /// the edge is tagged `code+manifest` and keeps its file-pair weight.
+    #[test]
+    fn architecture_brief_marks_an_edge_seen_in_code_and_manifest() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let a_manifest = make_node("crates/alpha/Cargo.toml", "crate:alpha");
+        let b_manifest = make_node("crates/beta/Cargo.toml", "crate:beta");
+        let pkg_beta = make_node("", "pkg:beta@*");
+        let store = make_store(
+            &[
+                a.clone(),
+                b.clone(),
+                a_manifest.clone(),
+                b_manifest.clone(),
+                pkg_beta.clone(),
+            ],
+            &[
+                // Resolved in code AND declared in the manifest.
+                (a.id, b.id, EdgeKind::RefCall),
+                (a_manifest.id, pkg_beta.id, EdgeKind::ExternalDependency),
+                (b_manifest.id, pkg_beta.id, EdgeKind::ResolvesTo),
+            ],
+        );
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("crates/alpha -&gt; crates/beta (1, code+manifest)"),
+            "an edge seen both ways must be tagged `code+manifest`:\n{out}"
+        );
+        // The union must not double-count: one edge, not two.
+        assert!(
+            out.contains("1 edge,"),
+            "code and manifest for the same pair are one edge:\n{out}"
+        );
+    }
+
+    /// A reference resolved in code but NOT declared in any manifest (for example
+    /// a dev-dependency used only from a test, or an analyzer's cross-directory
+    /// edge) is tagged `code only`, so the two layers can be told apart.
+    #[test]
+    fn architecture_brief_marks_an_edge_seen_only_in_code() {
+        use travsr_core::EdgeKind;
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        let out = get_architecture_brief(&store, "", 30_000);
+        assert!(
+            out.contains("crates/alpha -&gt; crates/beta (1, code only)"),
+            "an unmatched code edge must be tagged `code only`:\n{out}"
+        );
+    }
+
     #[test]
     fn architecture_brief_caps_its_lists_and_says_what_it_dropped() {
         // Unbounded, the byte limit did the cutting: on kubernetes the brief
@@ -14397,6 +15228,156 @@ mod tests {
         assert!(
             called_from.contains("sibling") && called_from.contains("outsider"),
             "entry mode lists every caller: {called_from}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_component_entry_is_a_root_not_a_popular_helper() {
+        // #1046: component entries were ranked by how often something outside
+        // called them, so a daemon's run loop (called once, from the CLI) lost to
+        // setup helpers the CLI calls directly. A call-graph root ranks first now.
+        use travsr_core::EdgeKind;
+        let run_loop = make_node("crates/app/src/run.rs", "fn:run_loop");
+        let helper = make_node("crates/app/src/util.rs", "fn:helper");
+        let driver1 = make_node("crates/cli/src/a.rs", "fn:driver1");
+        let driver2 = make_node("crates/cli/src/b.rs", "fn:driver2");
+        let edges = vec![
+            // run_loop: one external caller, calls the helper internally -> a root.
+            (driver1.id, run_loop.id, EdgeKind::RefCall),
+            (run_loop.id, helper.id, EdgeKind::RefCall),
+            // helper: more external callers than run_loop, but called from within
+            // the component too, so it is not a root.
+            (driver1.id, helper.id, EdgeKind::RefCall),
+            (driver2.id, helper.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(&[run_loop, helper, driver1, driver2], &edges);
+        let out = get_subsystem_brief(&store, "", "crates/app", "", 3, 6, 8_000);
+        let entry = out
+            .split("## Entry")
+            .nth(1)
+            .unwrap_or_else(|| panic!("entry section:\n{out}"))
+            .split("## Called from")
+            .next()
+            .unwrap();
+        let run_at = entry.find("run_loop");
+        let help_at = entry.find("helper");
+        assert!(run_at.is_some(), "the run loop must be an entry:\n{out}");
+        assert!(
+            help_at.is_none() || run_at < help_at,
+            "a root must rank ahead of a more-called helper:\n{entry}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_traces_a_binary_crate_and_a_path_qualified_entry() {
+        // #1046: a binary crate is never called, so "called from outside" found no
+        // entry and the component could not be traced; and `main` could not be
+        // picked out of the many like it without a path. Both are fixed: a
+        // call-graph root stands in for the missing outside caller, and a
+        // path-qualified id selects one definition.
+        use travsr_core::EdgeKind;
+        let cli_main = make_node("crates/cli/src/main.rs", "fn:main");
+        let cli_work = make_node("crates/cli/src/work.rs", "fn:do_work");
+        // A build script is a call-graph root that calls things, but it is not a
+        // subsystem entry and must never headline the crate over src/main.rs.
+        let cli_build = make_node("crates/cli/build.rs", "fn:main");
+        let cli_gen = make_node("crates/cli/src/gen.rs", "fn:codegen");
+        let tool_main = make_node("crates/tool/src/main.rs", "fn:main");
+        let tool_step = make_node("crates/tool/src/step.rs", "fn:step");
+        let edges = vec![
+            (cli_main.id, cli_work.id, EdgeKind::RefCall),
+            (cli_build.id, cli_gen.id, EdgeKind::RefCall),
+            (tool_main.id, tool_step.id, EdgeKind::RefCall),
+        ];
+        let store = make_store(
+            &[cli_main, cli_work, cli_build, cli_gen, tool_main, tool_step],
+            &edges,
+        );
+
+        // Binary crate: nothing calls into it, but `main` is a call-graph root.
+        let by_comp = get_subsystem_brief(&store, "", "crates/cli", "", 3, 6, 8_000);
+        assert!(
+            by_comp.contains("SUBSYSTEM BRIEF: crates/cli"),
+            "a binary crate must be traceable:\n{by_comp}"
+        );
+        assert!(
+            by_comp.contains("- main - crates/cli/src/main.rs"),
+            "its main must be the entry:\n{by_comp}"
+        );
+        let cli_entry = by_comp
+            .split("## Entry")
+            .nth(1)
+            .unwrap_or_else(|| panic!("entry section:\n{by_comp}"))
+            .split("## Called from")
+            .next()
+            .unwrap();
+        assert!(
+            !cli_entry.contains("build.rs"),
+            "a build script must not be surfaced as a component entry:\n{cli_entry}"
+        );
+
+        // Path-qualified entry picks the tool's main, not the cli's.
+        let by_path = get_subsystem_brief(
+            &store,
+            "crates/tool/src/main.rs:fn:main",
+            "",
+            "",
+            3,
+            6,
+            8_000,
+        );
+        assert!(
+            by_path.contains("crates/tool/src/main.rs"),
+            "the path-qualified id must resolve to that definition:\n{by_path}"
+        );
+        assert!(
+            !by_path.contains("crates/cli/src/main.rs"),
+            "it must not resolve to the other main:\n{by_path}"
+        );
+    }
+
+    #[test]
+    fn subsystem_brief_keeps_a_fanning_stage_over_a_popular_leaf() {
+        // #1046: same-component callees were cut by global reach, so a pipeline
+        // stage (build_seed_set, reach 4, out-degree 58) lost its slot to a leaf
+        // helper (validate_mcp_arg, reach 29, out-degree 1). Rank by out-degree so
+        // the stage survives a tight width.
+        use travsr_core::EdgeKind;
+        let body = make_node("crates/a/src/body.rs", "fn:body");
+        let stage = make_node("crates/a/src/stage.rs", "fn:stage");
+        let leaf = make_node("crates/a/src/util.rs", "fn:leaf");
+        let s1 = make_node("crates/a/src/s1.rs", "fn:s1");
+        let s2 = make_node("crates/a/src/s2.rs", "fn:s2");
+        let s3 = make_node("crates/a/src/s3.rs", "fn:s3");
+        let r1 = make_node("crates/a/src/r1.rs", "fn:r1");
+        let r2 = make_node("crates/a/src/r2.rs", "fn:r2");
+        let mut edges = vec![
+            (body.id, stage.id, EdgeKind::RefCall),
+            (body.id, leaf.id, EdgeKind::RefCall),
+            // stage fans out (high out-degree, low reach).
+            (stage.id, s1.id, EdgeKind::RefCall),
+            (stage.id, s2.id, EdgeKind::RefCall),
+            (stage.id, s3.id, EdgeKind::RefCall),
+        ];
+        // leaf is popular (high reach) but calls nothing (out-degree 0).
+        for r in [&r1, &r2] {
+            edges.push((r.id, leaf.id, EdgeKind::RefCall));
+        }
+        let store = make_store(&[body, stage, leaf, s1, s2, s3, r1, r2], &edges);
+        // width = 1 keeps a single same-component callee of body.
+        let out = get_subsystem_brief(&store, "fn:body", "", "", 2, 1, 8_000);
+        let spine = out
+            .split("## Call spine")
+            .nth(1)
+            .unwrap_or(&out)
+            .to_string();
+        assert!(
+            spine.contains("stage"),
+            "the fanning stage must win the width-1 slot:\n{out}"
+        );
+        assert!(
+            !spine.contains("- leaf "),
+            "the popular leaf must be the one cut:\n{spine}"
         );
     }
 
@@ -14902,6 +15883,23 @@ enum SymbolToken<'a> {
     BareSig(&'a str),
 }
 
+/// The requested name a [`SymbolToken`] came from, for the `#1052` "no symbol
+/// matched" note. Echoes back what the caller can act on: the bare name for a
+/// bare signature, the `sig (path)` form for a full header (keep the path: it
+/// disambiguates which overload/location was looked up and failed), and the
+/// explicit `nodeId:`/`path:line` form for the coordinate tiers.
+fn token_display_name(tok: &SymbolToken<'_>) -> String {
+    match tok {
+        SymbolToken::NodeId(id) => format!("nodeId:{id}"),
+        SymbolToken::FullHeader { sig, path } => format!("{sig} ({path})"),
+        // Unreachable from the sole caller (the generic "no symbol matched"
+        // note): a PathLine token always resolves to a synthetic node, so it
+        // never reaches that note. Kept only for match exhaustiveness.
+        SymbolToken::PathLine { path, start, .. } => format!("{path}:{start}"),
+        SymbolToken::BareSig(sig) => (*sig).to_string(),
+    }
+}
+
 /// Split `symbols_arg` on newline / comma and classify each token into the
 /// appropriate [`SymbolToken`] resolution tier.
 ///
@@ -15078,6 +16076,7 @@ fn get_snippets_body(
     symbols_arg: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     // Read repo_root from meta — written by init_repo_with_progress.
     // Absent on indexes created before this feature; degrade gracefully.
@@ -15089,6 +16088,11 @@ fn get_snippets_body(
         }
     };
 
+    // #1048: committed code before untracked, non-ignored scratch files, so a
+    // bare name resolves to the real definition rather than a spike-script copy.
+    // Computed once and reused for every token's resolution below.
+    let tracked = tracked_rel_paths(store);
+
     // Parse every token into its resolution tier.  Tokens in the same request
     // may use different forms (nodeId, full header, path:line, bare sig).
     let tokens = parse_symbol_tokens(symbols_arg);
@@ -15096,6 +16100,30 @@ fn get_snippets_body(
     if tokens.is_empty() {
         return String::new();
     }
+
+    // #1052: how many distinct bare names the request carries. The shared `path`
+    // hint is hard-scoped only when it disambiguates a single bare name (parity
+    // with find_references); with several bare names it is a soft per-name
+    // filter, so a name living outside the hint keeps its unhinted matches.
+    // Counts BareSig only: a nodeId / path:line / full-header token is already
+    // path-pinned and never consults the hint, so it must not relax this rule.
+    // #1076: count distinct names, not occurrences, so a name repeated in the
+    // request (`foo,foo`) still reads as one bare name and keeps hard-scoping,
+    // instead of being misread as multi-name and dropped into the soft filter.
+    // Only the `path` hint branch below reads this, so compute it only when a
+    // hint is present; the common no-hint call then allocates nothing here.
+    let bare_sig_count = if path.is_some() {
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                SymbolToken::BareSig(sig) => Some(*sig),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    } else {
+        0
+    };
 
     // Resolve each token to ≥0 CoreNodes.  All tiers produce nodes with stored
     // path + line/end_line, so snippet_for_node reads the correct file for each.
@@ -15105,12 +16133,30 @@ fn get_snippets_body(
     // tier (Tier 3) calls resolve_symbol_nodes, which can fall through to the O(N)
     // name search on a bare-name miss.
     let mut resolved: Vec<CoreNode> = Vec::new();
+    // #1052: per-name notes appended after the snippet blocks, each a full,
+    // ready-to-emit `[note: ...]` line, so the answer can say which request came
+    // back empty instead of dropping it without a trace. Mostly one line per
+    // requested name that produced no snippet, but NOT only hard misses: #1076
+    // also records here the informational note for a multi-name request whose
+    // shared hint was skipped for a name that DID resolve elsewhere, so an entry
+    // is not a reliable "produced no snippet" signal. Recorded at resolution
+    // time (before the budget cap), so a name that resolved but was later
+    // trimmed for budget is never reported here.
+    let mut unmatched: Vec<String> = Vec::new();
     for tok in &tokens {
+        let before = resolved.len();
+        let before_un = unmatched.len();
         match tok {
             // Tier 0: VS Code / internal callers pass the node's primary key.
             SymbolToken::NodeId(id) => match store.get_node(travsr_core::NodeId(*id)) {
                 Ok(Some(n)) if n.kind != "file" => resolved.push(n),
-                Ok(_) => {}
+                // The node exists but is a `file` container, which has no
+                // definition snippet. Say so, rather than letting the generic
+                // check below report a present node as "no symbol matched".
+                Ok(Some(_)) => unmatched.push(format!(
+                    "[note: 'nodeId:{id}' is a file, not a symbol with a snippet]"
+                )),
+                Ok(None) => {}
                 Err(e) => tracing::warn!("get_snippets nodeId:{id} lookup error: {e}"),
             },
 
@@ -15145,14 +16191,136 @@ fn get_snippets_body(
             // to support exact matches, plain names, and dotted paths, returning up to
             // MAX_SIGNATURE_MATCHES nodes (each with its own path + line).
             SymbolToken::BareSig(sig) => {
-                let nodes = resolve_symbol_nodes(store, sig, None);
+                // #1052: honour the caller's `path` hint. resolve_symbol_nodes
+                // can apply a hint itself, but only as an internal `retain` that
+                // hard-scopes and reports nothing back. We need the per-node
+                // match mask here to (a) soft-filter in a multi-name request and
+                // (b) tell a single-name hint miss apart from a genuine absence,
+                // so resolve unhinted and apply the mask in this scope.
+                let mut nodes = resolve_symbol_nodes(store, sig, None);
+                let existed = !nodes.is_empty();
+                let mut dropped_by_hint = false;
+                if let Some(p) = path {
+                    // One `path_hint_matches` pass: the mask is reused for the
+                    // `any` test and the retain, since path_hint_matches
+                    // allocates per node and the old two-pass form did it twice.
+                    let keep: Vec<bool> = nodes
+                        .iter()
+                        .map(|n| path_hint_matches(&n.vname.path, p))
+                        .collect();
+                    let any = keep.iter().any(|&k| k);
+                    // One `path` hint is shared by every name in a multi-name
+                    // request, so a name living outside it keeps its unhinted
+                    // matches rather than being erased. A request with a single
+                    // bare name keeps find_references' hard path-scoping, so its
+                    // empty hinted set stands.
+                    if any || bare_sig_count == 1 {
+                        let mut i = 0;
+                        nodes.retain(|_| {
+                            let k = keep[i];
+                            i += 1;
+                            k
+                        });
+                        dropped_by_hint = !any && existed;
+                    } else if existed {
+                        // #1076: multi-name request and this name has no match
+                        // under the shared hint, so it kept its unhinted matches
+                        // above. Say the hint was skipped for it, so the caller is
+                        // not misled into reading these as hint-scoped.
+                        unmatched.push(format!(
+                            "[note: '{sig}' is not under path hint '{p}'; \
+                             showing its matches from elsewhere]"
+                        ));
+                    }
+                }
+                // Reorder before the cap so a tracked definition is never the
+                // one dropped when more than MAX_SIGNATURE_MATCHES names match.
+                prefer_tracked_nodes(&mut nodes, &tracked);
                 resolved.extend(nodes.into_iter().take(MAX_SIGNATURE_MATCHES));
+                // A single-name hint that filtered out every real match means
+                // "not under this path", not "nowhere": name the hint so a
+                // stale/off path is not read as a missing symbol. Genuine
+                // absence (no match even unhinted) falls through to the generic
+                // note below.
+                if resolved.len() == before && dropped_by_hint {
+                    unmatched.push(format!(
+                        "[note: no symbol matched '{sig}' under path hint \
+                         '{}'; it exists outside that path]",
+                        path.unwrap_or("")
+                    ));
+                }
             }
+        }
+        // #1052: this token added nothing to the result set, and no tier above
+        // already recorded a more specific note for it (e.g. a file node).
+        if resolved.len() == before && unmatched.len() == before_un {
+            unmatched.push(format!(
+                "[note: no symbol matched '{}']",
+                token_display_name(tok)
+            ));
         }
     }
 
+    // #1052: a name repeated in the request (`foo,foo`) produces one identical
+    // note per occurrence; collapse duplicates so each unresolved name is
+    // reported once, preserving first-seen order.
+    if unmatched.len() > 1 {
+        let mut seen = std::collections::HashSet::new();
+        unmatched.retain(|n| seen.insert(n.clone()));
+    }
+
+    // #1076: a name repeated in the request (`foo,foo`), or two tokens that
+    // resolve to the same definition, each pushed an identical node. Collapse
+    // exact duplicates so one block renders and the footer count is honest,
+    // keyed by the fields that make a rendered block identical (path + span +
+    // kind + signature). This keeps genuinely distinct overloads (same name,
+    // different file) and distinct `path:line` windows apart.
+    if resolved.len() > 1 {
+        // Key the dedup on borrowed fields so a node is not cloned just to detect
+        // the (near-always absent) duplicate. `seen` is scoped so its borrow of
+        // `resolved` is released before the mutable `retain`, same one-pass-mask
+        // shape as the path-hint filter above.
+        let keep: Vec<bool> = {
+            let mut seen = std::collections::HashSet::new();
+            resolved
+                .iter()
+                .map(|n| {
+                    seen.insert((
+                        n.vname.path.as_str(),
+                        n.line,
+                        n.end_line,
+                        n.kind.as_str(),
+                        n.vname.signature.as_str(),
+                    ))
+                })
+                .collect()
+        };
+        let mut i = 0;
+        resolved.retain(|_| {
+            let k = keep[i];
+            i += 1;
+            k
+        });
+    }
+
     if resolved.is_empty() {
-        return "No symbols matching the provided names found in the graph.".to_string();
+        // #1052: name each token that matched nothing, rather than one generic
+        // line, so the caller can tell a typo from a missing symbol. Sanitised
+        // because a requested name is untrusted input.
+        let body = if unmatched.is_empty() {
+            "No symbols matching the provided names found in the graph.".to_string()
+        } else {
+            unmatched.join("\n")
+        };
+        // #1076: this body is only the per-name notes, no snippet payload, so a
+        // tiny token_budget must not shrink the cap below the notes themselves
+        // (budget=1 gave an 8-byte cap that cut "[note: no symbol matched ...]"
+        // down to "[note: "). Size the cap to the notes, still under the 1 MiB
+        // ceiling; the names are already bounded by the validated input length.
+        // Multiply by 4: sanitize escapes `<`/`>` to 4-byte entities AFTER the
+        // pre-truncation, so a raw-length cap would cut the tail of a note
+        // naming an angle-bracket symbol (`Vec<T>`); x4 is the worst case.
+        return sanitize_mcp_body_with_limit(&body, body.len().saturating_mul(4).min(1_024_000));
     }
 
     // Accumulate blocks within budget.  All symbols are equally requested so
@@ -15161,6 +16329,9 @@ fn get_snippets_body(
     let mut parts: Vec<String> = Vec::new();
     let mut tokens_used: usize = 0;
     let mut n_with_snippet: usize = 0;
+    // #1048: set when an included definition lives in an untracked file, so the
+    // answer flags that a not-yet-committed copy is among the results.
+    let mut shown_untracked = false;
     // One hash per file, not per symbol: a request routinely names several
     // symbols from the same file (that is how #895 was found).
     let mut drift_cache: HashMap<String, bool> = HashMap::new();
@@ -15169,12 +16340,30 @@ fn get_snippets_body(
         let drifted = *drift_cache
             .entry(node.vname.path.clone())
             .or_insert_with(|| file_drifted_since_index(store, &repo_root, &node.vname.path));
+        // Mirror `format_node_line`: carry the definition span so code read
+        // through a snippet is citable, and drop the `[package: ]` tag when the
+        // node has no package. A graph node's end_line is its true definition
+        // boundary, so emit `path:start-end`. A "source-range" node (Tier 2
+        // `path:line`) carries a synthetic end_line that is only a read window,
+        // not a definition boundary, so cite its start line alone rather than a
+        // fabricated span.
+        let loc = match (node.line, node.end_line) {
+            (Some(start), Some(end)) if node.kind != "source-range" => {
+                format!(":{start}-{end}")
+            }
+            (Some(start), _) => format!(":{start}"),
+            _ => String::new(),
+        };
+        let pkg = if node.package.is_empty() {
+            String::new()
+        } else {
+            format!(" [package: {}]", node.package)
+        };
         let header = format!(
-            "{} ({}) \u{2014} {} [package: {}]{}",
+            "{} ({}) \u{2014} {}{loc}{pkg}{}",
             display_label(node),
             node.kind,
             node.vname.path,
-            node.package,
             if drifted { STALE_SPAN_MARKER } else { "" }
         );
         let skeleton = |n: &CoreNode| skeleton_for_node_inner(n, &repo_root).map(|s| s.render());
@@ -15229,6 +16418,11 @@ fn get_snippets_body(
         } else {
             header
         };
+        if let Some(t) = &tracked {
+            if is_untracked_scratch(&node.vname.path, t) {
+                shown_untracked = true;
+            }
+        }
         parts.push(block);
     }
 
@@ -15236,13 +16430,38 @@ fn get_snippets_body(
         return "Token budget too small to include any symbols.".to_string();
     }
 
-    let body = parts.join("\n\n");
-    let sanitized = sanitize_mcp_body_with_limit(
-        &body,
+    // Sanitise the snippet payload under the budget-derived cap.
+    let mut sanitized = sanitize_mcp_body_with_limit(
+        &parts.join("\n\n"),
         (token_budget * TOKEN_CHARS_PER_TOKEN * 2).min(1_024_000),
     );
+    // #1052/#1076: append one note per requested name that produced no snippet.
+    // Each note is sanitised on its own, under a cap sized to its escaped-worst-
+    // case length (x4 for `<`/`>` expansion), NOT folded into the snippet body
+    // before the budget cap: a single large Full definition (the pin case) can
+    // fill that cap and would push appended notes off the end, silently
+    // dropping the "which name missed" answer #1052 guarantees. The names are
+    // bounded by the validated input length, so each note stays under 1 MiB.
+    for note in &unmatched {
+        sanitized.push_str("\n\n");
+        sanitized.push_str(&sanitize_mcp_body_with_limit(
+            note,
+            note.len().saturating_mul(4).min(1_024_000),
+        ));
+        // The notes are now always included in full, so folding their cost into
+        // the `~N tokens` footer is honest (the budget loop fixed tokens_used
+        // above). Same per-block estimate the loop uses (`+ 1` covers the
+        // separator).
+        tokens_used += note.len() / TOKEN_CHARS_PER_TOKEN + 1;
+    }
+    let untracked_note = if shown_untracked {
+        "\n[note: a definition shown is in an untracked (not-yet-committed) file; \
+         it leaves the graph at the next commit.]"
+    } else {
+        ""
+    };
     format!(
-        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]",
+        "{sanitized}\n\n[{} symbols, {n_with_snippet} with snippets, ~{tokens_used} tokens]{untracked_note}",
         parts.len()
     )
 }
@@ -15259,10 +16478,20 @@ pub fn get_snippets(
     symbols: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets rejected invalid arg: {reason}");
         return String::new();
+    }
+    // #1076: the `path` hint reaches only in-memory matching, never the
+    // filesystem, but validate it like get_callers/find_references so a
+    // pathological oversize hint can't be string-matched against every node.
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_snippets rejected invalid path arg: {reason}");
+            return String::new();
+        }
     }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     // `get_snippets_body` already sanitizes its body with a budget-derived limit
@@ -15270,7 +16499,7 @@ pub fn get_snippets(
     // Wrap-only here — like `get_context` — so the response honours `token_budget`
     // instead of being re-truncated to the 4 KiB scalar-output cap (which silently
     // dropped everything past ~6 symbols and cut off the summary footer).
-    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode))
+    wrap_envelope(&get_snippets_raw(store, symbols, budget, mode, path))
 }
 
 pub(crate) fn get_snippets_raw(
@@ -15278,8 +16507,9 @@ pub(crate) fn get_snippets_raw(
     symbols: &str,
     token_budget: usize,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
-    get_snippets_body(store, symbols, token_budget, mode)
+    get_snippets_body(store, symbols, token_budget, mode, path)
 }
 
 /// Global variant: searches across all registered repos (or a named one).
@@ -15289,14 +16519,22 @@ pub fn get_snippets_global(
     token_budget: usize,
     repo: Option<&str>,
     mode: SnippetMode,
+    path: Option<&str>,
 ) -> String {
     if let Err(reason) = validate_mcp_list_arg(symbols) {
         tracing::warn!("get_snippets_global rejected invalid arg: {reason}");
         return String::new();
     }
+    // #1076: validate the `path` hint, same as the single-repo get_snippets.
+    if let Some(p) = path {
+        if let Err(reason) = validate_mcp_arg(p) {
+            tracing::warn!("get_snippets_global rejected invalid path arg: {reason}");
+            return String::new();
+        }
+    }
     let budget = token_budget.clamp(1, MAX_CONTEXT_BUDGET);
     let raw = collect_global(repos, repo, |store, repo_name, single| {
-        let result = get_snippets_raw(store, symbols, budget, mode);
+        let result = get_snippets_raw(store, symbols, budget, mode, path);
         if result.is_empty() || single {
             result
         } else {
@@ -15372,6 +16610,117 @@ mod snippet_tests {
         .with_end_line(end_line)
     }
 
+    /// #1048: the reorder must lift a tracked definition above untracked
+    /// scratch copies *before* `get_snippets_body` applies the
+    /// `MAX_SIGNATURE_MATCHES` cap — otherwise the tracked def is exactly the
+    /// node the cap drops.
+    #[test]
+    fn prefer_tracked_nodes_lifts_tracked_before_the_signature_cap() {
+        // The untracked classification requires the scratch copies to be real
+        // files on disk, so stage them under a tempdir repo root.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("DOC/spike")).unwrap();
+        for f in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(tmp.path().join("DOC/spike").join(f), "x").unwrap();
+        }
+        let mut nodes = vec![
+            make_fn_node("DOC/spike/a.ts", "fn:rerank", 1, 2),
+            make_fn_node("DOC/spike/b.ts", "fn:rerank", 1, 2),
+            make_fn_node("DOC/spike/c.ts", "fn:rerank", 1, 2),
+            make_fn_node("crates/travsr-mcp/src/rerank.rs", "fn:rerank", 1, 2),
+        ];
+        let tracked: Option<TrackedSet> = Some((
+            ["crates/travsr-mcp/src/rerank.rs".to_string()]
+                .into_iter()
+                .collect(),
+            tmp.path().to_path_buf(),
+        ));
+
+        let any_untracked = prefer_tracked_nodes(&mut nodes, &tracked);
+
+        assert!(any_untracked, "the untracked scratch copies were present");
+        assert_eq!(
+            nodes[0].vname.path, "crates/travsr-mcp/src/rerank.rs",
+            "the tracked def must be lifted to the front"
+        );
+        // Within the untracked group the original order is preserved (stable).
+        let untracked_order: Vec<&str> = nodes[1..].iter().map(|n| n.vname.path.as_str()).collect();
+        assert_eq!(
+            untracked_order,
+            ["DOC/spike/a.ts", "DOC/spike/b.ts", "DOC/spike/c.ts"]
+        );
+        // The cap get_snippets_body applies next must now keep the tracked def.
+        let kept: Vec<&str> = nodes
+            .iter()
+            .take(MAX_SIGNATURE_MATCHES)
+            .map(|n| n.vname.path.as_str())
+            .collect();
+        assert!(
+            kept.contains(&"crates/travsr-mcp/src/rerank.rs"),
+            "reorder-before-cap must not drop the tracked def: {kept:?}"
+        );
+    }
+
+    /// #1048 follow-up: paths git never lists but that are not editable files —
+    /// synthetic VName paths (`<cgo_synthetic>/…`) and directory-keyed package
+    /// nodes — must NOT be classified untracked, so they are neither sorted down
+    /// nor flagged not-yet-committed.
+    #[test]
+    fn prefer_tracked_nodes_ignores_synthetic_and_non_file_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut nodes = vec![
+            make_fn_node("<cgo_synthetic>/main.go", "fn:helper", 1, 2),
+            make_fn_node("crates/foo/src/lib.rs", "fn:helper", 1, 2),
+        ];
+        let tracked: Option<TrackedSet> = Some((
+            ["crates/foo/src/lib.rs".to_string()].into_iter().collect(),
+            tmp.path().to_path_buf(),
+        ));
+
+        // The synthetic path is not tracked and not a file on disk, so it is not
+        // untracked scratch: no reorder, no note, order preserved.
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &tracked),
+            "a synthetic / non-file path is not untracked scratch"
+        );
+        assert_eq!(nodes[0].vname.path, "<cgo_synthetic>/main.go");
+        assert_eq!(nodes[1].vname.path, "crates/foo/src/lib.rs");
+    }
+
+    /// #1048: with no tracked set (no-git / cloud/SSE) or when nothing is
+    /// untracked, the reorder is a no-op that preserves order and reports no
+    /// untracked result — the fail-open path.
+    #[test]
+    fn prefer_tracked_nodes_is_a_noop_when_tracked_unknown_or_all_tracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut nodes = vec![
+            make_fn_node("a.ts", "fn:x", 1, 2),
+            make_fn_node("b.ts", "fn:x", 1, 2),
+        ];
+
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &None),
+            "unknown set reorders nothing"
+        );
+        assert_eq!(nodes[0].vname.path, "a.ts");
+        assert_eq!(nodes[1].vname.path, "b.ts");
+
+        // All paths tracked: the tracked-set membership short-circuits before any
+        // disk check, so no untracked node and no reorder.
+        let all_tracked: Option<TrackedSet> = Some((
+            ["a.ts".to_string(), "b.ts".to_string()]
+                .into_iter()
+                .collect(),
+            tmp.path().to_path_buf(),
+        ));
+        assert!(
+            !prefer_tracked_nodes(&mut nodes, &all_tracked),
+            "no untracked node means no reorder and no note"
+        );
+        assert_eq!(nodes[0].vname.path, "a.ts");
+        assert_eq!(nodes[1].vname.path, "b.ts");
+    }
+
     // Unit tests for is_comment_line / skip_leading_comments / snippet_line_cap /
     // snippet_for_node have moved to travsr-analysis/src/snippet.rs (RFC-017).
 
@@ -15419,7 +16768,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(result.contains("function hello()"), "snippet body missing");
         assert!(result.contains("return 'hi'"), "snippet content missing");
         assert!(
@@ -15448,6 +16797,7 @@ mod snippet_tests {
             "method:ClassA.enableSupportForFeatureX",
             2000,
             SnippetMode::Auto,
+            None,
         );
         assert!(
             exact.contains("enableSupportForFeatureX() {"),
@@ -15455,14 +16805,20 @@ mod snippet_tests {
         );
 
         // 2. Plain function name works
-        let plain = get_snippets_body(&store, "enableSupportForFeatureX", 2000, SnippetMode::Auto);
+        let plain = get_snippets_body(
+            &store,
+            "enableSupportForFeatureX",
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
         assert!(
             plain.contains("enableSupportForFeatureX() {"),
             "plain function name failed"
         );
 
         // 3. Bare class name works
-        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto);
+        let class = get_snippets_body(&store, "ClassA", 2000, SnippetMode::Auto, None);
         assert!(class.contains("class ClassA"), "bare class name failed");
 
         // 4. Dotted symbol name works
@@ -15471,17 +16827,438 @@ mod snippet_tests {
             "ClassA.enableSupportForFeatureX",
             2000,
             SnippetMode::Auto,
+            None,
         );
         assert!(
             dotted.contains("enableSupportForFeatureX() {"),
             "dotted symbol name failed"
         );
 
-        // 5. Unknown symbol
-        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto);
+        // 5. Unknown symbol (#1052): named in a per-name note, not dropped.
+        let unknown = get_snippets_body(&store, "unknownSymbol", 2000, SnippetMode::Auto, None);
         assert!(
-            unknown.contains("No symbols matching the provided names found in the graph."),
-            "unknown symbol failed"
+            unknown.contains("[note: no symbol matched 'unknownSymbol']"),
+            "unknown symbol failed: {unknown}"
+        );
+    }
+
+    /// #1052 Repro A: a name that resolves to nothing must be named in a note,
+    /// not silently dropped, and the resolvable name must still be returned.
+    #[test]
+    fn get_snippets_body_notes_each_unresolved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(
+            &store,
+            "fn:hello\nfn:does_not_exist",
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
+        assert!(
+            out.contains("function hello()"),
+            "resolved snippet missing: {out}"
+        );
+        assert!(
+            out.contains("[note: no symbol matched 'fn:does_not_exist']"),
+            "unmatched name not noted: {out}"
+        );
+        // The footer counts only names that produced a block.
+        assert!(
+            out.contains("1 symbols, 1 with snippets"),
+            "footer wrong: {out}"
+        );
+    }
+
+    /// #1052 Repro B: a `path` hint scopes an overloaded bare name to one file,
+    /// same semantics as find_references.
+    #[test]
+    fn get_snippets_body_path_hint_scopes_overloaded_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function dup() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/x.ts"),
+            "function dup() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:dup", 1, 3),
+                make_fn_node("b/x.ts", "fn:dup", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        let out = get_snippets_body(&store, "dup", 2000, SnippetMode::Full, Some("b/x.ts"));
+        assert!(out.contains("b/x.ts"), "path-pinned file missing: {out}");
+        assert!(!out.contains("a/x.ts"), "unscoped file leaked: {out}");
+        assert!(out.contains("return 2"), "wrong definition returned: {out}");
+        assert!(
+            out.contains("1 symbols"),
+            "should resolve exactly one: {out}"
+        );
+    }
+
+    /// #1052: the single `path` hint is shared by every name in a multi-name
+    /// request. A name that lives outside the hinted path must still resolve
+    /// (fall back to its unhinted match) rather than be filtered out and then
+    /// reported "no symbol matched".
+    #[test]
+    fn get_snippets_body_path_hint_does_not_drop_names_outside_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // Hint pins to a/x.ts, where only foo lives; bar lives in b/y.ts and must
+        // survive via the unhinted fallback.
+        let out = get_snippets_body(&store, "foo\nbar", 2000, SnippetMode::Full, Some("a/x.ts"));
+        assert!(out.contains("return 1"), "hinted name foo missing: {out}");
+        assert!(
+            out.contains("return 2"),
+            "name outside the hint was dropped: {out}"
+        );
+        assert!(
+            !out.contains("no symbol matched 'bar'"),
+            "a present name outside the hint must not be called missing: {out}"
+        );
+    }
+
+    /// #1052 review: a single-name request hard-scopes to the `path` hint (no
+    /// unhinted fallback). When the hint filters out a symbol that exists
+    /// elsewhere, the note must name the hint and say the symbol exists outside
+    /// it, not report a bare "no symbol matched" that reads as "does not exist".
+    /// A genuinely-absent name must still get the plain note (no false blame on
+    /// the path).
+    #[test]
+    fn get_snippets_body_single_name_hint_miss_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // foo exists only in a/x.ts; the hint pins b/y.ts.
+        let out = get_snippets_body(&store, "foo", 2000, SnippetMode::Full, Some("b/y.ts"));
+        assert!(
+            out.contains("under path hint 'b/y.ts'") && out.contains("exists outside that path"),
+            "hint-miss note must name the path and say it exists elsewhere: {out}"
+        );
+
+        // A name that exists nowhere keeps the plain note, with no path blame.
+        let out = get_snippets_body(&store, "ghost", 2000, SnippetMode::Full, Some("b/y.ts"));
+        assert!(
+            out.contains("[note: no symbol matched 'ghost']"),
+            "genuinely-absent name must get the plain note: {out}"
+        );
+        assert!(
+            !out.contains("under path hint"),
+            "a nowhere name must not blame the path: {out}"
+        );
+    }
+
+    /// #1052 review: a name repeated in the request yields identical notes; they
+    /// must collapse to one line, not one per occurrence.
+    #[test]
+    fn get_snippets_body_repeated_unresolved_name_noted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "ghost,ghost", 2000, SnippetMode::Auto, None);
+        assert_eq!(
+            out.matches("no symbol matched 'ghost'").count(),
+            1,
+            "duplicate unresolved-name notes not collapsed: {out}"
+        );
+    }
+
+    /// #1076: a name repeated in the request (`foo,foo`) resolves the same node
+    /// set per occurrence; the identical blocks must collapse so the symbol is
+    /// shown once and the footer counts it once: the resolved-side mirror of
+    /// the duplicate-note collapse above.
+    #[test]
+    fn get_snippets_body_repeated_resolved_name_shown_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "function run() { /* a */ }\n").unwrap();
+        let store = make_store_with_meta(&[make_fn_node("a.ts", "fn:run", 1, 1)], dir.path());
+
+        let result = get_snippets_body(&store, "fn:run,fn:run", 2000, SnippetMode::Full, None);
+        assert_eq!(
+            result.matches("/* a */").count(),
+            1,
+            "duplicate resolved snippet not collapsed: {result}"
+        );
+        assert!(
+            result.contains("1 symbols"),
+            "footer must count the symbol once: {result}"
+        );
+    }
+
+    /// #1076: in a multi-name request the shared hint is a soft per-name filter.
+    /// A name with no match under the hint keeps its matches from elsewhere, and
+    /// a note must say the hint was skipped for it, so the caller does not read
+    /// the result as hint-scoped.
+    #[test]
+    fn get_snippets_body_multi_name_hint_miss_notes_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/y.ts"),
+            "function bar() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:foo", 1, 3),
+                make_fn_node("b/y.ts", "fn:bar", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        let out = get_snippets_body(&store, "foo\nbar", 2000, SnippetMode::Full, Some("a/x.ts"));
+        assert!(
+            out.contains("return 2"),
+            "fallback match for bar missing: {out}"
+        );
+        assert!(
+            out.contains("'bar' is not under path hint 'a/x.ts'"),
+            "multi-name hint miss must be noted: {out}"
+        );
+    }
+
+    /// #1076 review: get_snippets resolves a single bare name unhinted and
+    /// re-applies the `path` hint in its own scope (to get the per-node mask),
+    /// rather than letting `resolve_symbol_nodes` apply it. Both sides share
+    /// `path_hint_matches`, but guard the equivalence so a future change to the
+    /// resolve-side hint handling that get_snippets does not track is caught
+    /// here instead of silently breaking the `--path` parity the schema promises.
+    #[test]
+    fn get_snippets_body_single_name_hint_matches_resolve_symbol_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function dup() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b/x.ts"),
+            "function dup() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(
+            &[
+                make_fn_node("a/x.ts", "fn:dup", 1, 3),
+                make_fn_node("b/x.ts", "fn:dup", 1, 3),
+            ],
+            dir.path(),
+        );
+
+        // resolve_symbol_nodes is the hint authority the find_references path uses.
+        let hinted = resolve_symbol_nodes(&store, "dup", Some("b/x.ts"));
+        assert_eq!(hinted.len(), 1, "fixture should pin exactly one def");
+        let want = hinted[0].vname.path.clone();
+
+        let out = get_snippets_body(&store, "dup", 2000, SnippetMode::Full, Some("b/x.ts"));
+        assert!(
+            out.contains(want.as_str()),
+            "get_snippets must include the path resolve_symbol_nodes kept ({want}): {out}"
+        );
+        assert!(
+            !out.contains("a/x.ts"),
+            "get_snippets must not include a path resolve_symbol_nodes excluded: {out}"
+        );
+    }
+
+    /// #1076: the all-unresolved path returns only per-name notes. A tiny budget
+    /// must not truncate those notes (budget=1 once cut them to "[note: ").
+    #[test]
+    fn get_snippets_body_notes_survive_tiny_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "somemissingsymbol", 1, SnippetMode::Auto, None);
+        assert!(
+            out.contains("no symbol matched 'somemissingsymbol'"),
+            "tiny budget truncated the unresolved-name note: {out}"
+        );
+    }
+
+    /// #1076: the first resolved symbol is always included even when it alone
+    /// exceeds the budget (the pin-into-context case). A miss note for an
+    /// unresolved sibling must still survive that budget pressure, or the #1052
+    /// "name every miss" guarantee fails exactly when the payload is largest.
+    #[test]
+    fn get_snippets_body_notes_survive_a_large_pinned_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        // A definition far larger than the sanitize cap a small budget allows,
+        // so the snippet payload alone would fill it and crowd out the note.
+        let big: String = std::iter::once("function big() {".to_string())
+            .chain((0..400).map(|i| format!("  const x{i} = {i};")))
+            .chain(std::iter::once("}".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("big.ts"), big).unwrap();
+        let store = make_store_with_meta(&[make_fn_node("big.ts", "fn:big", 1, 402)], dir.path());
+
+        let out = get_snippets_body(&store, "big\nmissingsibling", 50, SnippetMode::Full, None);
+        assert!(
+            out.contains("no symbol matched 'missingsibling'"),
+            "miss note dropped under a large pinned snippet: {out}"
+        );
+    }
+
+    /// #1076: a miss note names the requested symbol verbatim, and sanitize
+    /// escapes `<`/`>` to 4-byte entities, so a cap sized to the raw note length
+    /// cut the closing bytes of an angle-bracket name. The whole note survives.
+    #[test]
+    fn get_snippets_body_unresolved_angle_bracket_name_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "Vec<Widget>", 2000, SnippetMode::Auto, None);
+        assert!(
+            out.contains("no symbol matched 'Vec&lt;Widget&gt;']"),
+            "angle-bracket miss note was truncated: {out}"
+        );
+    }
+
+    /// #1076: `foo,foo` is one distinct bare name, so the shared path hint must
+    /// hard-scope it (parity with find_references): a match only outside the hint
+    /// yields the single-name "under path hint" miss note, NOT the multi-name
+    /// "showing its matches from elsewhere" fallback.
+    #[test]
+    fn get_snippets_body_duplicate_single_name_keeps_hard_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::write(
+            dir.path().join("a/x.ts"),
+            "function foo() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let store = make_store_with_meta(&[make_fn_node("a/x.ts", "fn:foo", 1, 3)], dir.path());
+
+        let out = get_snippets_body(&store, "foo,foo", 2000, SnippetMode::Full, Some("b/"));
+        assert!(
+            out.contains("no symbol matched 'foo' under path hint 'b/'"),
+            "duplicate single name lost hard-scoping: {out}"
+        );
+        assert!(
+            !out.contains("showing its matches from elsewhere"),
+            "duplicate single name wrongly took the multi-name fallback: {out}"
+        );
+    }
+
+    /// #1076: an invalid `path` hint is rejected like get_callers/find_references,
+    /// returning empty rather than being string-matched against every node.
+    #[test]
+    fn get_snippets_rejects_invalid_path_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store_with_meta(&[make_fn_node("lib.ts", "fn:hello", 1, 3)], dir.path());
+
+        let out = get_snippets(
+            &store,
+            "hello",
+            2000,
+            SnippetMode::Auto,
+            Some("../etc/passwd"),
+        );
+        assert!(out.is_empty(), "invalid path hint must be rejected: {out}");
+    }
+
+    /// #1052: a `nodeId:` that resolves to a `file` container node exists but has
+    /// no definition snippet. It must be noted accurately, not reported as a
+    /// missing symbol (which misdescribes a present node).
+    #[test]
+    fn get_snippets_body_file_node_id_is_noted_not_called_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let file_node = CoreNode::new(
+            VName::new("corpus", "", "lib.ts", "typescript", "file:lib.ts"),
+            "file",
+        );
+        let store = make_store_with_meta(
+            &[make_fn_node("lib.ts", "fn:hello", 1, 3), file_node],
+            dir.path(),
+        );
+
+        // Resolve the file container node's id to pass it back as `nodeId:`.
+        let file_id = store
+            .search_nodes_by_name("file:lib.ts")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == "file")
+            .expect("a file container node exists")
+            .id;
+
+        let out = get_snippets_body(
+            &store,
+            &format!("nodeId:{}", file_id.0),
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
+        assert!(
+            out.contains("is a file, not a symbol"),
+            "file node should be noted accurately: {out}"
+        );
+        assert!(
+            !out.contains("no symbol matched"),
+            "a present file node must not be called missing: {out}"
         );
     }
 
@@ -15506,7 +17283,7 @@ mod snippet_tests {
         .with_end_line(31);
         let store = make_store_with_meta(&[class_node], dir.path());
 
-        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full);
+        let full = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Full, None);
         assert!(
             full.contains("last = true"),
             "full mode must include last line: {full}"
@@ -15516,7 +17293,7 @@ mod snippet_tests {
             "full mode must not be a skeleton: {full}"
         );
 
-        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto);
+        let auto = get_snippets_body(&store, "class:Big", 8000, SnippetMode::Auto, None);
         assert!(
             auto.contains("[skeleton:") || !auto.contains("last = true"),
             "auto mode caps/skeletonises the oversized class: {auto}"
@@ -15534,7 +17311,7 @@ mod snippet_tests {
         let node = make_fn_node("s.ts", "fn:small", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton);
+        let skel = get_snippets_body(&store, "fn:small", 2000, SnippetMode::Skeleton, None);
         assert!(
             skel.contains("[skeleton:"),
             "skeleton mode must render the AST summary even for a small fn: {skel}"
@@ -15547,7 +17324,7 @@ mod snippet_tests {
         let db_path = dir.path().join("graph.db");
         let store = SqliteStore::open(&db_path).unwrap();
         // No set_meta("repo_root") — simulates an old index.
-        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "anything", 2000, SnippetMode::Auto, None);
         assert!(
             result.contains("travsr init"),
             "must prompt user to re-init: {result}"
@@ -15574,7 +17351,7 @@ mod snippet_tests {
         // Tight budget (5 tokens) — the first resolved symbol is always included
         // (so a single large definition is never dropped), but the second respects
         // the exhausted budget and must not appear.
-        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto);
+        let tight = get_snippets_body(&store, "fn:aaa\nfn:bbb", 5, SnippetMode::Auto, None);
         assert!(
             tight.contains("aaa"),
             "first symbol must always be included even under a tiny budget: {tight}"
@@ -15587,7 +17364,7 @@ mod snippet_tests {
         // Ordering budget (20 tokens) — enough for one symbol (header ~9 tokens +
         // 3-line snippet ~8 tokens = ~17 tokens) but not both. The first symbol
         // in request order ("aaa") must appear; the second ("bbb") must not.
-        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto);
+        let ordered = get_snippets_body(&store, "fn:aaa\nfn:bbb", 20, SnippetMode::Auto, None);
         assert!(
             ordered.contains("aaa"),
             "first symbol must be included within budget: {ordered}"
@@ -15605,7 +17382,7 @@ mod snippet_tests {
         let node = make_fn_node("missing.ts", "fn:ghost", 1, 5);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:ghost", 2000, SnippetMode::Auto, None);
         // Should return metadata line without panic.
         assert!(
             result.contains("fn:ghost"),
@@ -15648,7 +17425,7 @@ mod snippet_tests {
             .put_file_hash("lib.ts", &sha256_hex_for_test(original.as_bytes()))
             .unwrap();
 
-        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let fresh = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             !fresh.contains("stale:"),
             "an unmodified file must not be flagged: {fresh}"
@@ -15659,11 +17436,36 @@ mod snippet_tests {
         // covers it.
         std::fs::write(&src, format!("// added\n// added\n{original}")).unwrap();
 
-        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let drifted = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             drifted.contains("stale:"),
             "a file edited since indexing must be disclosed, not answered \
              silently from the stale span: {drifted}"
+        );
+    }
+
+    // #1045: the snippet header must carry the definition span so code read
+    // through get_snippets is citable, and must not print an empty `[package: ]`
+    // tag when the node has no package.
+    #[test]
+    fn get_snippets_header_carries_span_and_omits_empty_package() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.ts"),
+            "function hello() {\n  return 'hi';\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
+        let store = make_store_with_meta(&[node], dir.path());
+
+        let out = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Full, None);
+        assert!(
+            out.contains("lib.ts:1-3"),
+            "header must carry the path:start-end span: {out}"
+        );
+        assert!(
+            !out.contains("[package:"),
+            "empty package must not print a `[package: ]` tag: {out}"
         );
     }
 
@@ -15731,7 +17533,7 @@ mod snippet_tests {
         let node_b = make_fn_node("b.ts", "fn:run", 1, 1);
         let store = make_store_with_meta(&[node_a, node_b], dir.path());
 
-        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, "fn:run", 2000, SnippetMode::Full, None);
 
         // Both nodes must appear in the output.
         assert!(
@@ -15772,7 +17574,7 @@ mod snippet_tests {
 
         // Caller passes the full header with path — should resolve to a.ts only.
         let full_header = "fn:run (function) \u{2014} a.ts [package: mypkg]";
-        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full, None);
 
         assert!(
             result.contains("/* a */"),
@@ -15810,7 +17612,7 @@ mod snippet_tests {
             header.contains("a.ts:1"),
             "sanity: real header must carry the line locator: {header}"
         );
-        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full);
+        let result = get_snippets_body(&store, &header, 2000, SnippetMode::Full, None);
         assert!(
             result.contains("/* a */"),
             "must resolve a.ts from the real get_context header: {result}\nheader={header}"
@@ -15824,7 +17626,7 @@ mod snippet_tests {
         let node_pkg = make_fn_node("a.ts", "fn:run", 1, 1).with_package("mypkg");
         let header_pkg = format_node_line(&node_pkg, "seed", Some(0.80), None, None, false);
         assert!(header_pkg.contains("[package:"), "sanity: {header_pkg}");
-        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full);
+        let result_pkg = get_snippets_body(&store, &header_pkg, 2000, SnippetMode::Full, None);
         assert!(
             result_pkg.contains("/* a */") && !result_pkg.contains("/* b */"),
             "package-present header must also resolve a.ts only: {result_pkg}"
@@ -15963,7 +17765,7 @@ mod snippet_tests {
         let node = make_fn_node("lib.ts", "fn:hello", 1, 3);
         let store = make_store_with_meta(&[node], dir.path());
 
-        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:hello", 2000, SnippetMode::Auto, None);
         assert!(
             result.contains("function hello()"),
             "snippet body missing: {result}"
@@ -15998,7 +17800,13 @@ mod snippet_tests {
             .set_meta("repo_root", dir.path().to_str().unwrap())
             .unwrap();
 
-        let result = get_snippets_body(&store, "src/exact.ts:3-5", 2000, SnippetMode::Skeleton);
+        let result = get_snippets_body(
+            &store,
+            "src/exact.ts:3-5",
+            2000,
+            SnippetMode::Skeleton,
+            None,
+        );
 
         assert!(
             result.contains("line3"),
@@ -16009,6 +17817,36 @@ mod snippet_tests {
             "line5 must be in result: {result}"
         );
         assert!(!result.contains("line6"), "line6 must NOT appear: {result}");
+    }
+
+    // #1045: a bare Tier 2 `path:line` request has a synthetic end_line (a
+    // 40-line read window, not a definition boundary). The header must cite
+    // only the requested start line, never the fabricated `start+39` span.
+    #[test]
+    fn get_snippets_path_line_header_cites_start_not_synthetic_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src: String = (1u32..=10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(src_dir.join("win.ts"), &src).unwrap();
+
+        // No graph nodes — PathLine builds a synthetic source-range node.
+        let db_path = dir.path().join(".travsr").join("graph.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let mut store = SqliteStore::open(&db_path).unwrap();
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+
+        let out = get_snippets_body(&store, "src/win.ts:3", 2000, SnippetMode::Full, None);
+        assert!(
+            out.contains("src/win.ts:3"),
+            "header must cite the requested start line: {out}"
+        );
+        assert!(
+            !out.contains("src/win.ts:3-"),
+            "header must not print a fabricated start+39 span: {out}"
+        );
     }
 
     // T-M7: NodeId tier (Tier 0) resolves directly by DB row id —
@@ -16032,7 +17870,13 @@ mod snippet_tests {
         assert_eq!(rows.len(), 1, "expected 1 node");
         let id = rows[0].id.0;
 
-        let result = get_snippets_body(&store, &format!("nodeId:{id}"), 2000, SnippetMode::Auto);
+        let result = get_snippets_body(
+            &store,
+            &format!("nodeId:{id}"),
+            2000,
+            SnippetMode::Auto,
+            None,
+        );
         assert!(result.contains("return 99"), "snippet missing: {result}");
         assert!(result.contains("fn:direct"), "header missing: {result}");
     }
@@ -16055,7 +17899,7 @@ mod snippet_tests {
         }
         let store = make_store_with_meta(&nodes, dir.path());
 
-        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto);
+        let result = get_snippets_body(&store, "fn:run", 8000, SnippetMode::Auto, None);
 
         // Footer must report exactly MAX_SIGNATURE_MATCHES symbols resolved.
         assert!(
@@ -17277,7 +19121,7 @@ mod snippet_tests {
         store.set_meta("phase_b_commit", "idx0000").unwrap();
 
         // Caller's HEAD differs from the index ⇒ note appended to the body.
-        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"));
+        let out = append_read_notes(&store, "real result".to_string(), Some("chk1111"), false);
         assert!(out.starts_with("real result"), "body preserved: {out}");
         assert!(
             out.contains("idx0000") && out.contains("chk1111"),
@@ -17286,12 +19130,12 @@ mod snippet_tests {
 
         // Same commit ⇒ no head note.
         assert_eq!(
-            append_read_notes(&store, "real result".to_string(), Some("idx0000")),
+            append_read_notes(&store, "real result".to_string(), Some("idx0000"), false),
             "real result"
         );
         // git-less caller ⇒ no head note.
         assert_eq!(
-            append_read_notes(&store, "real result".to_string(), None),
+            append_read_notes(&store, "real result".to_string(), None, false),
             "real result"
         );
     }
@@ -17302,7 +19146,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Empty body + mismatch: the note is the whole answer (no leading newline).
-        let out = append_read_notes(&store, String::new(), Some("chk1111"));
+        let out = append_read_notes(&store, String::new(), Some("chk1111"), false);
         assert!(out.starts_with("[note:"), "note is the body: {out}");
         assert!(
             !out.contains("\n[note:"),
@@ -17317,7 +19161,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
         // ...and the caller is at yet another commit ⇒ head note also fires.
-        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"));
+        let out = append_read_notes(&store, "body".to_string(), Some("chk1111"), false);
         assert!(
             out.contains("calls are still being traced for this commit"),
             "phase-b note: {out}"
@@ -17335,7 +19179,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         assert!(
-            live_overlay_note(&store, "a.ts").is_none(),
+            live_overlay_note(&store, "a.ts", false).is_none(),
             "a repo with no uncommitted edits must get no note"
         );
 
@@ -17351,7 +19195,10 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        let note = live_overlay_note(&store, "a.ts").expect("an overlay must be announced");
+        // #1053: the live half speaks only when the answer actually rendered a
+        // live row, which the caller reports as `has_live_row`.
+        let note = live_overlay_note(&store, "callers in a.ts:3", true)
+            .expect("an overlay must be announced");
         assert!(
             note.contains("1 call found in edits not yet committed is included"),
             "singular form: {note}"
@@ -17359,6 +19206,18 @@ mod snippet_tests {
         assert!(
             note.contains("marked `live`"),
             "a reader must be told how to get ratified-only truth: {note}"
+        );
+
+        // #1053: the same overlay beside an answer with no live row stays silent
+        // rather than claiming a row was included where none is on screen.
+        assert!(
+            live_overlay_note(
+                &store,
+                "No symbol named 'ReindexCommit' in the graph.",
+                false
+            )
+            .is_none(),
+            "the live half must not fire on an answer that printed no live row"
         );
     }
 
@@ -17389,12 +19248,12 @@ mod snippet_tests {
         // Calls are traced at HEAD: what is still pending is a call no commit
         // resolves (`Vec::new`), so "the next commit confirms them" is false.
         assert!(
-            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            live_overlay_note(&store, "callers in a.ts:3", false).is_none(),
             "no pending note while no edit awaits tracing"
         );
 
         store.set_meta("phase_b_dirty", "1").unwrap();
-        let note = live_overlay_note(&store, "callers in a.ts:3")
+        let note = live_overlay_note(&store, "callers in a.ts:3", false)
             .expect("a pending reference must be announced");
         assert!(
             note.contains("1 reference in the files above changed since the last commit and is not traced yet"),
@@ -17404,7 +19263,7 @@ mod snippet_tests {
         // Scoped, not ambient: an answer that never mentions `a.ts` must not be
         // told about `a.ts`'s gaps.
         assert!(
-            live_overlay_note(&store, "callers in unrelated.ts:9").is_none(),
+            live_overlay_note(&store, "callers in unrelated.ts:9", false).is_none(),
             "the pending half must not fire for a file the answer never names"
         );
 
@@ -17423,7 +19282,7 @@ mod snippet_tests {
         git(&["commit", "-q", "-m", "a"]);
         std::fs::write(repo.path().join("other.ts"), "").unwrap();
         assert!(
-            live_overlay_note(&store, "callers in a.ts:3").is_none(),
+            live_overlay_note(&store, "callers in a.ts:3", false).is_none(),
             "a committed file's pending rows were reported as changed"
         );
     }
@@ -17529,10 +19388,15 @@ mod snippet_tests {
             ))
             .unwrap();
 
-        let prose = append_read_notes(&store, "body".to_string(), None);
+        // #1053: both seams announce the overlay only when the answer actually
+        // carried a live row. Each surface signals that in its own terms: the
+        // prose body carries `LIVE_MARKER`, the JSON seam is told `has_live`.
+        // What matters here is that neither seam gains or loses the note the
+        // other keeps.
+        let prose = append_read_notes(&store, format!("body{LIVE_MARKER}"), None, true);
         assert!(prose.contains("marked `live`"), "prose: {prose}");
 
-        let signals = read_note_signals(&store, None, "a.ts");
+        let signals = read_note_signals(&store, None, "a.ts", true);
         assert!(
             signals
                 .iter()
@@ -17544,6 +19408,58 @@ mod snippet_tests {
         let out = serde_json::json!({ "nodes": [], "edges": [], "signals": signals });
         let text = serde_json::to_string(&out).unwrap();
         serde_json::from_str::<serde_json::Value>(&text).expect("body must stay valid JSON");
+    }
+
+    /// #1053 / #1077: get_blast_radius and get_execution_path render no
+    /// `LIVE_MARKER`, so their per-answer live signal is "a real result was
+    /// produced" (a non-empty radius, a rendered path). The overlay note must
+    /// fire beside a real answer drawn over an un-ratified edge, and stay silent
+    /// beside a not-found answer, the same contract the marker tools keep. A
+    /// `body.contains(LIVE_MARKER)` gate would leave both surfaces permanently
+    /// silent, which is the regression this test guards.
+    #[test]
+    fn marker_less_prose_tools_still_track_the_live_overlay() {
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("last_commit", "idx0000").unwrap();
+        store.set_meta("phase_b_commit", "idx0000").unwrap();
+        let caller = node_with("fn:execCaller", "function", "caller.ts");
+        let callee = node_with("fn:execCallee", "function", "callee.ts");
+        store.put_node(&caller).unwrap();
+        store.put_node(&callee).unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                caller.id,
+                callee.id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+
+        // get_execution_path: a rendered path over the live edge carries the note.
+        let path = get_execution_path(&store, "execCaller", "execCallee");
+        assert!(path.contains("path ("), "a real path must render: {path}");
+        assert!(
+            path.contains("marked `live`"),
+            "a path built over an un-ratified edge must carry the live note: {path}"
+        );
+        // A sink that does not resolve is a not-found answer: stay silent.
+        let no_path = get_execution_path(&store, "execCaller", "ghostSink");
+        assert!(
+            !no_path.contains("marked `live`"),
+            "the live note must not fire beside a not-found path: {no_path}"
+        );
+
+        // get_blast_radius: a found seed yields a real radius over the live edge.
+        let blast = get_blast_radius(&store, "callee.ts", AnalysisMode::TreeSitter, None);
+        assert!(
+            blast.contains("marked `live`"),
+            "a blast radius over an un-ratified edge must carry the live note: {blast}"
+        );
+        // A missing file is the not-found case the note must stay off for.
+        let missing = get_blast_radius(&store, "ghost.ts", AnalysisMode::TreeSitter, None);
+        assert!(
+            !missing.contains("marked `live`"),
+            "the live note must not fire beside a not-found radius: {missing}"
+        );
     }
 
     /// Build a node for the overlay tests.
@@ -17605,7 +19521,7 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "old9999").unwrap();
 
-        let signals = read_note_signals(&store, Some("chk1111"), "a.ts");
+        let signals = read_note_signals(&store, Some("chk1111"), "a.ts", false);
         assert_eq!(signals.len(), 2, "both signals present: {signals:?}");
 
         // Embedding them in a graph-json envelope must still parse as JSON.
@@ -17627,9 +19543,9 @@ mod snippet_tests {
         store.set_meta("last_commit", "idx0000").unwrap();
         store.set_meta("phase_b_commit", "idx0000").unwrap();
         // Markers agree (no Phase-B signal) and no caller HEAD ⇒ no signals at all.
-        assert!(read_note_signals(&store, None, "a.ts").is_empty());
+        assert!(read_note_signals(&store, None, "a.ts", false).is_empty());
         // Caller at the same commit ⇒ still no head signal.
-        assert!(read_note_signals(&store, Some("idx0000"), "a.ts").is_empty());
+        assert!(read_note_signals(&store, Some("idx0000"), "a.ts", false).is_empty());
     }
 
     /// get_callers must carry the note alongside real results when the marker
@@ -17740,6 +19656,106 @@ mod snippet_tests {
         assert!(
             parsed.get("signals").is_none(),
             "complete graph must not emit signals; got: {raw}"
+        );
+    }
+
+    /// #1053: on the JSON surface the live half must fire exactly when the
+    /// returned subgraph carries an un-ratified edge. The gate used to look for
+    /// the prose `LIVE_MARKER`, which a JSON body never contains, so
+    /// get_graph_json stayed silent while serving a live edge.
+    #[test]
+    fn get_graph_json_announces_live_edge_in_subgraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let callee = make_fn_node_with_pkg("src/b.ts", "fn:beta", 1, 3);
+        let (caller_id, callee_id) = (caller.id, callee.id);
+        let mut store = make_store_with_root(&dir, &[caller, callee]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                caller_id,
+                callee_id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            provenance: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Precondition: the live edge really did reach the subgraph, so a pass
+        // cannot be for the wrong reason.
+        assert!(
+            raw.contains(r#""provenance":"live""#),
+            "the live edge must be in the subgraph: {raw}"
+        );
+        let signals = parsed["signals"].as_array().expect("signals array");
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains("marked `live`")),
+            "JSON surface must announce the live overlay it is serving: {raw}"
+        );
+    }
+
+    /// #1053: a live edge elsewhere in the repo must not make get_graph_json
+    /// claim THIS subgraph includes one. The gate is per-answer; the repo-wide
+    /// count the note reports is not what decides whether it speaks.
+    #[test]
+    fn get_graph_json_silent_on_live_edge_outside_subgraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = make_fn_node_with_pkg("src/a.ts", "fn:alpha", 1, 3);
+        let other_src = make_fn_node_with_pkg("src/c.ts", "fn:gamma", 1, 3);
+        let other_dst = make_fn_node_with_pkg("src/d.ts", "fn:delta", 1, 3);
+        let (g_id, d_id) = (other_src.id, other_dst.id);
+        let mut store = make_store_with_root(&dir, &[seed, other_src, other_dst]);
+        store.set_meta("last_commit", "abc").unwrap();
+        store.set_meta("phase_b_commit", "abc").unwrap();
+        // A live edge the alpha subgraph never reaches.
+        store
+            .put_edge_live(&travsr_core::Edge::new(
+                g_id,
+                d_id,
+                travsr_core::EdgeKind::RefCall,
+            ))
+            .unwrap();
+        // Precondition: the repo really does hold a live edge, so it is the gate,
+        // not an empty overlay, that keeps the note silent.
+        assert_eq!(store.count_edges_with_provenance("live").unwrap(), 1);
+        let params = GraphJsonParams {
+            query: "alpha",
+            direction: "both",
+            depth: 2,
+            kind_filter: "",
+            provenance: "",
+            token_budget: 0,
+            mode: "",
+            path_prefix: "",
+        };
+        let raw = get_graph_json(&store, &params);
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            !raw.contains(r#""provenance":"live""#),
+            "the live edge must stay out of this subgraph: {raw}"
+        );
+        // Not `is_none_or`: clippy.toml pins msrv at 1.75 (ADR-001) and that is a
+        // 1.82 API, so `clippy::incompatible_msrv` would fail `-D warnings`.
+        assert!(
+            parsed
+                .get("signals")
+                .and_then(|s| s.as_array())
+                .map_or(true, |a| !a
+                    .iter()
+                    .any(|s| s.as_str().unwrap_or("").contains("marked `live`"))),
+            "live half must not fire when the subgraph holds no live edge: {raw}"
         );
     }
 
@@ -20011,14 +22027,14 @@ mod snippet_tests {
         // Newline / NUL in the pattern must be rejected before any exec: the body
         // is empty, so only the empty envelope comes back (never a match list).
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "foo\nbar", None, false), empty);
-        assert_eq!(find_pattern(&store, "", None, false), empty);
+        assert_eq!(find_pattern(&store, "foo\nbar", None, false, 0), empty);
+        assert_eq!(find_pattern(&store, "", None, false, 0), empty);
     }
 
     #[test]
     fn find_pattern_without_repo_root_is_graceful() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         assert!(
             out.contains("run `travsr init`"),
             "expected init hint: {out}"
@@ -20032,9 +22048,12 @@ mod snippet_tests {
         // Absolute and parent-escaping scopes must be dropped before exec →
         // empty envelope, never a match list.
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "charge", Some("/etc"), false), empty);
         assert_eq!(
-            find_pattern(&store, "charge", Some("../secrets"), false),
+            find_pattern(&store, "charge", Some("/etc"), false, 0),
+            empty
+        );
+        assert_eq!(
+            find_pattern(&store, "charge", Some("../secrets"), false, 0),
             empty
         );
     }
@@ -20067,7 +22086,7 @@ mod snippet_tests {
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
         // Skip if git is unavailable in the sandbox (grep returns nothing).
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if out.contains("keep.rs") {
             assert!(
                 !out.contains("gen/skip.rs"),
@@ -20249,15 +22268,15 @@ mod snippet_tests {
     fn find_pattern_zero_matches_says_so() {
         let (_dir, store) = file_universe_fixture();
         // Skip if git is unavailable in the sandbox (grep returns nothing).
-        if !find_pattern(&store, "charge", None, false).contains("tracked.rs") {
+        if !find_pattern(&store, "charge", None, false, 0).contains("tracked.rs") {
             return;
         }
-        let out = find_pattern(&store, "zzz_no_such_text_qqq", None, true);
+        let out = find_pattern(&store, "zzz_no_such_text_qqq", None, true, 0);
         assert_eq!(out, "<travsr-data>\n[note: no matches]\n</travsr-data>");
         // The raw body keeps the empty-string contract the multi-repo
         // aggregator and the CLI key on.
         assert_eq!(
-            find_pattern_raw(&store, "zzz_no_such_text_qqq", None, true),
+            find_pattern_raw(&store, "zzz_no_such_text_qqq", None, true, 0),
             ""
         );
     }
@@ -20270,7 +22289,7 @@ mod snippet_tests {
         let db = dir.path().join("graph.db");
         drop(travsr_store::SqliteStore::open(&db).unwrap());
         let repos: HashMap<String, PathBuf> = [("/r".to_string(), db)].into_iter().collect();
-        let out = find_pattern_global(&repos, "a\nb", None, None, false);
+        let out = find_pattern_global(&repos, "a\nb", None, None, false, 0);
         assert_eq!(out, "<travsr-data></travsr-data>");
     }
 
@@ -20326,7 +22345,7 @@ mod snippet_tests {
         // without `--untracked` only ever sees the index, so every not-yet-added
         // file was a guaranteed false negative.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return; // git unavailable in this sandbox — nothing to assert
         }
@@ -20342,7 +22361,7 @@ mod snippet_tests {
         // so a `!` rule puts a gitignored subtree in the graph. git's own file
         // discovery can never reach it, at any flag combination.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return;
         }
@@ -20357,13 +22376,209 @@ mod snippet_tests {
         // The other direction: widening the search must not start returning
         // files the graph does not contain. `ignored/` has no `!` rule.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return;
         }
         assert!(
             !out.contains("ignored/dep.rs"),
             "a gitignored file with no `!` rule is not in the graph and must not appear: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_counts_a_hyphen_prefixed_sibling_path_at_context_zero() {
+        // #1050 regression: at context=0 git emits no `--` separators, so the
+        // group walk never resets between files. A file whose path is a strict
+        // prefix of the next, split by '-' (the classic LICENSE / LICENSE-APACHE
+        // pair, which git sorts in that order), must not be mistaken for an
+        // after-context line of the first and dropped from the match count.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("LICENSE"), "Apache License\n").unwrap();
+        std::fs::write(root.join("LICENSE-APACHE"), "Apache License\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "License", None, false, 0);
+        if !out.contains("LICENSE") {
+            return; // git unavailable in this sandbox
+        }
+        assert!(
+            out.contains("LICENSE-APACHE:1:"),
+            "the sibling file's match line must render as a match, not context: {out}"
+        );
+        assert!(
+            out.contains("2 match(es)"),
+            "both files must be counted; the sibling is not an after-context line: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_context_shows_lines_after_each_match() {
+        // #1050 gap 1: `-A` after-context. A context line is `path-line-text`
+        // (not counted as a match), and non-adjacent groups are split by `--`.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // Two matches, each with a distinct line right after it, a filler line
+        // between the groups so they do not merge.
+        std::fs::write(
+            root.join("f.rs"),
+            "let a = mark();\nAFTER_ONE\nfiller\nlet b = mark();\nAFTER_TWO\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "mark", None, false, 1);
+        if !out.contains("f.rs") {
+            return; // git unavailable in this sandbox — nothing to assert
+        }
+        assert!(
+            out.contains("f.rs-2-AFTER_ONE"),
+            "one line after the first match must show: {out}"
+        );
+        assert!(
+            out.contains("f.rs-5-AFTER_TWO"),
+            "one line after the second match must show: {out}"
+        );
+        assert!(
+            out.contains("2 match(es)"),
+            "context lines must not be counted as matches: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_context_drops_an_excluded_group_without_a_dangling_separator() {
+        // #1050 gap 1 edge: an excluded group (a SKIP_DIR hit) sitting between
+        // two kept groups must not be counted, and its `--` separator must not
+        // survive as a dangling separator in the rendered output.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // One kept file, one excluded (node_modules) file, one kept file — git
+        // emits a `--` on either side of the excluded middle group.
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("a.rs"), "HIT one\nafter_a\n").unwrap();
+        std::fs::write(root.join("node_modules/skip.rs"), "HIT two\nafter_s\n").unwrap();
+        std::fs::write(root.join("z.rs"), "HIT three\nafter_z\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+
+        let out = find_pattern(&store, "HIT", None, false, 1);
+        if !out.contains("a.rs") {
+            return; // git unavailable in this sandbox — nothing to assert
+        }
+        assert!(
+            !out.contains("skip.rs"),
+            "the excluded node_modules group must not be rendered: {out}"
+        );
+        assert!(
+            out.contains("2 match(es)"),
+            "the excluded match must not be counted: {out}"
+        );
+        // Exactly one separator (between the two kept groups), and it is never
+        // the last rendered line.
+        let seps = out.lines().filter(|l| *l == "--").count();
+        assert_eq!(
+            seps, 1,
+            "exactly one `--` between the two kept groups: {out}"
+        );
+        assert!(
+            !out.trim_end().ends_with("--"),
+            "no dangling trailing separator: {out}"
+        );
+    }
+
+    #[test]
+    fn find_pattern_tags_a_match_inside_a_test() {
+        // #1050 gap 2: a hit inside a node the graph classifies as test code is
+        // prefixed `[test]`; a hit outside any test node is not.
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        // mark() at line 1 (production) and line 4 (inside a test fn, lines 3..=5).
+        std::fs::write(
+            root.join("f.rs"),
+            "let a = mark();\nfn x() {}\nfn t() {\n    let b = mark();\n}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "i"]);
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+        store.set_meta("corpus", "c").unwrap();
+        store
+            .put_node(
+                &travsr_core::Node::new(
+                    travsr_core::VName::new("c", "", "f.rs", "rust", "fn:t"),
+                    "function",
+                )
+                .with_line(3)
+                .with_end_line(5)
+                .with_test_role(travsr_core::TestRole::EntryPoint),
+            )
+            .unwrap();
+
+        let out = find_pattern(&store, "mark", None, false, 0);
+        if !out.contains("f.rs") {
+            return; // git unavailable in this sandbox — nothing to assert
+        }
+        assert!(
+            out.contains("[test] f.rs:4:"),
+            "the match inside the test fn must be tagged: {out}"
+        );
+        assert!(
+            !out.contains("[test] f.rs:1:"),
+            "the production match must not be tagged: {out}"
         );
     }
 
@@ -20401,7 +22616,7 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return; // git unavailable in this sandbox
         }
@@ -20443,7 +22658,7 @@ mod snippet_tests {
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
 
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         if !out.contains("tracked.rs") {
             return; // git unavailable in this sandbox
         }
@@ -20463,7 +22678,7 @@ mod snippet_tests {
         // Pass 2 has to honor `scope` the same way git honors a pathspec,
         // otherwise scoping a search would widen it.
         let (_dir, store) = file_universe_fixture();
-        let out = find_pattern(&store, "charge", Some("vendored"), false);
+        let out = find_pattern(&store, "charge", Some("vendored"), false, 0);
         if out.contains("tracked.rs") {
             panic!("scope was not applied at all: {out}");
         }
@@ -20641,7 +22856,7 @@ mod snippet_tests {
             .unwrap();
         // MAX_PATTERN_MATCHES caps the printed list, so assert on the total in
         // the header rather than on the truncated body.
-        let out = find_pattern(&store, "charge", None, false);
+        let out = find_pattern(&store, "charge", None, false, 0);
         assert_eq!(
             extract_match_count(&out),
             N,
@@ -20696,8 +22911,8 @@ mod snippet_tests {
     #[test]
     fn pattern_alternation_never_reduces_match_count() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\nlet beta = 2;\n");
-        let base = find_pattern(&store, "alpha", None, false);
-        let widened = find_pattern(&store, "alpha|zzznonexistent", None, false);
+        let base = find_pattern(&store, "alpha", None, false, 0);
+        let widened = find_pattern(&store, "alpha|zzznonexistent", None, false, 0);
         assert!(
             extract_match_count(&widened) >= extract_match_count(&base),
             "alternation must never reduce match count: base={base:?} widened={widened:?}"
@@ -20707,8 +22922,8 @@ mod snippet_tests {
     #[test]
     fn pattern_capture_group_matches_like_the_bare_literal() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
-        let bare = find_pattern(&store, "alpha", None, false);
-        let grouped = find_pattern(&store, "(alpha)", None, false);
+        let bare = find_pattern(&store, "alpha", None, false, 0);
+        let grouped = find_pattern(&store, "(alpha)", None, false, 0);
         assert_eq!(
             extract_match_count(&bare),
             extract_match_count(&grouped),
@@ -20719,7 +22934,7 @@ mod snippet_tests {
     #[test]
     fn pattern_escaped_paren_finds_call_sites() {
         let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
-        let out = find_pattern(&store, "alpha\\(", None, false);
+        let out = find_pattern(&store, "alpha\\(", None, false, 0);
         assert!(
             out.contains("alpha();"),
             "escaped paren must find the call site: {out}"
@@ -20729,7 +22944,7 @@ mod snippet_tests {
     #[test]
     fn pattern_reports_error_for_uncompilable_pattern() {
         let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
-        let out = find_pattern(&store, "alpha(", None, false);
+        let out = find_pattern(&store, "alpha(", None, false, 0);
         assert!(
             out.contains("pattern error"),
             "an unbalanced group must error, not return empty: {out}"
@@ -20747,7 +22962,7 @@ mod snippet_tests {
     #[test]
     fn pattern_fixed_mode_treats_metachars_literally() {
         let (_dir, store) = pattern_fixture("fix.rs", "alpha();\n");
-        let out = find_pattern(&store, "alpha(", None, true);
+        let out = find_pattern(&store, "alpha(", None, true, 0);
         assert!(
             !out.contains("pattern error"),
             "--fixed must not attempt regex compilation: {out}"
@@ -20762,7 +22977,7 @@ mod snippet_tests {
     #[test]
     fn pattern_allows_percent_in_pattern() {
         let (_dir, store) = pattern_fixture("fix.rs", "let load = 100%;\n");
-        let out = find_pattern(&store, "100%", None, false);
+        let out = find_pattern(&store, "100%", None, false, 0);
         assert_eq!(
             extract_match_count(&out),
             1,
@@ -20776,8 +22991,8 @@ mod snippet_tests {
     fn pattern_still_rejects_nul_and_control_chars() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
         let empty = "<travsr-data></travsr-data>";
-        assert_eq!(find_pattern(&store, "foo\0bar", None, false), empty);
-        assert_eq!(find_pattern(&store, "foo\nbar", None, false), empty);
+        assert_eq!(find_pattern(&store, "foo\0bar", None, false, 0), empty);
+        assert_eq!(find_pattern(&store, "foo\nbar", None, false, 0), empty);
     }
 
     /// #517 DD-7 M1: the relaxed validator applies only to `pattern` — `scope`
@@ -20788,7 +23003,7 @@ mod snippet_tests {
         store.set_meta("repo_root", "/tmp/whatever").unwrap();
         let empty = "<travsr-data></travsr-data>";
         assert_eq!(
-            find_pattern(&store, "100%", Some("../etc"), false),
+            find_pattern(&store, "100%", Some("../etc"), false, 0),
             empty,
             "a percent-containing pattern must not smuggle a traversal scope past validation"
         );
@@ -20812,7 +23027,7 @@ mod snippet_tests {
             "src/../../etc",
         ] {
             assert_eq!(
-                find_pattern(&store, "alpha", Some(scope), false),
+                find_pattern(&store, "alpha", Some(scope), false, 0),
                 empty,
                 "scope {scope:?} must be rejected"
             );
@@ -20827,7 +23042,7 @@ mod snippet_tests {
             // Must not be rejected by the guard (a no-match result is fine —
             // rejection returns the empty envelope before git even runs, and
             // for the existing file the match must actually surface).
-            let out = find_pattern(&store, "alpha", Some(scope), false);
+            let out = find_pattern(&store, "alpha", Some(scope), false, 0);
             if scope == "src" || scope == "src/fix.rs" {
                 assert!(
                     out.contains("alpha"),
@@ -20847,7 +23062,7 @@ mod snippet_tests {
     #[test]
     fn pattern_advises_on_pcre_only_construct() {
         let (_dir, store) = pattern_fixture("fix.rs", "let alpha = 1;\n");
-        let out = find_pattern(&store, "\\dalpha", None, false);
+        let out = find_pattern(&store, "\\dalpha", None, false, 0);
         assert!(
             out.contains("\\d"),
             "advisory must name the unsupported construct: {out}"
@@ -20924,7 +23139,7 @@ mod snippet_tests {
         #[cfg(not(windows))]
         let delim = ":";
         std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling_paths.join(delim));
-        let out = find_pattern_global(&repos, "alpha", None, None, false);
+        let out = find_pattern_global(&repos, "alpha", None, None, false, 0);
         std::env::remove_var("GIT_CEILING_DIRECTORIES");
         assert!(
             out.contains("[repo_bad] pattern error"),

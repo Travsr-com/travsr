@@ -108,6 +108,9 @@ pub fn serve_stdio(db_path: &Path) -> anyhow::Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         tools::set_launch_cwd(cwd);
     }
+    // #1049: fingerprint the binary on disk now, so a later tool call can warn
+    // if this long-lived server is left running after a rebuild.
+    server::record_startup_exe();
     // Inject the embed KNN hook so get_context's semantic seed selection (Step 4)
     // works in standalone `travsr mcp --stdio` mode, not just daemon mode.
     inject_embed_hook(&mut store, db_path);
@@ -126,6 +129,8 @@ pub fn serve_stdio_global() -> anyhow::Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         tools::set_launch_cwd(cwd);
     }
+    // #1049: same rebuilt-under-a-live-server guard as `serve_stdio`.
+    server::record_startup_exe();
     rerank::warm_background();
     server::run_global()
 }

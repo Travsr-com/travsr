@@ -33,7 +33,7 @@ pub mod noise;
 ///       existing `.travsr/graph.db` so the daemon skew check and the
 ///       `travsr status` warning force a full re-index (RFC-014 "Re-index
 ///       Policy").
-///   3 - current: Objective-C method signatures carry the WHOLE selector
+///   3 - Objective-C method signatures carry the WHOLE selector
 ///       (`method:Class.setWidth:height:`) instead of only its leading keyword
 ///       (`method:Class.setWidth`). The old form collapsed every selector
 ///       sharing a first keyword onto one node, so sibling methods lost their
@@ -43,6 +43,14 @@ pub mod noise;
 ///       re-parses files that changed, so an ObjC repo would hold collapsed
 ///       signatures for untouched files and full selectors for the rest, with
 ///       nothing able to tell the halves apart.
+///   4 - current: Phase A now emits enum members as `variant:Enum.Member`
+///       nodes (and Rust union fields as `field:U.f`), landed in #1023 without
+///       a version bump. That is the same shape as the v2 entry: Phase A
+///       captures nodes an older database lacks, and incremental reindex only
+///       re-parses changed files, so a database built before #1023 holds no
+///       variants for any untouched file (`find_references ReindexCommit` found
+///       nothing, #1053) with nothing to tell it apart from a file that truly
+///       has none. Bumping forces the full re-parse that back-fills them.
 ///
 /// The constant does not invalidate anything by itself. It is a marker some code
 /// paths compare against, and only those paths act on a bump:
@@ -63,7 +71,7 @@ pub mod noise;
 /// schema version only, so queries keep answering from the old-format graph: it
 /// is stale, not corrupt, and the write-path refusals above are what stop the
 /// two formats from ever mixing.
-pub const SIGNATURE_FORMAT_VERSION: u8 = 3;
+pub const SIGNATURE_FORMAT_VERSION: u8 = 4;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 

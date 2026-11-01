@@ -45,6 +45,95 @@ pub fn run(store: &mut SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The running binary's on-disk fingerprint when the stdio server started:
+/// absolute path, last-modified time, and byte length. Captured once (#1049) so
+/// a later tool call can notice that `target/release/travsr` was rebuilt
+/// underneath a long-lived `travsr mcp --stdio`, which otherwise keeps serving
+/// the old tool code against the current graph with no signal.
+///
+/// The path string is remembered here, not re-derived from `current_exe()` per
+/// call: after a rebuild renames a fresh binary over this path, `current_exe()`
+/// on Linux resolves `/proc/self/exe` to "<path> (deleted)" for the now-unlinked
+/// image, and `metadata` on that fails. Re-`stat`ing the captured path instead
+/// sees the NEW file that now lives there, which is the comparison we want.
+///
+/// `None` (path or metadata unreadable at startup) disables the check: the
+/// server then never emits a false "stale" note. Never armed on the SSE path,
+/// whose process is replaced on redeploy, so the note is stdio-only.
+static STARTUP_EXE: std::sync::OnceLock<Option<ExeFingerprint>> = std::sync::OnceLock::new();
+
+#[derive(Clone)]
+struct ExeFingerprint {
+    path: PathBuf,
+    mtime: std::time::SystemTime,
+    len: u64,
+}
+
+fn read_exe_fingerprint() -> Option<ExeFingerprint> {
+    let path = std::env::current_exe().ok()?;
+    let md = std::fs::metadata(&path).ok()?;
+    Some(ExeFingerprint {
+        path,
+        mtime: md.modified().ok()?,
+        len: md.len(),
+    })
+}
+
+/// Record the running binary's on-disk fingerprint. Called once from
+/// `serve_stdio` / `serve_stdio_global` before the event loop, so the baseline
+/// is the image the server was launched with, not whatever is on disk by the
+/// time the first tool call arrives.
+pub(crate) fn record_startup_exe() {
+    let _ = STARTUP_EXE.get_or_init(read_exe_fingerprint);
+}
+
+/// Whether an on-disk binary now `(mtime, len)` is a different build than the one
+/// recorded at startup. A newer mtime is the primary signal (a relink always
+/// writes a fresh file, so its timestamp advances); a changed length is a
+/// secondary one that also catches a same-second rebuild.
+fn build_changed(start: (std::time::SystemTime, u64), now: (std::time::SystemTime, u64)) -> bool {
+    now.0 > start.0 || now.1 != start.1
+}
+
+/// The stale-build note, or `None` when the check was never armed (SSE, or a
+/// startup read that failed), the current metadata is unreadable, or the build
+/// is unchanged.
+fn stale_build_note() -> Option<&'static str> {
+    let start = STARTUP_EXE.get()?.as_ref()?;
+    let md = std::fs::metadata(&start.path).ok()?;
+    let now = (md.modified().ok()?, md.len());
+    build_changed((start.mtime, start.len), now).then_some(
+        "[note: this MCP server is running a different build than the travsr binary on disk; \
+         reconnect the MCP server to pick up the build on disk]",
+    )
+}
+
+/// Place the stale-build note (when the binary was rebuilt under this long-lived
+/// server) inside the `<travsr-data>` envelope the tool already produced, on its
+/// own line before the closing tag — the same spot the Phase-B and HEAD-drift
+/// notes sit, so every envelope-aware client already drops it from its result
+/// rows and the envelope stays structurally intact. A tool whose body is raw
+/// JSON for renderers (`get_graph_json`) has no envelope to land in, so it is
+/// left untouched rather than have `JSON.parse` trip on the prose.
+fn with_stale_build_note(text: String) -> String {
+    match stale_build_note() {
+        Some(note) => place_note_in_envelope(text, note),
+        None => text,
+    }
+}
+
+/// Insert `note` on its own line just before the envelope's closing tag. A body
+/// with no `</travsr-data>` suffix (raw JSON from `get_graph_json`) is returned
+/// unchanged so its `JSON.parse` never trips on the prose. Split out from
+/// [`with_stale_build_note`] so the placement is testable without the
+/// process-global startup fingerprint.
+fn place_note_in_envelope(text: String, note: &str) -> String {
+    match text.strip_suffix("</travsr-data>") {
+        Some(head) => format!("{}\n{note}\n</travsr-data>", head.trim_end_matches('\n')),
+        None => text,
+    }
+}
+
 /// Capabilities advertised in the `initialize` response. The `prompts`
 /// capability is only declared when `mcp-sampling` is enabled, so that a
 /// spec-compliant client can discover and call the `prompts/*` endpoints that
@@ -453,7 +542,8 @@ fn handle_tool_call(
             let pattern = args["pattern"].as_str().unwrap_or("");
             let scope = args["scope"].as_str().filter(|s| !s.is_empty());
             let fixed = args["fixed"].as_bool().unwrap_or(false);
-            tools::find_pattern(store, pattern, scope, fixed)
+            let context = args["context"].as_u64().unwrap_or(0) as u32;
+            tools::find_pattern(store, pattern, scope, fixed, context)
         }
         "get_architecture_brief" => {
             let provenance = args["provenance"].as_str().unwrap_or("ratified");
@@ -534,7 +624,8 @@ fn handle_tool_call(
                 .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
                 as usize;
             let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
-            tools::get_snippets(store, symbols, token_budget, mode)
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::get_snippets(store, symbols, token_budget, mode, path)
         }
         // #636: read-only observability tools.
         "get_daemon_logs" => {
@@ -562,7 +653,7 @@ fn handle_tool_call(
     );
     ok_response(
         id,
-        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+        serde_json::json!({ "content": [{ "type": "text", "text": with_stale_build_note(text) }] }),
     )
 }
 
@@ -617,13 +708,14 @@ pub fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Textual search (git grep) over the repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>).",
+                "description": "Textual search (git grep) over the repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or to files-importing(<symbol>). A match inside test code is prefixed `[test]`. Set `context` to also show that many lines after each match.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "POSIX ERE pattern to search for (use fixed:true for a literal string)" },
                         "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
-                        "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" }
+                        "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" },
+                        "context": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Lines of source to show after each match (git grep -A), capped at 10. Default 0." }
                     },
                     "required": ["pattern"],
                     "additionalProperties": false
@@ -887,6 +979,10 @@ pub fn tools_list() -> serde_json::Value {
                             "enum": ["auto", "full", "skeleton"],
                             "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else a condensed structural outline. 'full': complete definition, no line cap. 'skeleton': structural outline only (signatures, no bodies)."
                         },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected. With a single bare name the hint hard-scopes (as in find_references); with several, it is a per-name filter, so a name absent under the hint keeps its matches from elsewhere and the result notes that the hint was skipped for it."
+                        },
                         "repo": {
                             "type": "string",
                             "description": "Restrict to a specific registered repo by name (global / multi-repo mode only)."
@@ -1081,6 +1177,7 @@ fn handle_tool_call_global(
             args["scope"].as_str().filter(|s| !s.is_empty()),
             repo_arg,
             args["fixed"].as_bool().unwrap_or(false),
+            args["context"].as_u64().unwrap_or(0) as u32,
         ),
         "get_blast_radius" => {
             let mode = match args["analysis"].as_str().unwrap_or("tree-sitter") {
@@ -1182,7 +1279,8 @@ fn handle_tool_call_global(
                 .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
                 as usize;
             let mode = tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto"));
-            tools::get_snippets_global(repos, symbols, token_budget, repo_arg, mode)
+            let path = args["path"].as_str().filter(|s| !s.is_empty());
+            tools::get_snippets_global(repos, symbols, token_budget, repo_arg, mode, path)
         }
         "synonym_add"
         | "synonym_set"
@@ -1232,7 +1330,7 @@ fn handle_tool_call_global(
     );
     ok_response(
         id,
-        serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+        serde_json::json!({ "content": [{ "type": "text", "text": with_stale_build_note(text) }] }),
     )
 }
 
@@ -1294,13 +1392,14 @@ pub fn tools_list_global() -> serde_json::Value {
             },
             {
                 "name": "find_pattern",
-                "description": "Textual search (git grep) over each repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). Supply `repo` to scope; omit only to search across all repos.",
+                "description": "Textual search (git grep) over each repo's tracked and untracked text files, returning path:line:col: text. Not limited to the files the graph indexes: any file git shows as text can match, with known-binary formats and ignored paths removed. Pattern is a POSIX extended regular expression (ERE); set `fixed: true` for a literal search. Optionally scope to a path prefix or files-importing(<symbol>). A match inside test code is prefixed `[test]`. Set `context` to also show that many lines after each match. Supply `repo` to scope; omit only to search across all repos.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "POSIX ERE pattern to search for (use fixed:true for a literal string)" },
                         "scope": { "type": "string", "description": "Optional scope: a repo-relative path prefix, or files-importing(<symbol>)" },
                         "fixed": { "type": "boolean", "description": "Treat pattern as a literal string instead of a regular expression" },
+                        "context": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Lines of source to show after each match (git grep -A), capped at 10. Default 0." },
                         "repo": { "type": "string", "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos." }
                     },
                     "required": ["pattern"],
@@ -1439,6 +1538,10 @@ pub fn tools_list_global() -> serde_json::Value {
                             "enum": ["auto", "full", "skeleton"],
                             "description": "Representation per symbol. 'auto' (default): raw body if within the kind line-cap, else a condensed structural outline. 'full': complete definition, no line cap. 'skeleton': structural outline only (signatures, no bodies)."
                         },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional path hint to scope an overloaded bare name to a file or directory: a filename, a relative path, a directory prefix, or a path fragment (e.g. rerank.rs, src/rerank.rs, crates/travsr-mcp, retrieval). Applies to bare-name symbols; names already pinned by full header or path:line are unaffected. With a single bare name the hint hard-scopes (as in find_references); with several, it is a per-name filter, so a name absent under the hint keeps its matches from elsewhere and the result notes that the hint was skipped for it."
+                        },
                         "repo": {
                             "type": "string",
                             "description": "Repo name (run repos_list to discover). Always supply to avoid cross-repo noise; omit only when explicitly querying across all repos."
@@ -1536,6 +1639,40 @@ fn handle_prompts_get(id: serde_json::Value, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1049: the rebuilt-binary comparator. A newer mtime or a changed length
+    /// is "rebuilt"; an unchanged file, or an older on-disk mtime (clock skew)
+    /// at the same length, is not.
+    #[test]
+    fn build_changed_flags_a_newer_or_resized_binary() {
+        let t0 = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert!(!build_changed((t0, 100), (t0, 100)), "unchanged");
+        assert!(build_changed((t0, 100), (t1, 100)), "later mtime");
+        assert!(build_changed((t0, 100), (t0, 120)), "same-second, resized");
+        assert!(
+            !build_changed((t1, 100), (t0, 100)),
+            "older on disk, same len"
+        );
+    }
+
+    /// The note lands inside the envelope, on its own line before the close, so
+    /// the envelope stays intact; a raw-JSON body (no envelope) is left alone.
+    #[test]
+    fn stale_note_placement_preserves_the_envelope_and_skips_json() {
+        let note = "[note: stale]";
+        let place = |t: &str| place_note_in_envelope(t.to_string(), note);
+        assert_eq!(
+            place("<travsr-data>\nrow\n</travsr-data>"),
+            "<travsr-data>\nrow\n[note: stale]\n</travsr-data>"
+        );
+        assert_eq!(
+            place("<travsr-data></travsr-data>"),
+            "<travsr-data>\n[note: stale]\n</travsr-data>"
+        );
+        // get_graph_json returns raw JSON, which has no envelope to land in.
+        assert_eq!(place("{\"nodes\":[]}"), "{\"nodes\":[]}");
+    }
 
     const ALL_TOOLS: &[&str] = &[
         "get_dependencies",

@@ -2077,6 +2077,37 @@ impl SqliteStore {
         .map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    /// #1050: whether `line` at `path` falls inside a node classified as test
+    /// code (`test_role != None`) in `corpus`. A textual `find_pattern` hit uses
+    /// this to tag a match `[test]` so a line inside `mod tests` or a `#[test]`
+    /// function is not cited as production code.
+    ///
+    /// True when ANY node whose span `[line, end_line]` contains `line` is a
+    /// test — a match inside a test function is covered by both the function
+    /// (`EntryPoint`) and the enclosing test module (`Support`), and either one
+    /// is enough. Scoped to one `corpus` because the store can hold several
+    /// (dependency graphs) that share repo-relative paths. Uses the
+    /// `idx_nodes_corpus_path` index.
+    pub fn line_in_test(&self, corpus: &str, path: &str, line: u32) -> Result<bool, StoreError> {
+        (|| -> AnyResult<bool> {
+            let hit: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM nodes \
+                     WHERE corpus = ?1 AND path = ?2 \
+                       AND line IS NOT NULL AND end_line IS NOT NULL \
+                       AND line <= ?3 AND end_line >= ?3 \
+                       AND test_role != 0 LIMIT 1",
+                    params![corpus, path, line as i64],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("line_in_test: query")?;
+            Ok(hit.is_some())
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
     /// #478: word-segmented `(sig_words, path_words)` currently indexed for `id`
     /// (`nodes_fts_words_map`). `None` when absent. Test/diagnostic accessor.
     pub fn fts_words_entry(&self, id: NodeId) -> Result<Option<(String, String)>, StoreError> {
@@ -4316,6 +4347,21 @@ impl SqliteStore {
       WHEN signature = ?1 THEN 0
       WHEN kind = 'file' AND path = ?1 THEN 0
       WHEN signature LIKE ?1 || ':%' OR signature LIKE '%:' || ?1 OR signature LIKE '%:' || ?1 || ':%' THEN 10
+      -- #1052: a member-qualified signature (`variant:Enum.Member`,
+      -- `method:Class.m`, scip `Type#member`) is a genuine name match on its
+      -- trailing `.Member`/`#member`, just like the `:`-scoped case above. Rank
+      -- it above ELSE 40 so it is not buried under unrelated path-substring hits
+      -- and truncated away by the LIMIT before the caller's name filter runs.
+      -- #1076: rank it 11, one below the `:`-scoped tier, NOT a tie at 10: a
+      -- flood of member homonyms (`method:X.id`) past the LIMIT would otherwise
+      -- break the `path ASC` tie against a genuine `:`-scoped definition and
+      -- push it out of the window. 11 keeps the member-leaf above the 20/40
+      -- flood tiers (the #1052 win) while the `:`-scoped match always sorts first.
+      -- The leaf term here is `?2`: `?1` pre-escaped for LIKE and paired with
+      -- `ESCAPE '\\'`, so a `_`/`%` in a snake_case name (`get_context`) matches
+      -- literally and does not wildcard junk (`get1context`) into this protected
+      -- tier (parity with the `exact_leaf_name_count` member-leaf count).
+      WHEN signature LIKE '%.' || ?2 ESCAPE '\\' OR signature LIKE '%#' || ?2 ESCAPE '\\' THEN 11
       WHEN signature LIKE ?1 || '%' THEN 20
       WHEN path = ?1 THEN 5
       WHEN path LIKE '%/' || ?1 THEN 15
@@ -4362,6 +4408,15 @@ FROM nodes";
 
     /// Exact/word-boundary/prefix match: drops the loose `ELSE 40` substring
     /// tier so short, common names don't drag in unrelated symbols (#453).
+    ///
+    /// Deliberately does NOT treat `.`/`#` as boundaries. This is Leg A, the
+    /// precision anchor of the seed pipeline (`search_nodes_by_name_exact` ->
+    /// `fused_search_scored`), and a bare member leaf (`new`, `id`) must not
+    /// pull in every `method:X.new` / scip `Type#member` homonym in the corpus.
+    /// The #1052 member-qualified findability (`variant:Enum.Member`) is served
+    /// by the substring leg plus the rank-10 member branch in
+    /// `NAME_SEARCH_SELECT`, which `resolve_symbol_nodes` (get_snippets /
+    /// find_references / search_symbol) routes through; it never reaches here.
     const NAME_MATCH_BOUNDARY: &'static str = "(signature = ?1
    OR signature LIKE ?1 || ':%'
    OR signature LIKE '%:' || ?1
@@ -4409,6 +4464,22 @@ FROM nodes";
         name: &str,
         lang: Option<&str>,
     ) -> Result<Vec<Node>, StoreError> {
+        // `?2` is `name` with LIKE metacharacters escaped, bound for the
+        // member-leaf rank branch's `ESCAPE '\'` clauses in NAME_SEARCH_SELECT so
+        // a `_`/`%` in a snake_case name matches literally, not as a wildcard
+        // (parity with `exact_leaf_name_count`). `\` itself is escaped first. The
+        // other LIKE/equality branches keep the raw `?1`.
+        fn escape_like(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if matches!(c, '\\' | '%' | '_') {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            out
+        }
+        let escaped = escape_like(name);
         (|| -> AnyResult<Vec<Node>> {
             let mut sql =
                 String::with_capacity(Self::NAME_SEARCH_SELECT.len() + match_clause.len() + 96);
@@ -4417,7 +4488,9 @@ FROM nodes";
             sql.push_str(match_clause);
             sql.push_str("\n  AND kind != 'doc-chunk'");
             if lang.is_some() {
-                sql.push_str("\n  AND language = ?2");
+                // `?2` is the escaped leaf term (always bound); the language
+                // filter is `?3`.
+                sql.push_str("\n  AND language = ?3");
             }
             // Ties break on the name, not the NodeId: the id hashes the corpus
             // (the checkout's directory), so id order changed with it.
@@ -4427,8 +4500,8 @@ FROM nodes";
 
             let mut stmt = self.conn.prepare(&sql).context("preparing search query")?;
             let rows = match lang {
-                Some(l) => stmt.query_map(params![name, l], Self::map_search_row),
-                None => stmt.query_map(params![name], Self::map_search_row),
+                Some(l) => stmt.query_map(params![name, escaped, l], Self::map_search_row),
+                None => stmt.query_map(params![name, escaped], Self::map_search_row),
             }
             .context("executing search query")?;
 
@@ -4828,24 +4901,44 @@ LIMIT ?4",
     /// src_path is the path of the node making the import (any kind: file, function, etc.).
     /// dst_path is the path of the resolved target file.
     /// Used by the graph-overview aggregation to compute cross-package edges.
-    pub fn file_import_pairs(&self) -> Result<Vec<(String, String)>, StoreError> {
+    ///
+    /// `provenance` filters with the same grammar as [`resolved_dep_pairs`]: `""`
+    /// returns everything, `"ratified"` drops `live` overlay edges, and any other
+    /// value is matched exactly on both the `depends` and `resolves-to` edge.
+    pub fn file_import_pairs(&self, provenance: &str) -> Result<Vec<(String, String)>, StoreError> {
         (|| -> AnyResult<Vec<(String, String)>> {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT n1.path, n2.path
+            // Built as SQL rather than a bound parameter because the shape of the
+            // predicate differs per mode, not just its value. `provenance` is
+            // never interpolated: the exact-match arm binds it.
+            let (pred_e1, pred_e2, bind_exact) = match provenance {
+                "" => ("", "", false),
+                "ratified" => (
+                    " AND e1.provenance <> 'live'",
+                    " AND e2.provenance <> 'live'",
+                    false,
+                ),
+                _ => (" AND e1.provenance = ?1", " AND e2.provenance = ?1", true),
+            };
+            let sql = format!(
+                "SELECT n1.path, n2.path
                      FROM edges e1
                      JOIN nodes n1 ON n1.id = e1.src
                      JOIN edges e2 ON e2.src = e1.dst AND e2.kind = 'resolves-to'
                      JOIN nodes n2 ON n2.id = e2.dst AND n2.kind = 'file'
-                     WHERE e1.kind = 'depends'",
-                )
+                     WHERE e1.kind = 'depends'{pred_e1}{pred_e2}"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
                 .context("preparing file_import_pairs query")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .context("executing file_import_pairs query")?;
+            let map_row =
+                |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            let rows = if bind_exact {
+                stmt.query_map([provenance], map_row)
+            } else {
+                stmt.query_map([], map_row)
+            }
+            .context("executing file_import_pairs query")?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding file_import_pairs row")?);
@@ -4934,6 +5027,79 @@ LIMIT ?4",
             let mut out = Vec::new();
             for row in rows {
                 out.push(row.context("decoding resolved_dep_pairs row")?);
+            }
+            Ok(out)
+        })()
+        .map_err(|e| StoreError::Database(e.to_string()))
+    }
+
+    /// Cross-component dependencies **declared in a package manifest**, as
+    /// `(consumer_manifest_path, provider_manifest_path)` pairs.
+    ///
+    /// Phase A already records a manifest dependency as
+    /// `consumer_manifest --external-dependency--> pkg:<name>@<ver>`, and a local
+    /// package records `provider_manifest(crate:<name>) --resolves-to-->
+    /// pkg:<name>@<ver>` into the *same* package-identity node (see
+    /// `data_format::cargo_package_node`). Joining the two on that shared node
+    /// resolves a declared dependency to the local package that provides it,
+    /// without any per-language logic here.
+    ///
+    /// Only dependencies that resolve to a LOCAL provider are returned: a
+    /// third-party package's `crate:` node carries an empty path, so
+    /// `n_prov.path <> ''` drops it. This is the manifest counterpart to
+    /// [`resolved_dep_pairs`], which sees only code-resolved edges and therefore
+    /// misses a crate that is declared but used only through imports,
+    /// `pub use` re-exports or type-position mentions.
+    ///
+    /// `provenance` filters with the same grammar as [`resolved_dep_pairs`]: both
+    /// the `external-dependency` and the `resolves-to` edge behind a pair must
+    /// pass, so a caller asking for one provenance is never handed a pair that
+    /// rests on another. An unrecognised value matches nothing.
+    pub fn declared_dep_pairs(
+        &self,
+        provenance: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        (|| -> AnyResult<Vec<(String, String)>> {
+            let (pred_dep, pred_res, bind_exact) = match provenance {
+                "" => ("", "", false),
+                "ratified" => (
+                    " AND e_dep.provenance <> 'live'",
+                    " AND e_res.provenance <> 'live'",
+                    false,
+                ),
+                _ => (
+                    " AND e_dep.provenance = ?1",
+                    " AND e_res.provenance = ?1",
+                    true,
+                ),
+            };
+            let sql = format!(
+                "SELECT DISTINCT n_con.path AS src, n_prov.path AS dst
+                     FROM edges e_dep
+                     JOIN nodes n_con ON n_con.id = e_dep.src
+                     JOIN edges e_res
+                         ON e_res.dst = e_dep.dst AND e_res.kind = 'resolves-to'
+                     JOIN nodes n_prov ON n_prov.id = e_res.src
+                     WHERE e_dep.kind = 'external-dependency'
+                       AND n_prov.signature LIKE 'crate:%'
+                       AND n_con.path <> '' AND n_prov.path <> ''
+                       AND n_con.path <> n_prov.path{pred_dep}{pred_res}"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .context("preparing declared_dep_pairs query")?;
+            let map_row =
+                |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+            let rows = if bind_exact {
+                stmt.query_map([provenance], map_row)
+            } else {
+                stmt.query_map([], map_row)
+            }
+            .context("executing declared_dep_pairs query")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding declared_dep_pairs row")?);
             }
             Ok(out)
         })()
@@ -9621,18 +9787,20 @@ impl SqliteStore {
     /// #778: how many definition nodes are named *exactly* `token` — i.e.
     /// `token` is the leaf of their `kind:Qualified.leaf` signature
     /// (`class:UI` -> `UI`, `method:Widget.id` -> `id`), case-insensitively.
-    /// This matches the exact leg's raw-score-1.0 name semantics
-    /// (`search_nodes_by_name_exact`), so it is the same scale the anchor path
-    /// treats as an exact match — unlike a substring or a segment count.
+    /// This is a NAME count, not a substring or segment count: it mirrors how
+    /// the search legs treat a name — the rank-10 member branch in
+    /// `NAME_SEARCH_SELECT` scores a `.leaf`/`#leaf` hit as a real name match on
+    /// the substring/word legs that `symbol_frequency` grounds.
     ///
     /// The distinction that matters for the [`Self::symbol_frequency`] fallback:
-    /// `NAME_MATCH_BOUNDARY`'s unqualified tail forms cannot see a qualified
-    /// member (`method:Widget.id` is invisible to a bare-`id` boundary match)
-    /// yet its prefix form over-counts (`id%` catches `Identifier`), so it both
-    /// fabricates rarity for a common member name and inflates a unique one.
-    /// The two leaf clauses below (`'%:' || tok` for an unqualified body,
-    /// `'%.' || tok` for a qualified leaf) count exactly the nodes whose own
-    /// name is the token, and nothing else.
+    /// a prefix form (`id%` catches `Identifier`) would over-count and inflate a
+    /// unique name's frequency, so it is excluded. The three leaf clauses below
+    /// (`'%:' || tok` for an unqualified body, `'%.' || tok` for a qualified
+    /// leaf, `'%#' || tok` for a scip `Type#member` leaf) count exactly the
+    /// nodes whose own name is the token, and nothing else. Counting the
+    /// qualified / scip leaves keeps a common member (`id`, `new`) from reading
+    /// as rare (#1052): under-counting floored IDF to specific and wrongly
+    /// anchored seed selection on it.
     ///
     /// Bounded by [`Self::LEAF_NAME_COUNT_CAP`]: only the rare/generic
     /// distinction (via the resulting IDF band) is used downstream, so the true
@@ -9663,12 +9831,16 @@ impl SqliteStore {
         }
         let escaped = escape_like(token);
         // `'%:' || ?1` matches an unqualified body (`class:UI`); `'%.' || ?1` a
-        // qualified leaf (`method:Widget.id`). Wrapped in a `LIMIT`-ed subquery
-        // so the scan stops after the cap is reached.
+        // qualified leaf (`method:Widget.id`); `'%#' || ?1` a scip `Type#member`
+        // leaf — the three member-leaf forms the rank CASE scores as a name
+        // match, so this frequency count stays on the same name scale.
+        // Wrapped in a `LIMIT`-ed subquery so the scan stops after the cap is
+        // reached.
         let sql = "SELECT count(*) FROM (\
                      SELECT 1 FROM nodes \
                      WHERE (signature LIKE '%:' || ?1 ESCAPE '\\' \
-                         OR signature LIKE '%.' || ?1 ESCAPE '\\') \
+                         OR signature LIKE '%.' || ?1 ESCAPE '\\' \
+                         OR signature LIKE '%#' || ?1 ESCAPE '\\') \
                        AND kind != 'doc-chunk' \
                      LIMIT ?2)";
         let n: i64 = self
@@ -11035,6 +11207,46 @@ mod tests {
             None,
             "deriving a root from any database location invents a confident \
              wrong answer, which is worse than none"
+        );
+    }
+
+    #[test]
+    fn line_in_test_reports_a_span_containing_a_test_node() {
+        // #1050: find_pattern tags a hit `[test]` from this. A line is "in a
+        // test" when ANY node whose [line, end_line] span contains it is test
+        // code — the match need not land on the test's own declaration line.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let test_fn = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:it_works"),
+            "function",
+        )
+        .with_line(10)
+        .with_end_line(20)
+        .with_test_role(travsr_core::TestRole::EntryPoint);
+        let prod_fn = Node::new(
+            VName::new("c", "", "src/lib.rs", "rust", "fn:charge"),
+            "function",
+        )
+        .with_line(30)
+        .with_end_line(40);
+        store.put_node(&test_fn).unwrap();
+        store.put_node(&prod_fn).unwrap();
+
+        assert!(
+            store.line_in_test("c", "src/lib.rs", 15).unwrap(),
+            "a line inside the test fn's body is in a test"
+        );
+        assert!(
+            !store.line_in_test("c", "src/lib.rs", 35).unwrap(),
+            "a line inside the production fn is not in a test"
+        );
+        assert!(
+            !store.line_in_test("c", "src/lib.rs", 100).unwrap(),
+            "a line inside no node is not in a test"
+        );
+        assert!(
+            !store.line_in_test("other", "src/lib.rs", 15).unwrap(),
+            "the same path in another corpus must not match"
         );
     }
 
@@ -15523,6 +15735,157 @@ mod tests {
         assert_eq!(results[0].vname.signature, "fn:charge");
     }
 
+    /// #1052 Repro C: a member-qualified name (`variant:Enum.Member`) is a real
+    /// name match on its trailing `.Member`, and must survive the search cap
+    /// even when hundreds of unrelated nodes match only because their *path*
+    /// contains the query as a substring (the `travsr-mcp` crate vs. the `Mcp`
+    /// variant). Before the rank fix the variant sat at ELSE-40 and was
+    /// truncated away by the LIMIT behind the path-substring flood.
+    #[test]
+    fn member_qualified_name_outranks_path_substring_flood() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // The variant, on a path that sorts AFTER the flood so only its rank can
+        // keep it in the window.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "zzz/cli/main.rs", "rust", "variant:Command.Mcp"),
+                "variant",
+            ))
+            .unwrap();
+        // Flood: more than the cap, each matching only via `path LIKE '%mcp%'`,
+        // on paths that sort before the variant's.
+        for i in 0..(NODE_NAME_SEARCH_LIMIT + 20) {
+            store
+                .put_node(&node_with_path(
+                    &format!("aaa/mcp/f{i}.rs"),
+                    &format!("fn:noise{i}"),
+                ))
+                .unwrap();
+        }
+        let hits = store.search_nodes_by_name("Mcp").unwrap();
+        assert!(
+            hits.iter()
+                .any(|n| n.vname.signature == "variant:Command.Mcp"),
+            "member-qualified variant was buried behind the path-substring flood"
+        );
+    }
+
+    /// #1076: the member-leaf tier (rank 11) sorts below the `:`-scoped tier
+    /// (rank 10), so a flood of same-kind member homonyms past the LIMIT can
+    /// never break the `path ASC` tie against a genuine `:`-scoped definition and
+    /// push it out of the window. This is the #1052 flood bug re-created for
+    /// `:`-scoped names if the two tiers were left tied at 10.
+    #[test]
+    fn scoped_name_survives_member_leaf_flood() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        // The `:`-scoped definition (`fn:id` -> `%:id`, rank 10), on a path that
+        // sorts AFTER the flood so only its rank can keep it in the window.
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "zzz/defs.rs", "rust", "fn:id"),
+                "function",
+            ))
+            .unwrap();
+        // Flood of member homonyms (`method:Widget{i}.id` -> `%.id`, rank 11),
+        // same function/method kind penalty (0), on paths that sort before the
+        // definition's: only the base-rank gap keeps `fn:id` in the window.
+        for i in 0..(NODE_NAME_SEARCH_LIMIT + 20) {
+            store
+                .put_node(&Node::new(
+                    VName::new(
+                        "",
+                        "",
+                        format!("aaa/widget_{i}.rs"),
+                        "rust",
+                        format!("method:Widget{i}.id"),
+                    ),
+                    "method",
+                ))
+                .unwrap();
+        }
+        let hits = store.search_nodes_by_name("id").unwrap();
+        assert!(
+            hits.iter().any(|n| n.vname.signature == "fn:id"),
+            "`:`-scoped definition was buried behind the member-leaf flood"
+        );
+    }
+
+    #[test]
+    fn member_leaf_rank_matches_underscore_name_literally_not_as_wildcard() {
+        // #1076: the member-leaf rank branch binds the leaf term pre-escaped and
+        // paired with `ESCAPE '\'`, so a `_` in a snake_case name matches
+        // literally. Querying `get_context` must rank the genuine
+        // `method:Svc.get_context` leaf in the member tier (11) while an impostor
+        // `method:Svc.getXcontext` (a member-tier hit only if `_` is treated as a
+        // single-char wildcard) stays in the ELSE tier (40) and sorts after it.
+        // Both are admitted by the loose substring WHERE filter, so this asserts
+        // ranking, not membership; with an unescaped `_` both would rank 11 and
+        // the impostor (`X` < `_` on the signature tiebreak) would sort ahead.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "svc.rs", "rust", "method:Svc.get_context"),
+                "method",
+            ))
+            .unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "svc.rs", "rust", "method:Svc.getXcontext"),
+                "method",
+            ))
+            .unwrap();
+
+        let hits = store.search_nodes_by_name("get_context").unwrap();
+        let genuine = hits
+            .iter()
+            .position(|n| n.vname.signature == "method:Svc.get_context")
+            .expect("genuine `.get_context` leaf must match");
+        let impostor = hits
+            .iter()
+            .position(|n| n.vname.signature == "method:Svc.getXcontext");
+        assert!(
+            impostor.map_or(true, |imp| genuine < imp),
+            "underscore leaf must outrank the wildcard impostor: {hits:?}"
+        );
+    }
+
+    /// #1052: the exact/word-boundary leg (`search_nodes_by_name_exact`, Leg A
+    /// of the seed pipeline) is the precision anchor and must NOT widen to
+    /// member leaves: a bare member name stays matched only through the
+    /// substring leg + rank CASE, not here, so Leg A can't flood with
+    /// `method:X.m` / scip `Type#member` homonyms of a common leaf.
+    #[test]
+    fn exact_search_does_not_match_member_leaf() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .put_node(&Node::new(
+                VName::new("", "", "cli/main.rs", "rust", "variant:Command.Mcp"),
+                "variant",
+            ))
+            .unwrap();
+        // Bare member leaf: only the substring leg should surface the variant.
+        let exact = store.search_nodes_by_name_exact("Mcp").unwrap();
+        assert!(
+            !exact
+                .iter()
+                .any(|n| n.vname.signature == "variant:Command.Mcp"),
+            "exact leg must not match a member leaf: {:?}",
+            exact.iter().map(|n| &n.vname.signature).collect::<Vec<_>>()
+        );
+        // The `:`-scoped exact form still resolves on the exact leg.
+        let scoped = store.search_nodes_by_name_exact("Command.Mcp").unwrap();
+        assert!(
+            scoped
+                .iter()
+                .any(|n| n.vname.signature == "variant:Command.Mcp"),
+            "exact leg lost the `:`-scoped qualified form: {:?}",
+            scoped
+                .iter()
+                .map(|n| &n.vname.signature)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Equal-rank matches must not be ordered by NodeId: it hashes the corpus,
     /// which is the checkout's directory name (`local/<dir>`), so the same code
     /// picked a different anchor for a tie in another directory (bench hit@1
@@ -17422,7 +17785,7 @@ mod tests {
     #[test]
     fn file_import_pairs_empty_store_returns_empty() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert!(store.file_import_pairs().unwrap().is_empty());
+        assert!(store.file_import_pairs("").unwrap().is_empty());
     }
 
     #[test]
@@ -17442,7 +17805,7 @@ mod tests {
         store
             .put_edge(&Edge::new(src.id, imp.id, EdgeKind::Depends))
             .unwrap();
-        assert!(store.file_import_pairs().unwrap().is_empty());
+        assert!(store.file_import_pairs("").unwrap().is_empty());
     }
 
     #[test]
@@ -17470,10 +17833,67 @@ mod tests {
         store
             .put_edge(&Edge::new(imp.id, dst.id, EdgeKind::ResolvesTo))
             .unwrap();
-        let pairs = store.file_import_pairs().unwrap();
+        let pairs = store.file_import_pairs("").unwrap();
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "pkg/a/mod.ts");
         assert_eq!(pairs[0].1, "test/b/util.ts");
+    }
+
+    #[test]
+    fn file_import_pairs_honours_the_provenance_filter() {
+        // Same contract as resolved_dep_pairs: an un-ratified live import chain
+        // must not be handed to a caller that asked for ratified ground truth.
+        // Provenance is set by the write method; a whole chain is ratified only
+        // when both its edges are.
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mk = |path: &str, sig: &str, kind: &str| {
+            Node::new(VName::new("", "", path, "typescript", sig), kind)
+        };
+        // Ratified chain: r_src --Depends--> r_imp --ResolvesTo--> r_dst
+        let r_src = mk("a/mod.ts", "a/mod.ts", "file");
+        let r_imp = mk("lib/x.ts", "import:x", "import");
+        let r_dst = mk("lib/x.ts", "lib/x.ts", "file");
+        // Live chain: l_src --Depends--> l_imp --ResolvesTo--> l_dst
+        let l_src = mk("a/mod2.ts", "a/mod2.ts", "file");
+        let l_imp = mk("lib/y.ts", "import:y", "import");
+        let l_dst = mk("lib/y.ts", "lib/y.ts", "file");
+        for n in [&r_src, &r_imp, &r_dst, &l_src, &l_imp, &l_dst] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(r_src.id, r_imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(r_imp.id, r_dst.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        store
+            .put_edge_live(&Edge::new(l_src.id, l_imp.id, EdgeKind::Depends))
+            .unwrap();
+        store
+            .put_edge_live(&Edge::new(l_imp.id, l_dst.id, EdgeKind::ResolvesTo))
+            .unwrap();
+
+        let all = store.file_import_pairs("").unwrap();
+        assert_eq!(all.len(), 2, "empty filter accepts every chain: {all:?}");
+
+        let ratified = store.file_import_pairs("ratified").unwrap();
+        assert_eq!(
+            ratified,
+            vec![("a/mod.ts".to_string(), "lib/x.ts".to_string())],
+            "`ratified` must drop the live import chain"
+        );
+
+        let live = store.file_import_pairs("live").unwrap();
+        assert_eq!(
+            live,
+            vec![("a/mod2.ts".to_string(), "lib/y.ts".to_string())],
+            "an exact provenance names one kind"
+        );
+
+        assert!(
+            store.file_import_pairs("ratifed").unwrap().is_empty(),
+            "unknown filter must match nothing"
+        );
     }
 
     // ── resolved_dep_pairs ────────────────────────────────────────────────────
@@ -17587,6 +18007,88 @@ mod tests {
         assert!(
             typo.is_empty(),
             "unknown filter must match nothing: {typo:?}"
+        );
+    }
+
+    #[test]
+    fn declared_dep_pairs_resolves_manifest_deps_to_local_providers() {
+        // A manifest dependency is `consumer_manifest --external-dependency-->
+        // pkg:<name>` and a local provider is `provider_manifest(crate:<name>)
+        // --resolves-to--> pkg:<name>`, both pointing at the same package node.
+        // The join must pair consumer with provider, and must NOT pair a
+        // third-party dependency (whose provider node carries no path).
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let con = Node::new(
+            VName::new("", "", "crates/x/Cargo.toml", "toml", "crate:x"),
+            "package",
+        );
+        // Shared package-identity node both edges point at.
+        let pkg_y = Node::new(
+            VName::new("crates.io", "", "", "toml", "pkg:y@*"),
+            "package",
+        );
+        let prov_y = Node::new(
+            VName::new("", "", "crates/y/Cargo.toml", "toml", "crate:y"),
+            "package",
+        );
+        // A third-party dependency: its provider node has no path, so it is not
+        // a local component and must be dropped.
+        let pkg_serde = Node::new(
+            VName::new("crates.io", "", "", "toml", "pkg:serde@1"),
+            "package",
+        );
+        let prov_serde = Node::new(
+            VName::new("crates.io", "", "", "toml", "crate:serde"),
+            "package",
+        );
+        for n in [&con, &pkg_y, &prov_y, &pkg_serde, &prov_serde] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(con.id, pkg_y.id, EdgeKind::ExternalDependency))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(prov_y.id, pkg_y.id, EdgeKind::ResolvesTo))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                con.id,
+                pkg_serde.id,
+                EdgeKind::ExternalDependency,
+            ))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(
+                prov_serde.id,
+                pkg_serde.id,
+                EdgeKind::ResolvesTo,
+            ))
+            .unwrap();
+
+        let pairs = store.declared_dep_pairs("").unwrap();
+        assert_eq!(
+            pairs,
+            vec![(
+                "crates/x/Cargo.toml".to_string(),
+                "crates/y/Cargo.toml".to_string()
+            )],
+            "must pair consumer with its local provider and drop third-party deps"
+        );
+
+        // Manifest edges are tree-sitter provenance, so `ratified` (non-live)
+        // keeps them and an unrecognised filter matches nothing.
+        assert_eq!(
+            store.declared_dep_pairs("ratified").unwrap().len(),
+            1,
+            "ratified must keep the non-live manifest edge"
+        );
+        assert!(
+            store.declared_dep_pairs("live").unwrap().is_empty(),
+            "a live-only filter must drop the tree-sitter manifest edge"
+        );
+        assert!(
+            store.declared_dep_pairs("ratifed").unwrap().is_empty(),
+            "an unknown filter must match nothing"
         );
     }
 
