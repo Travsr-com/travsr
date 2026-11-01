@@ -1,13 +1,13 @@
-//! The Terminal page's two commands, `travsr ask` and `travsr graph`, run
+//! The Terminal page's read-only CLI commands ([`TERMINAL_COMMANDS`]), run
 //! exactly as typed in a shell so the page shows the CLI's own output.
 //!
-//! Only those two, and only the read-only options of each. The page never
+//! Only those, and only the read-only options of each. The page never
 //! sends an argv: it sends named fields, [`terminal_argv`] checks each one and
 //! builds the argv from a fixed shape, and every user value goes after `--` or
 //! as `--flag=value`, so no input can become an option. The child is this same
 //! binary, run with no shell.
 //!
-//! Both commands fall back to a writable open when an index needs a schema
+//! Each falls back to a writable open when an index needs a schema
 //! upgrade (the CLI's `open_read_store`); `travsr ui` never writes the index,
 //! so a run starts only once a read-only open has succeeded here.
 
@@ -141,9 +141,126 @@ pub(super) fn terminal_argv(
                 reads_index: true,
             })
         }
+        "references" => {
+            let symbol = text(params, "query")?.ok_or("type a symbol name")?;
+            let mut args = vec![
+                "references".to_string(),
+                format!("--format={}", choice(params, "format", &["text", "json"])?),
+            ];
+            if let Some(path) = text(params, "path")? {
+                args.push(format!("--path={path}"));
+            }
+            args.extend(["--".to_string(), symbol]);
+            Ok(Planned {
+                args,
+                secs: 60,
+                reads_index: true,
+            })
+        }
+        "pattern" => {
+            let pattern = text(params, "query")?.ok_or("type a pattern to search for")?;
+            let context = match params.get("context") {
+                None => 0,
+                Some(n) => n
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n <= 10)
+                    .ok_or("context must be a number from 0 to 10")?,
+            };
+            let mut args = vec![
+                "pattern".to_string(),
+                format!("--format={}", choice(params, "format", &["text", "json"])?),
+                format!("--context={context}"),
+            ];
+            if flag(params, "fixed") {
+                args.push("--fixed".into());
+            }
+            if let Some(scope) = text(params, "scope")? {
+                args.push(format!("--scope={scope}"));
+            }
+            args.extend(["--".to_string(), pattern]);
+            Ok(Planned {
+                args,
+                secs: 60,
+                reads_index: true,
+            })
+        }
+        "explain" => {
+            let query = text(params, "query")?.ok_or("type the question you asked")?;
+            let symbol = text(params, "symbol")?.ok_or("type the symbol to explain")?;
+            let args = vec![
+                "explain".to_string(),
+                format!("--format={}", choice(params, "format", &["text", "json"])?),
+                "--".to_string(),
+                query,
+                symbol,
+            ];
+            // Runs the same retrieval as `ask`, so the same budget.
+            Ok(Planned {
+                args,
+                secs: 180,
+                reads_index: true,
+            })
+        }
+        "status" => {
+            let mut args = vec!["status".to_string()];
+            if flag(params, "verbose") {
+                args.push("--verbose".into());
+            }
+            Ok(Planned {
+                args,
+                secs: 60,
+                reads_index: true,
+            })
+        }
+        "invariants" => {
+            let provenance = params
+                .get("provenance")
+                .map(String::as_str)
+                .unwrap_or("ratified");
+            if !travsr_mcp::PROVENANCE_FILTERS.contains(&provenance) {
+                return Err(format!(
+                    "unknown provenance '{provenance}'; use one of: {}",
+                    travsr_mcp::PROVENANCE_FILTERS.join(", ")
+                ));
+            }
+            Ok(Planned {
+                args: vec!["invariants".into(), format!("--provenance={provenance}")],
+                secs: 120,
+                reads_index: true,
+            })
+        }
+        // `fsck` is left out on purpose: even its report-only mode opens the
+        // index writable (`travsr_daemon::fsck_repo`), and the Health page
+        // already reports integrity from a read-only open.
         other => Err(format!(
-            "unknown command '{other}'; the Terminal runs ask and graph"
+            "unknown command '{other}'; the Terminal runs {}",
+            TERMINAL_COMMANDS.join(", ")
         )),
+    }
+}
+
+/// The commands [`terminal_argv`] accepts, all read-only.
+pub(super) const TERMINAL_COMMANDS: &[&str] = &[
+    "ask",
+    "graph",
+    "references",
+    "pattern",
+    "explain",
+    "status",
+    "invariants",
+];
+
+/// `params[key]`, which must be one of `allowed`; the first is the default.
+fn choice<'a>(
+    params: &'a BTreeMap<String, String>,
+    key: &str,
+    allowed: &[&'a str],
+) -> Result<&'a str, String> {
+    match params.get(key).map(String::as_str) {
+        None | Some("") => Ok(allowed[0]),
+        Some(v) if allowed.contains(&v) => Ok(v),
+        Some(v) => Err(format!("unknown {key} '{v}'")),
     }
 }
 
@@ -315,10 +432,83 @@ mod tests {
     }
 
     #[test]
-    fn only_ask_and_graph_run() {
-        for cmd in ["init", "daemon", "synonym", "config", "uninstall", ""] {
+    fn only_the_read_only_commands_run() {
+        // fsck opens the index writable even when it only reports.
+        for cmd in [
+            "init", "daemon", "synonym", "config", "fsck", "lang", "embed", "",
+        ] {
             assert!(terminal_argv(cmd, &p(&[("query", "x")])).is_err(), "{cmd}");
         }
+    }
+
+    #[test]
+    fn references_pattern_and_explain_bind_their_values() {
+        assert_eq!(
+            terminal_argv("references", &p(&[("query", "-x"), ("path", "src")]))
+                .unwrap()
+                .args,
+            vec!["references", "--format=text", "--path=src", "--", "-x"]
+        );
+        assert_eq!(
+            terminal_argv(
+                "pattern",
+                &p(&[
+                    ("query", "--fix"),
+                    ("fixed", "1"),
+                    ("context", "3"),
+                    ("scope", "crates/")
+                ])
+            )
+            .unwrap()
+            .args,
+            vec![
+                "pattern",
+                "--format=text",
+                "--context=3",
+                "--fixed",
+                "--scope=crates/",
+                "--",
+                "--fix"
+            ]
+        );
+        assert_eq!(
+            terminal_argv(
+                "explain",
+                &p(&[("query", "how is x"), ("symbol", "run"), ("format", "json")])
+            )
+            .unwrap()
+            .args,
+            vec!["explain", "--format=json", "--", "how is x", "run"]
+        );
+        for (cmd, bad) in [
+            ("references", p(&[])),
+            ("references", p(&[("query", "x"), ("format", "yaml")])),
+            ("pattern", p(&[("query", "x"), ("context", "11")])),
+            ("pattern", p(&[("query", "x"), ("context", "-1")])),
+            ("explain", p(&[("query", "x")])),
+            ("explain", p(&[("symbol", "x")])),
+        ] {
+            assert!(terminal_argv(cmd, &bad).is_err(), "{cmd} {bad:?}");
+        }
+    }
+
+    #[test]
+    fn status_and_invariants_take_only_their_switches() {
+        assert_eq!(
+            terminal_argv("status", &p(&[])).unwrap().args,
+            vec!["status"]
+        );
+        assert_eq!(
+            terminal_argv("status", &p(&[("verbose", "1"), ("query", "--fix")]))
+                .unwrap()
+                .args,
+            vec!["status", "--verbose"]
+        );
+        assert_eq!(
+            terminal_argv("invariants", &p(&[])).unwrap().args,
+            vec!["invariants", "--provenance=ratified"]
+        );
+        assert!(terminal_argv("invariants", &p(&[("provenance", "ratifed")])).is_err());
     }
 
     #[test]

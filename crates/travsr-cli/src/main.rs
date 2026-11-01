@@ -379,9 +379,10 @@ enum Command {
         #[arg(long)]
         tenants_dir: std::path::PathBuf,
     },
-    /// Browse the code graph in a web browser: repo status, symbol search,
-    /// callers, dependencies, blast radius and the repo map. Read-only; serves
-    /// on this machine only unless --allow-remote is given.
+    /// Browse the code graph in a web browser: repo status, the repo map and
+    /// symbol graph, callers, dependencies, blast radius, the context agents
+    /// get, and the read-only CLI commands. Read-only; serves on this machine
+    /// only unless --allow-remote is given.
     Ui {
         /// Address to bind on: an IP address, or localhost. Must be a
         /// loopback address unless --allow-remote is also given.

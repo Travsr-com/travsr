@@ -539,65 +539,125 @@
     return html + esc(line.slice(at));
   }
 
+  // One entry per command terminal.rs runs: its fields, in form order. A
+  // field is a text box (`ph`, optional `suggest` of symbols or files), a
+  // select (`opts` as [value, label]) or a checkbox (`check`). Field keys are
+  // the names /api/run/<cmd> reads.
+  const range = (a, b, dflt) => Array.from({ length: b - a + 1 }, (_, i) => [String(a + i), String(a + i), a + i === dflt]);
+  const TCMDS = {
+    ask: {
+      help: "Ask a question about the code, or name a symbol: the answer agents get, as ranked tables.",
+      fields: [
+        { k: "query", ph: "a question, or a symbol name", suggest: "sym", main: true },
+        { k: "format", label: "Format", opts: [["table", "table"], ["json", "json"]] },
+      ],
+      extra: '<button class="btn" type="button" data-examples="1" title="travsr ask --examples">Examples</button>',
+    },
+    graph: {
+      help: "The dependency graph around a symbol or file, as a tree, DOT or JSON.",
+      fields: [
+        { k: "query", ph: "symbol or file name", suggest: "sym", main: true },
+        { k: "path", ph: "--path (optional)", suggest: "file" },
+        { k: "depth", label: "Depth", opts: range(1, 6, 3) },
+        { k: "direction", label: "Direction", opts: [["deps", "deps"], ["callers", "callers"], ["both", "both"]] },
+        { k: "format", label: "Format", opts: [["tree", "tree"], ["dot", "dot"], ["json", "json"]] },
+        { k: "all", check: "whole repo (--all)" },
+      ],
+    },
+    references: {
+      help: "Every place a symbol is used, as path:line: calls, assignments and type uses, not only callers.",
+      fields: [
+        { k: "query", ph: "symbol name", suggest: "sym", main: true },
+        { k: "path", ph: "--path (optional)", suggest: "file" },
+        { k: "format", label: "Format", opts: [["text", "text"], ["json", "json"]] },
+      ],
+    },
+    pattern: {
+      help: "Text search (git grep) over the indexed files. A POSIX regex, or a literal with --fixed.",
+      fields: [
+        { k: "query", ph: "pattern, e.g. fn\\s+run_", main: true },
+        { k: "scope", ph: "--scope: path prefix or files-importing(Symbol)", suggest: "file" },
+        { k: "context", label: "Context", opts: range(0, 10, 0) },
+        { k: "fixed", check: "literal (--fixed)" },
+        { k: "format", label: "Format", opts: [["text", "text"], ["json", "json"]] },
+      ],
+    },
+    explain: {
+      help: "Why ask ranked or skipped a symbol for a question: which terms matched and which thresholds passed.",
+      fields: [
+        { k: "query", ph: "the question you gave ask", main: true },
+        { k: "symbol", ph: "symbol it ranked or skipped", suggest: "sym" },
+        { k: "format", label: "Format", opts: [["text", "text"], ["json", "json"]] },
+      ],
+    },
+    status: {
+      help: "Index and graph status, as travsr status prints it.",
+      fields: [{ k: "verbose", check: "per-language detail (--verbose)" }],
+    },
+    invariants: {
+      help: "Check the architecture rules in architecture-invariants.json against the graph.",
+      fields: [{ k: "provenance", label: "Edges", opts: [["ratified", "ratified"], ["", "all"], ["tree-sitter", "tree-sitter"], ["lsif", "lsif"], ["scip", "scip"], ["live", "live"]] }],
+    },
+  };
+
+  function terminalForm(cmd, spec) {
+    const id = (k) => "t-" + cmd + "-" + k;
+    const parts = spec.fields.map((f) => {
+      if (f.check) return '<label class="ctx-check"><input id="' + id(f.k) + '" type="checkbox"> ' + esc(f.check) + "</label>";
+      if (f.opts) {
+        return '<label class="sel" for="' + id(f.k) + '">' + esc(f.label) + '</label><select id="' + id(f.k) + '">' +
+          f.opts.map(([v, l, sel]) => '<option value="' + esc(v) + '"' + (sel ? " selected" : "") + ">" + esc(l) + "</option>").join("") + "</select>";
+      }
+      return '<span class="lookup-box ' + (f.main ? "t-main" : "t-path") + '"><input id="' + id(f.k) + '" type="search" placeholder="' + esc(f.ph) +
+        '" autocomplete="off" spellcheck="false" maxlength="200"></span>';
+    });
+    return '<form class="lookup t-form" id="t-' + cmd + '" data-cmd="' + cmd + '">' + parts.join("") +
+      '<button class="btn primary" type="submit">Run</button>' + (spec.extra || "") + "</form>";
+  }
+
   function terminalView() {
     document.title = "Travsr: Terminal";
-    const start = params.get("cmd") === "graph" ? "graph" : "ask";
-    const depthOpts = [1, 2, 3, 4, 5, 6].map((d) => '<option value="' + d + '"' + (d === 3 ? " selected" : "") + ">" + d + "</option>").join("");
+    const start = TCMDS[params.get("cmd")] ? params.get("cmd") : "ask";
     page.innerHTML =
       '<div class="phead"><h2>Terminal</h2></div>' +
-      '<p class="sub" style="margin:-4px 0 14px">Run <code>travsr ask</code> and <code>travsr graph</code> here, exactly as in a shell, in this repository. Read-only: nothing here changes the index.</p>' +
+      '<p class="sub" style="margin:-4px 0 14px">Run travsr\'s read-only commands here, exactly as in a shell, in this repository. Nothing here changes the index.</p>' +
       '<div class="pills t-tabs" role="tablist">' +
-      '<button class="pill-btn" type="button" role="tab" data-tab="ask">travsr ask</button>' +
-      '<button class="pill-btn" type="button" role="tab" data-tab="graph">travsr graph</button></div>' +
-      // ask
-      '<form class="lookup t-form" id="t-ask" data-cmd="ask">' +
-      '<span class="lookup-box t-main"><input id="t-ask-q" type="search" placeholder="a question, or a symbol name" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
-      '<label class="sel" for="t-ask-f">Format</label><select id="t-ask-f"><option value="table">table</option><option value="json">json</option></select>' +
-      '<button class="btn primary" type="submit">Run</button>' +
-      '<button class="btn" type="button" data-examples="1" title="travsr ask --examples">Examples</button></form>' +
-      // graph
-      '<form class="lookup t-form" id="t-graph" data-cmd="graph">' +
-      '<span class="lookup-box t-main"><input id="t-graph-q" type="search" placeholder="symbol or file name" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
-      '<span class="lookup-box t-path"><input id="t-graph-p" type="search" placeholder="--path (optional)" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
-      '<label class="sel" for="t-graph-d">Depth</label><select id="t-graph-d">' + depthOpts + "</select>" +
-      '<label class="sel" for="t-graph-r">Direction</label><select id="t-graph-r"><option value="deps">deps</option><option value="callers">callers</option><option value="both">both</option></select>' +
-      '<label class="sel" for="t-graph-f">Format</label><select id="t-graph-f"><option value="tree">tree</option><option value="dot">dot</option><option value="json">json</option></select>' +
-      '<label class="ctx-check"><input id="t-graph-all" type="checkbox"> whole repo (--all)</label>' +
-      '<button class="btn primary" type="submit">Run</button></form>' +
+      Object.keys(TCMDS).map((c) => '<button class="pill-btn" type="button" role="tab" data-tab="' + c + '">' + esc(c) + "</button>").join("") + "</div>" +
+      '<p class="sub t-help" id="t-help"></p>' +
+      Object.entries(TCMDS).map(([c, s]) => terminalForm(c, s)).join("") +
       '<div id="t-log" class="t-log"></div>';
 
-    const forms = { ask: document.getElementById("t-ask"), graph: document.getElementById("t-graph") };
+    const forms = Object.fromEntries(Object.keys(TCMDS).map((c) => [c, document.getElementById("t-" + c)]));
     const log = document.getElementById("t-log");
-    const allBox = document.getElementById("t-graph-all");
-    const graphOnlyOne = ["t-graph-q", "t-graph-p", "t-graph-d", "t-graph-r"].map((id) => document.getElementById(id));
+    const el = (cmd, k) => document.getElementById("t-" + cmd + "-" + k);
 
-    // The query box is a symbol on graph, often a symbol on ask; --path is a file.
-    for (const [id, search] of [["t-ask-q", ui.suggestSymbols], ["t-graph-q", ui.suggestSymbols], ["t-graph-p", ui.suggestFiles]]) {
-      const input = document.getElementById(id);
-      ui.suggest(input, { anchor: input.parentElement, search, onPick: () => input.form.requestSubmit() });
+    for (const [cmd, spec] of Object.entries(TCMDS)) {
+      for (const f of spec.fields.filter((x) => x.suggest)) {
+        const input = el(cmd, f.k);
+        ui.suggest(input, { anchor: input.parentElement, search: f.suggest === "file" ? ui.suggestFiles : ui.suggestSymbols, onPick: () => input.form.requestSubmit() });
+      }
     }
 
     function tab(name) {
       for (const [n, f] of Object.entries(forms)) f.hidden = n !== name;
       document.querySelectorAll(".t-tabs [data-tab]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.tab === name)));
+      document.getElementById("t-help").textContent = TCMDS[name].help;
       setQuery("cmd", name === "ask" ? "" : name);
     }
     tab(start);
 
-    allBox.addEventListener("change", () => graphOnlyOne.forEach((el) => { el.disabled = allBox.checked; }));
+    // graph --all ignores the symbol, path, depth and direction.
+    const allBox = el("graph", "all");
+    allBox.addEventListener("change", () => ["query", "path", "depth", "direction"].forEach((k) => { el("graph", k).disabled = allBox.checked; }));
 
     function fields(cmd, extra) {
-      if (cmd === "ask") {
-        return Object.assign({ query: document.getElementById("t-ask-q").value, format: document.getElementById("t-ask-f").value }, extra);
+      const out = {};
+      for (const f of TCMDS[cmd].fields) {
+        const input = el(cmd, f.k);
+        if (input.disabled) continue;
+        if (f.check) { if (input.checked) out[f.k] = "1"; } else out[f.k] = input.value;
       }
-      if (allBox.checked) return { all: "1", format: document.getElementById("t-graph-f").value };
-      return {
-        query: document.getElementById("t-graph-q").value,
-        path: document.getElementById("t-graph-p").value,
-        depth: document.getElementById("t-graph-d").value,
-        direction: document.getElementById("t-graph-r").value,
-        format: document.getElementById("t-graph-f").value,
-      };
+      return Object.assign(out, extra);
     }
 
     async function run(cmd, extra) {
@@ -657,8 +717,8 @@
 
     // A link like /terminal?cmd=graph&q=foo runs straight away.
     const q0 = params.get("q");
-    if (q0) {
-      document.getElementById(start === "graph" ? "t-graph-q" : "t-ask-q").value = q0;
+    if (q0 && el(start, "query")) {
+      el(start, "query").value = q0;
       run(start);
     }
   }

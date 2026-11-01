@@ -309,3 +309,5 @@ body:not(.ui-page) #brand .word {
 .t-out a.t-sig { color: var(--tsr-accent-text); }
 .t-out a:hover { text-decoration-color: currentColor; }
 @media (max-width: 760px) { .t-form .t-main, .t-form .t-path { min-width: 0; flex: 1 1 100%; } }
+.t-tabs { flex-wrap: wrap; }
+.t-help { margin: -4px 0 10px; font-size: 12px; }
