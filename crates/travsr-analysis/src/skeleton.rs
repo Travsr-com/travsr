@@ -267,14 +267,50 @@ fn join_doc_comment(lines: &[String]) -> Option<String> {
     Some(truncate_at_sentence(&joined))
 }
 
+/// A token that ends in `.` without ending a sentence: a known Latin abbreviation
+/// (`etc`, `vs`, `cf`, `resp`, …), any token carrying an internal `.` (`e.g`, `i.e`,
+/// a version like `v1.2`), or a lone letter (`C`, an initial). Used so a `. ` inside
+/// such a token is not mistaken for a sentence boundary.
+fn is_abbreviation(tok: &str) -> bool {
+    const ABBR: &[&str] = &[
+        "etc", "vs", "cf", "resp", "approx", "incl", "excl", "viz", "fig",
+    ];
+    if tok.contains('.') {
+        return true;
+    }
+    let mut chars = tok.chars();
+    if let Some(c) = chars.next() {
+        if chars.next().is_none() && c.is_alphabetic() {
+            return true;
+        }
+    }
+    ABBR.contains(&tok.to_ascii_lowercase().as_str())
+}
+
 /// Cut `s` at the end of its first sentence if that falls at or before
 /// `DOC_MAX_CHARS`; otherwise truncate at `DOC_MAX_CHARS` on a char boundary.
+/// A `.` closing a known abbreviation (`e.g.`, `etc.`) is not a sentence end.
 fn truncate_at_sentence(s: &str) -> String {
     let bytes = s.as_bytes();
     let sentence_end = bytes.iter().enumerate().find_map(|(i, &b)| {
         let terminator = b == b'.' || b == b'!' || b == b'?';
         let boundary = i + 1 >= bytes.len() || bytes[i + 1] == b' ';
-        (terminator && boundary).then_some(i + 1)
+        if !(terminator && boundary) {
+            return None;
+        }
+        // `. ` ending an abbreviation is not a sentence break; keep scanning.
+        if b == b'.' {
+            let start = bytes[..i]
+                .iter()
+                .rposition(|&c| c == b' ')
+                .map_or(0, |p| p + 1);
+            if let Ok(tok) = std::str::from_utf8(&bytes[start..i]) {
+                if is_abbreviation(tok) {
+                    return None;
+                }
+            }
+        }
+        Some(i + 1)
     });
     let cut = match sentence_end {
         Some(e) if e <= DOC_MAX_CHARS => e,
@@ -289,6 +325,19 @@ fn truncate_at_sentence(s: &str) -> String {
     s[..cut].trim_end().to_string()
 }
 
+/// A section banner (`// ── petgraph construction ──────`), not prose. A `//` rule
+/// shares the `line_comment` kind with a `///` doc on most grammars, so the doc walk
+/// picks it up; it must be dropped before it becomes the `doc:` field or crowds out a
+/// real body comment.
+fn is_banner_line(line: &str) -> bool {
+    // Box-drawing rules are never prose; ASCII rules need a 4+ run to avoid `---` in text.
+    line.contains('─')
+        || line.contains('═')
+        || line.contains("====")
+        || line.contains("----")
+        || line.contains("****")
+}
+
 /// The leading doc comment for `decl` as continuous prose: preceding
 /// `///` / `/** */` sibling comments for most languages, or the first-statement
 /// docstring for Python. `None` when the declaration has no doc comment.
@@ -299,7 +348,15 @@ fn leading_doc_comment(decl: TsNode<'_>, src: &[u8], ck: &[&str], lang: &Lang) -
             let docstring = collect_python_docstring(body, src)?;
             join_doc_comment(&[docstring])
         }
-        _ => join_doc_comment(&doc_comments_from(decl, src, ck, true)),
+        _ => {
+            // Drop section-banner lines so a `// ── X ──` rule above the declaration
+            // neither becomes the doc nor suppresses the real body-comment fallback.
+            let lines: Vec<String> = doc_comments_from(decl, src, ck, true)
+                .into_iter()
+                .filter(|l| !is_banner_line(l))
+                .collect();
+            join_doc_comment(&lines)
+        }
     }
 }
 
@@ -2647,6 +2704,51 @@ mod tests {
         );
         assert_eq!(join_doc_comment(&[]), None);
         assert_eq!(join_doc_comment(&["   ".to_string()]), None);
+    }
+
+    #[test]
+    fn truncate_does_not_break_on_abbreviations() {
+        // `e.g.` / `i.e.` / `etc.` are not sentence boundaries: the first real
+        // sentence must survive intact rather than cutting to a dangling fragment.
+        let lines =
+            vec!["First two path segments, e.g. \"crates/travsr\". Dropped tail.".to_string()];
+        assert_eq!(
+            join_doc_comment(&lines).as_deref(),
+            Some("First two path segments, e.g. \"crates/travsr\".")
+        );
+        let lines = vec!["Share of IDF mass, i.e. the subject term. Next.".to_string()];
+        assert_eq!(
+            join_doc_comment(&lines).as_deref(),
+            Some("Share of IDF mass, i.e. the subject term.")
+        );
+    }
+
+    #[test]
+    fn banner_only_doc_falls_back_to_body_comment() {
+        // A `// ── X ──` rule above a declaration with no real doc comment must not
+        // become the doc field or suppress the body-comment fallback (#1056 follow-up).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "// \u{2500}\u{2500} petgraph construction \u{2500}\u{2500}\u{2500}\u{2500}\n\
+             \n\
+             fn build_graph() {\n\
+                 // Determinism: insert nodes in sorted order.\n\
+                 let x = 1;\n\
+             }\n",
+        )
+        .unwrap();
+        let node = make_node("lib.rs", "fn:build_graph", "rust", "function", 3, 6);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        // The banner is dropped, so `doc` is None and render falls back to the body
+        // comment (as it did before #1056) instead of showing a banner-only doc field.
+        assert_eq!(skel.doc, None, "banner must not become the doc field");
+        assert!(
+            skel.render().contains("Determinism"),
+            "render should keep body comment: {}",
+            skel.render()
+        );
     }
 
     // ── SEC guards ────────────────────────────────────────────────────────────
