@@ -16,7 +16,7 @@
   window.TRAVSR_INIT = { logoUri: "/assets/icon.png" };
   window.acquireVsCodeApi = function () {
     return {
-      postMessage(msg) { if (ready) handle(msg); else pending.push(msg); },
+      postMessage(msg) { if (ready) answerGraphMessage(msg); else pending.push(msg); },
       getState() { return saved; },
       setState(s) { saved = s; },
     };
@@ -83,7 +83,11 @@
     a.remove();
   }
 
-  async function handle(m) {
+  // Not `handle`: the extension's commands.ts calls a `handle` property, which
+  // the indexer resolved by name to this function, making the extension
+  // appear to depend on this crate (half of a cycle `travsr invariants`
+  // reports). A name no other code uses keeps the graph honest.
+  async function answerGraphMessage(m) {
     switch (m && m.command) {
       case "query":
         if (m.query || m.kind_filter === "file" || m.mode === "overview") await query(m);
@@ -226,8 +230,8 @@
     // Anything graph.js asked for while the repo was loading goes first; the
     // initial view only if it asked for nothing.
     const queued = pending.splice(0);
-    if (!queued.some((m) => m.command === "query")) await handle(initial);
-    for (const m of queued) await handle(m);
+    if (!queued.some((m) => m.command === "query")) await answerGraphMessage(initial);
+    for (const m of queued) await answerGraphMessage(m);
     // Live refresh: redraw what is on the canvas from the new index. The
     // request id is dropped so graph.js accepts the render even though the
     // user issued no new query.

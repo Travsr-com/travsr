@@ -36,13 +36,17 @@
     "query.failed": "query", "editor.attached": "editor", "editor.detached": "editor",
   };
   const LOG_RANK = { TRACE: 0, DEBUG: 1, INFO: 2, WARN: 3, ERROR: 4 };
-  const rankOf = (lvl) => (lvl in LOG_RANK ? LOG_RANK[lvl] : 2);
+  // Function declarations, not arrow consts, here and in isTempRepo: the
+  // indexer records only declarations, so calls to an arrow const resolved by
+  // name to the extension's webviews.ts helpers and made this crate appear to
+  // depend on packages/travsr-vscode (a cycle `travsr invariants` reports).
+  function rankOf(lvl) { return lvl in LOG_RANK ? LOG_RANK[lvl] : 2; }
   const LOG_LEVELS = ["error", "warn", "info", "debug", "trace"];
   const LOG_AUTO_SECONDS = [0, 5, 15, 30, 60];
   const LOG_MAX_LINES = 5000;
   const LANG_CONTRACT_FIELDS = ["language", "status", "statusLine", "repoState", "prerequisites",
     "builtin", "availableOnThisPlatform", "unavailableTarget"];
-  const isTempRepo = (name) => /^\.tmp[A-Za-z0-9]{6}$/.test(name);
+  function isTempRepo(name) { return /^\.tmp[A-Za-z0-9]{6}$/.test(name); }
 
   const OK_ICON = '<svg class="ci" viewBox="0 0 16 16" fill="none"><path d="M3 8.4 6.4 11.8 13 5.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const WARN_ICON = '<svg class="ci" viewBox="0 0 16 16" fill="none"><path d="M8 2.6 14.4 13H1.6L8 2.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 6.5v3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="11.3" r=".8" fill="currentColor"/></svg>';
