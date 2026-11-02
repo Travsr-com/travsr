@@ -143,12 +143,14 @@ pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Opt
     }
 }
 
-/// #1051: the `#[cfg(...)]` / `#[cfg_attr(...)]` attribute line directly above the
-/// declaration at 0-based `from`, verbatim, if any. Walks up past blank lines,
-/// comment lines, and other `#[...]` attributes; stops at the first real code
-/// line. Rust only by construction — no other indexed language writes `#[cfg(`.
-/// Single-line cfg attributes only (the common case); a cfg split across lines
-/// is left for the skeleton path, which parses the AST.
+/// #1051: the `#[cfg(...)]` attribute line directly above the declaration at
+/// 0-based `from`, verbatim, if any. Walks up past blank lines, comment lines, and
+/// other `#[...]` attributes; stops at the first real code line. Rust only by
+/// construction — no other indexed language writes `#[cfg(`. Single-line cfg
+/// attributes only (the common case); a cfg split across lines is left for the
+/// skeleton path, which parses the AST. `#[cfg_attr(...)]` is not a gate (it
+/// conditionally applies an attribute, the item exists either way) and is skipped
+/// like any other attribute.
 fn preceding_cfg_line<'a>(lines: &[&'a str], from: usize) -> Option<&'a str> {
     let mut i = from;
     while i > 0 {
@@ -159,10 +161,10 @@ fn preceding_cfg_line<'a>(lines: &[&'a str], from: usize) -> Option<&'a str> {
             continue;
         }
         if t.starts_with("#[") {
-            if t.starts_with("#[cfg(") || t.starts_with("#[cfg_attr(") {
+            if t.starts_with("#[cfg(") {
                 return Some(line);
             }
-            continue; // a different attribute — keep scanning upward
+            continue; // a different attribute (incl. #[cfg_attr(...)]) — keep scanning
         }
         break; // real code: no cfg gate directly above the declaration
     }
@@ -447,6 +449,23 @@ mod tests {
         let snippet = snippet_for_node(&node, dir.path()).unwrap();
         assert!(snippet.starts_with("fn f()"));
         assert!(!snippet.contains("#[inline]"));
+    }
+
+    #[test]
+    fn snippet_ignores_preceding_cfg_attr() {
+        // #1051: `#[cfg_attr(...)]` does not gate the item's existence, so it is
+        // not prepended as a gate.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("t.rs");
+        std::fs::write(
+            &src,
+            "#[cfg_attr(test, derive(Debug))]\nfn f() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("t.rs", "fn:f", 2, 4);
+        let snippet = snippet_for_node(&node, dir.path()).unwrap();
+        assert!(snippet.starts_with("fn f()"));
+        assert!(!snippet.contains("cfg_attr"));
     }
 
     // ── line_has_identifier ───────────────────────────────────────────────────

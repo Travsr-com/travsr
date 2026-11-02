@@ -72,7 +72,7 @@ pub struct AstSkeleton {
     /// of comment markers. Collected in source order; up to 60 entries pre-subsampling.
     /// Even subsampling is applied at render/embed time so coverage spans the full body.
     pub comments: Vec<String>,
-    /// #1051: the `#[cfg(...)]` / `#[cfg_attr(...)]` gate on the declaration, if
+    /// #1051: the `#[cfg(...)]` gate on the declaration, if
     /// any, normalised to one line (e.g. `#[cfg(target_os = "macos")]`). Rust
     /// only. Tree-sitter parses every cfg branch, so a name with platform- or
     /// feature-gated branches resolves to several same-signature definitions;
@@ -851,13 +851,16 @@ fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> A
     skel
 }
 
-/// #1051: the `#[cfg(...)]` / `#[cfg_attr(...)]` attribute gating `decl`, if any,
-/// as a one-line string with runs of whitespace collapsed (a multi-line cfg
-/// renders on one line). Rust only — no other indexed language has a cfg concept.
+/// #1051: the `#[cfg(...)]` attribute gating `decl`, if any, as a one-line string
+/// with runs of whitespace collapsed (a multi-line cfg renders on one line). Rust
+/// only — no other indexed language has a cfg concept.
 ///
 /// Mirrors [`doc_comments_from`]: walks preceding named siblings, stepping past
-/// comment lines and other `#[...]` attributes, and stops at the first real
-/// item. Returns the first attribute whose text names `cfg` / `cfg_attr`.
+/// comment lines and other `#[...]` attributes, and stops at the first real item.
+/// Returns the first attribute that is a `#[cfg(...)]` gate. `#[cfg_attr(...)]` is
+/// not a gate — it conditionally applies an attribute, the item exists either way
+/// — so it is skipped like any other attribute; anchoring on the `#[cfg(` prefix
+/// (not a `contains`) also avoids misfiring on a name like `#[my_cfg(...)]`.
 fn leading_cfg(decl: TsNode<'_>, src: &[u8], lang: &Lang) -> Option<String> {
     if !matches!(lang, Lang::Rust) {
         return None;
@@ -867,7 +870,7 @@ fn leading_cfg(decl: TsNode<'_>, src: &[u8], lang: &Lang) -> Option<String> {
         let kind = sib.kind();
         if kind == "attribute_item" {
             let text = node_text(sib, src).trim();
-            if text.contains("cfg(") || text.contains("cfg_attr(") {
+            if text.starts_with("#[cfg(") {
                 return Some(text.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             cursor = sib.prev_named_sibling();
@@ -2867,6 +2870,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("lib.rs");
         std::fs::write(&src, "#[inline]\nfn f() -> i32 {\n    0\n}\n").unwrap();
+        let node = make_node("lib.rs", "fn:f", "rust", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert_eq!(skel.cfg, None);
+        assert!(!skel.render().contains("cfg:"));
+    }
+
+    #[test]
+    fn rust_cfg_attr_is_not_a_gate() {
+        // #1051: `#[cfg_attr(...)]` conditionally applies an attribute; the item
+        // exists either way, so it is not a gate and must not be surfaced as one.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "#[cfg_attr(test, derive(Debug))]\nfn f() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
         let node = make_node("lib.rs", "fn:f", "rust", "function", 2, 4);
         let skel = skeleton_for_node(&node, dir.path()).unwrap();
         assert_eq!(skel.cfg, None);
