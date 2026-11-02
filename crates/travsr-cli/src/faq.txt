@@ -76,6 +76,15 @@ $ travsr lang list
 - the network is used to download travsr and optional models
 The cloud tier is opt-in and separate: you deploy it and point at it deliberately. Nothing on the local path calls home, so travsr works on a machine with no network at all once the binary and any models you want are present.
 
+## can my team commit the .travsr folder?
+> Only config.toml; everything else there stays on your machine.
+- .travsr/config.toml   shareable team settings, not ignored
+- graph.db, locks, logs, embeddings   ignored by travsr init
+- put per-machine settings in ~/.travsr/config.toml
+- commit .travsrignore too, the default init makes may change indexing
+init adds a block to .gitignore that ignores everything in .travsr except config.toml. A committed graph.db does answer queries after a clone, but every reindex rewrites it, so your tree turns dirty and a git pull that brings in a refreshed map stops with "local changes would be overwritten". If your team wants it anyway, git add -f .travsr/graph.db opts in (commit .travsrignore with it, or the clone may index different files, and expect the committed map to show as modified after each reindex). The AI tool config at the repo root (.mcp.json) stays out of git by default because a tool runs it on clone, and travsr connect --commit is the opt-in.
+$ travsr status
+
 ## do I need the daemon running?
 > No. Queries work without it; it keeps the graph fresher.
 - without it, queries are served from the database as it stands

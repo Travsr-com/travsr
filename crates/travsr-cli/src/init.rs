@@ -135,12 +135,35 @@ pub fn run(
     // against the permanently dirty WAL. Always stderr, so it reaches the `--json` path too without landing in
     // the machine-readable summary on stdout. Reported, not auto-fixed: removing
     // it rewrites the user's index.
-    if stats.travsr_dir_tracked {
+    // `graph.db` alone is the documented opt-in (ADR-020, `git add -f`), so it
+    // gets a quiet note; anything else tracked is almost certainly accidental.
+    let (opted_in, accidental): (Vec<&String>, Vec<&String>) = stats
+        .travsr_local_tracked
+        .iter()
+        .partition(|f| f.as_str() == ".travsr/graph.db");
+    if !accidental.is_empty() {
+        let files = accidental
+            .iter()
+            .map(|f| shell_quote(f))
+            .collect::<Vec<_>>()
+            .join(" ");
         eprintln!(
-            "warning: git tracks files under .travsr/, so ignoring it has no effect. \
+            "warning: git tracks travsr's local-only files ({}), so ignoring them has no effect. \
              The graph's WAL changes on every read, which keeps the working tree \
              dirty and makes `git revert`/`git merge` refuse to run. \
-             `git rm -r --cached .travsr` to untrack it, then commit."
+             `git rm --cached -- {files}` to untrack them, then commit. \
+             .travsr/config.toml can stay committed.",
+            accidental
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !opted_in.is_empty() {
+        eprintln!(
+            "note: .travsr/graph.db is committed, so it will show as modified after each \
+             reindex. Run `travsr ask \"can my team commit the .travsr folder?\"` for the tradeoffs."
         );
     }
 
@@ -487,6 +510,19 @@ fn grant_unsandboxed_where_needed(languages: &[String], corpus: &str) {
                 Err(e) => eprintln!("warning: could not save the {lang} setting: {e:#}"),
             }
         }
+    }
+}
+
+/// Single-quote a path for the suggested command when it holds anything a shell
+/// would interpret, so the line can be pasted as printed.
+fn shell_quote(path: &str) -> String {
+    let plain = path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '='));
+    if plain {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
     }
 }
 
