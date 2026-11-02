@@ -132,7 +132,41 @@ pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Opt
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.join("\n"))
+    let body = trimmed.join("\n");
+    // #1051: the window starts at the declaration line, so a Rust `#[cfg(...)]`
+    // gate sitting just above it is invisible — a reader cannot tell a
+    // platform/feature-specific branch from an unconditional definition. Prepend
+    // it (verbatim, indentation preserved) when present.
+    match preceding_cfg_line(&all_lines, from) {
+        Some(cfg) => Some(format!("{cfg}\n{body}")),
+        None => Some(body),
+    }
+}
+
+/// #1051: the `#[cfg(...)]` / `#[cfg_attr(...)]` attribute line directly above the
+/// declaration at 0-based `from`, verbatim, if any. Walks up past blank lines,
+/// comment lines, and other `#[...]` attributes; stops at the first real code
+/// line. Rust only by construction — no other indexed language writes `#[cfg(`.
+/// Single-line cfg attributes only (the common case); a cfg split across lines
+/// is left for the skeleton path, which parses the AST.
+fn preceding_cfg_line<'a>(lines: &[&'a str], from: usize) -> Option<&'a str> {
+    let mut i = from;
+    while i > 0 {
+        i -= 1;
+        let line = lines[i];
+        let t = line.trim();
+        if t.is_empty() || is_comment_line(line) {
+            continue;
+        }
+        if t.starts_with("#[") {
+            if t.starts_with("#[cfg(") || t.starts_with("#[cfg_attr(") {
+                return Some(line);
+            }
+            continue; // a different attribute — keep scanning upward
+        }
+        break; // real code: no cfg gate directly above the declaration
+    }
+    None
 }
 
 /// Resolve `node.vname.path` to a canonicalized absolute path under `repo_root`,
@@ -383,6 +417,36 @@ mod tests {
         assert!(snippet.starts_with("function charge(amount)"));
         assert!(!snippet.contains("apply fee"));
         assert!(snippet.contains("return amount * 1.02"));
+    }
+
+    #[test]
+    fn snippet_prepends_preceding_cfg_gate() {
+        // #1051: the window starts at the `fn` line; the `#[cfg(...)]` just above
+        // it must be surfaced so a platform-gated branch is not mistaken for an
+        // unconditional one.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("t.rs");
+        std::fs::write(
+            &src,
+            "#[cfg(target_os = \"macos\")]\nfn build_cmd() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("t.rs", "fn:build_cmd", 2, 4);
+        let snippet = snippet_for_node(&node, dir.path()).unwrap();
+        assert!(snippet.starts_with("#[cfg(target_os = \"macos\")]"));
+        assert!(snippet.contains("fn build_cmd()"));
+    }
+
+    #[test]
+    fn snippet_ignores_preceding_non_cfg_attribute() {
+        // A non-cfg attribute above the declaration is not prepended.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("t.rs");
+        std::fs::write(&src, "#[inline]\nfn f() -> i32 {\n    0\n}\n").unwrap();
+        let node = make_fn_node("t.rs", "fn:f", 2, 4);
+        let snippet = snippet_for_node(&node, dir.path()).unwrap();
+        assert!(snippet.starts_with("fn f()"));
+        assert!(!snippet.contains("#[inline]"));
     }
 
     // ── line_has_identifier ───────────────────────────────────────────────────

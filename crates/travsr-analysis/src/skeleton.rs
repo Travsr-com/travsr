@@ -72,6 +72,14 @@ pub struct AstSkeleton {
     /// of comment markers. Collected in source order; up to 60 entries pre-subsampling.
     /// Even subsampling is applied at render/embed time so coverage spans the full body.
     pub comments: Vec<String>,
+    /// #1051: the `#[cfg(...)]` / `#[cfg_attr(...)]` gate on the declaration, if
+    /// any, normalised to one line (e.g. `#[cfg(target_os = "macos")]`). Rust
+    /// only. Tree-sitter parses every cfg branch, so a name with platform- or
+    /// feature-gated branches resolves to several same-signature definitions;
+    /// surfacing the gate lets a reader tell them apart instead of assuming the
+    /// one shown is unconditional. Rendered by `render()` only — kept out of
+    /// `to_embed_text` so embedding vectors are byte-for-byte unchanged.
+    pub cfg: Option<String>,
     /// Rough token estimate: `(declaration_byte_length / 4).max(512)`.
     pub token_estimate: usize,
 }
@@ -82,6 +90,9 @@ impl AstSkeleton {
         let mut out: Vec<String> = Vec::new();
         out.push(format!("[skeleton: {}]", self.kind));
         out.push(self.signature.clone());
+        if let Some(cfg) = &self.cfg {
+            out.push(format!("  cfg: {cfg}"));
+        }
         if !self.params.is_empty() {
             out.push(format!("  params: {}", self.params.join(", ")));
         }
@@ -834,7 +845,39 @@ fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> A
     // Extractors leave `doc` as None and merge all comments into `comments`
     // (so embedding text is unchanged). Fill the human-readable doc comment here.
     skel.doc = leading_doc_comment(decl, src, ck, lang);
+    // #1051: record the cfg gate the same way — post-pass, so no extractor and
+    // no embedding text changes.
+    skel.cfg = leading_cfg(decl, src, lang);
     skel
+}
+
+/// #1051: the `#[cfg(...)]` / `#[cfg_attr(...)]` attribute gating `decl`, if any,
+/// as a one-line string with runs of whitespace collapsed (a multi-line cfg
+/// renders on one line). Rust only — no other indexed language has a cfg concept.
+///
+/// Mirrors [`doc_comments_from`]: walks preceding named siblings, stepping past
+/// comment lines and other `#[...]` attributes, and stops at the first real
+/// item. Returns the first attribute whose text names `cfg` / `cfg_attr`.
+fn leading_cfg(decl: TsNode<'_>, src: &[u8], lang: &Lang) -> Option<String> {
+    if !matches!(lang, Lang::Rust) {
+        return None;
+    }
+    let mut cursor = decl.prev_named_sibling();
+    while let Some(sib) = cursor {
+        let kind = sib.kind();
+        if kind == "attribute_item" {
+            let text = node_text(sib, src).trim();
+            if text.contains("cfg(") || text.contains("cfg_attr(") {
+                return Some(text.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            cursor = sib.prev_named_sibling();
+        } else if kind.contains("comment") {
+            cursor = sib.prev_named_sibling();
+        } else {
+            break;
+        }
+    }
+    None
 }
 
 // ── Rust ──────────────────────────────────────────────────────────────────────
@@ -944,6 +987,7 @@ fn extract_rust(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1088,6 +1132,7 @@ fn extract_typescript(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1174,6 +1219,7 @@ fn extract_python(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1306,6 +1352,7 @@ fn extract_go(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1411,6 +1458,7 @@ fn extract_java(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1473,6 +1521,7 @@ fn extract_kotlin(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1556,6 +1605,7 @@ fn extract_c(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1630,6 +1680,7 @@ fn extract_cpp(
         callees: vec![],
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1720,6 +1771,7 @@ fn extract_csharp(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1853,6 +1905,7 @@ fn extract_swift(
         callees: vec![], // call_expression in Swift has no named fields
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -1997,6 +2050,7 @@ fn extract_dart(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -2067,6 +2121,7 @@ fn extract_ruby(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -2136,6 +2191,7 @@ fn extract_scala(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -2217,6 +2273,7 @@ fn extract_php(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -2293,6 +2350,7 @@ fn extract_objc(
         callees,
         doc: None,
         comments,
+        cfg: None,
         token_estimate,
     }
 }
@@ -2634,6 +2692,7 @@ mod tests {
             callees: vec!["validate".to_string()],
             doc: None,
             comments: vec![],
+            cfg: None,
             token_estimate: 512,
         };
         let r = s.render();
@@ -2749,6 +2808,69 @@ mod tests {
             "render should keep body comment: {}",
             skel.render()
         );
+    }
+
+    #[test]
+    fn rust_cfg_gate_is_recorded_and_rendered() {
+        // #1051: two same-signature defs gated by opposite cfgs. Each must carry
+        // and render its own gate so a reader can tell the branches apart.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("sandbox.rs");
+        std::fs::write(
+            &src,
+            "#[cfg(target_os = \"macos\")]\n\
+             pub fn build_sandboxed_command() -> i32 {\n\
+                 0\n\
+             }\n\
+             \n\
+             #[cfg(not(target_os = \"macos\"))]\n\
+             pub fn build_sandboxed_command() -> i32 {\n\
+                 1\n\
+             }\n",
+        )
+        .unwrap();
+
+        let real = make_node(
+            "sandbox.rs",
+            "fn:build_sandboxed_command",
+            "rust",
+            "function",
+            2,
+            4,
+        );
+        let skel = skeleton_for_node(&real, dir.path()).unwrap();
+        assert_eq!(skel.cfg.as_deref(), Some("#[cfg(target_os = \"macos\")]"));
+        assert!(
+            skel.render().contains("cfg: #[cfg(target_os = \"macos\")]"),
+            "render should surface the gate: {}",
+            skel.render()
+        );
+
+        let stub = make_node(
+            "sandbox.rs",
+            "fn:build_sandboxed_command",
+            "rust",
+            "function",
+            7,
+            9,
+        );
+        let skel = skeleton_for_node(&stub, dir.path()).unwrap();
+        assert_eq!(
+            skel.cfg.as_deref(),
+            Some("#[cfg(not(target_os = \"macos\"))]")
+        );
+    }
+
+    #[test]
+    fn rust_non_cfg_attribute_sets_no_gate() {
+        // An `#[inline]` above a fn is not a cfg gate — `cfg` stays None.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "#[inline]\nfn f() -> i32 {\n    0\n}\n").unwrap();
+        let node = make_node("lib.rs", "fn:f", "rust", "function", 2, 4);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert_eq!(skel.cfg, None);
+        assert!(!skel.render().contains("cfg:"));
     }
 
     // ── SEC guards ────────────────────────────────────────────────────────────
