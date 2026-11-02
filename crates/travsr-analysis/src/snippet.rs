@@ -137,21 +137,28 @@ pub fn snippet_for_node_capped(node: &Node, repo_root: &Path, cap: usize) -> Opt
     // gate sitting just above it is invisible — a reader cannot tell a
     // platform/feature-specific branch from an unconditional definition. Prepend
     // it (verbatim, indentation preserved) when present.
-    match preceding_cfg_line(&all_lines, from) {
-        Some(cfg) => Some(format!("{cfg}\n{body}")),
-        None => Some(body),
+    let gates = preceding_cfg_lines(&all_lines, from);
+    if gates.is_empty() {
+        Some(body)
+    } else {
+        Some(format!("{}\n{}", gates.join("\n"), body))
     }
 }
 
-/// #1051: the `#[cfg(...)]` attribute line directly above the declaration at
-/// 0-based `from`, verbatim, if any. Walks up past blank lines, comment lines, and
-/// other `#[...]` attributes; stops at the first real code line. Rust only by
-/// construction — no other indexed language writes `#[cfg(`. Single-line cfg
-/// attributes only (the common case); a cfg split across lines is left for the
-/// skeleton path, which parses the AST. `#[cfg_attr(...)]` is not a gate (it
-/// conditionally applies an attribute, the item exists either way) and is skipped
-/// like any other attribute.
-fn preceding_cfg_line<'a>(lines: &[&'a str], from: usize) -> Option<&'a str> {
+/// #1051: the `#[cfg(...)]` gate attribute(s) directly above the declaration at
+/// 0-based `from`, verbatim and in source order (empty when there are none). Walks
+/// up past blank lines, comment lines, and non-cfg attributes, stopping at the
+/// first real code line. Rust only by construction — no other indexed language
+/// writes `#[cfg(`.
+///
+/// Captures both single-line (`#[cfg(...)]`) and multi-line (`#[cfg(any(\n ...\n))]`)
+/// attributes by balancing `[` against `]` while walking up, and collects every
+/// gate when an item carries more than one (they AND together). `#[cfg_attr(...)]`
+/// is not a gate (it conditionally applies an attribute, the item exists either
+/// way) and is skipped like any other attribute.
+fn preceding_cfg_lines<'a>(lines: &[&'a str], from: usize) -> Vec<&'a str> {
+    // Each entry is one complete attribute block's verbatim lines, source order.
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
     let mut i = from;
     while i > 0 {
         i -= 1;
@@ -160,15 +167,49 @@ fn preceding_cfg_line<'a>(lines: &[&'a str], from: usize) -> Option<&'a str> {
         if t.is_empty() || is_comment_line(line) {
             continue;
         }
-        if t.starts_with("#[") {
-            if t.starts_with("#[cfg(") {
-                return Some(line);
-            }
-            continue; // a different attribute (incl. #[cfg_attr(...)]) — keep scanning
+        // The bottom line of an attribute block ends with `]` (a single-line
+        // attribute both opens `#[` and ends `]`). Anything else is real code: stop.
+        if !t.ends_with(']') {
+            break;
         }
-        break; // real code: no cfg gate directly above the declaration
+        // Walk up until the square brackets balance so a multi-line attribute is
+        // captured whole. `depth` counts `]` not yet matched by `[`, read bottom-up.
+        let mut block: Vec<&str> = vec![line];
+        let mut depth = bracket_delta(line);
+        while depth > 0 && i > 0 {
+            i -= 1;
+            let up = lines[i];
+            block.push(up);
+            depth += bracket_delta(up);
+        }
+        block.reverse(); // source order
+                         // A real attribute opens with `#[` on its top line; otherwise this was code
+                         // that merely ended in `]` — stop without recording it.
+        if !block
+            .first()
+            .map(|l| l.trim().starts_with("#["))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        blocks.push(block);
     }
-    None
+    blocks.reverse(); // collected nearest-first; present in source order
+    blocks
+        .into_iter()
+        .filter(|b| {
+            b.first()
+                .map(|l| l.trim().starts_with("#[cfg("))
+                .unwrap_or(false)
+        })
+        .flatten()
+        .collect()
+}
+
+/// `]` count minus `[` count on `line`, as the running depth contribution when
+/// walking source upward to find where a (possibly multi-line) attribute begins.
+fn bracket_delta(line: &str) -> i32 {
+    line.matches(']').count() as i32 - line.matches('[').count() as i32
 }
 
 /// Resolve `node.vname.path` to a canonicalized absolute path under `repo_root`,
@@ -466,6 +507,47 @@ mod tests {
         let snippet = snippet_for_node(&node, dir.path()).unwrap();
         assert!(snippet.starts_with("fn f()"));
         assert!(!snippet.contains("cfg_attr"));
+    }
+
+    #[test]
+    fn snippet_prepends_multiline_cfg_gate() {
+        // #1051: a cfg split across lines must be captured whole and prepended
+        // verbatim, matching what the skeleton path (AST) surfaces.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("t.rs");
+        std::fs::write(
+            &src,
+            "#[cfg(any(\n    target_os = \"linux\",\n    target_os = \"macos\"\n))]\n\
+             fn build_cmd() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("t.rs", "fn:build_cmd", 5, 7);
+        let snippet = snippet_for_node(&node, dir.path()).unwrap();
+        assert!(
+            snippet.starts_with("#[cfg(any(\n    target_os = \"linux\","),
+            "multi-line cfg should be prepended verbatim: {snippet}"
+        );
+        assert!(snippet.contains("))]\nfn build_cmd()"));
+    }
+
+    #[test]
+    fn snippet_prepends_all_cfg_gates() {
+        // #1051: two separate `#[cfg(...)]` AND together; both must be prepended,
+        // in source order, so one gate alone does not misrepresent the condition.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("t.rs");
+        std::fs::write(
+            &src,
+            "#[cfg(feature = \"x\")]\n\
+             #[cfg(target_os = \"macos\")]\n\
+             fn f() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let node = make_fn_node("t.rs", "fn:f", 3, 5);
+        let snippet = snippet_for_node(&node, dir.path()).unwrap();
+        assert!(
+            snippet.starts_with("#[cfg(feature = \"x\")]\n#[cfg(target_os = \"macos\")]\nfn f()")
+        );
     }
 
     // ── line_has_identifier ───────────────────────────────────────────────────

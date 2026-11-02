@@ -72,9 +72,10 @@ pub struct AstSkeleton {
     /// of comment markers. Collected in source order; up to 60 entries pre-subsampling.
     /// Even subsampling is applied at render/embed time so coverage spans the full body.
     pub comments: Vec<String>,
-    /// #1051: the `#[cfg(...)]` gate on the declaration, if
-    /// any, normalised to one line (e.g. `#[cfg(target_os = "macos")]`). Rust
-    /// only. Tree-sitter parses every cfg branch, so a name with platform- or
+    /// #1051: the `#[cfg(...)]` gate(s) on the declaration, if any, each
+    /// normalised to one line and space-joined when an item carries more than one
+    /// (they AND together), e.g. `#[cfg(target_os = "macos")]`. Rust only.
+    /// Tree-sitter parses every cfg branch, so a name with platform- or
     /// feature-gated branches resolves to several same-signature definitions;
     /// surfacing the gate lets a reader tell them apart instead of assuming the
     /// one shown is unconditional. Rendered by `render()` only — kept out of
@@ -851,27 +852,31 @@ fn extract_skeleton(decl: TsNode<'_>, src: &[u8], node: &Node, lang: &Lang) -> A
     skel
 }
 
-/// #1051: the `#[cfg(...)]` attribute gating `decl`, if any, as a one-line string
-/// with runs of whitespace collapsed (a multi-line cfg renders on one line). Rust
-/// only — no other indexed language has a cfg concept.
+/// #1051: the `#[cfg(...)]` attribute(s) gating `decl`, if any, each as a one-line
+/// string with runs of whitespace collapsed (a multi-line cfg renders on one line)
+/// and space-joined in source order. Rust only — no other indexed language has a
+/// cfg concept.
 ///
 /// Mirrors [`doc_comments_from`]: walks preceding named siblings, stepping past
 /// comment lines and other `#[...]` attributes, and stops at the first real item.
-/// Returns the first attribute that is a `#[cfg(...)]` gate. `#[cfg_attr(...)]` is
-/// not a gate — it conditionally applies an attribute, the item exists either way
-/// — so it is skipped like any other attribute; anchoring on the `#[cfg(` prefix
-/// (not a `contains`) also avoids misfiring on a name like `#[my_cfg(...)]`.
+/// Collects every attribute that is a `#[cfg(...)]` gate — an item can carry more
+/// than one (they AND together), so one alone would misrepresent the condition.
+/// `#[cfg_attr(...)]` is not a gate — it conditionally applies an attribute, the
+/// item exists either way — so it is skipped like any other attribute; anchoring
+/// on the `#[cfg(` prefix (not a `contains`) also avoids misfiring on a name like
+/// `#[my_cfg(...)]`.
 fn leading_cfg(decl: TsNode<'_>, src: &[u8], lang: &Lang) -> Option<String> {
     if !matches!(lang, Lang::Rust) {
         return None;
     }
+    let mut gates: Vec<String> = Vec::new();
     let mut cursor = decl.prev_named_sibling();
     while let Some(sib) = cursor {
         let kind = sib.kind();
         if kind == "attribute_item" {
             let text = node_text(sib, src).trim();
             if text.starts_with("#[cfg(") {
-                return Some(text.split_whitespace().collect::<Vec<_>>().join(" "));
+                gates.push(text.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             cursor = sib.prev_named_sibling();
         } else if kind.contains("comment") {
@@ -880,7 +885,11 @@ fn leading_cfg(decl: TsNode<'_>, src: &[u8], lang: &Lang) -> Option<String> {
             break;
         }
     }
-    None
+    if gates.is_empty() {
+        return None;
+    }
+    gates.reverse(); // collected nearest-first; present in source order
+    Some(gates.join(" "))
 }
 
 // ── Rust ──────────────────────────────────────────────────────────────────────
@@ -2891,6 +2900,46 @@ mod tests {
         let skel = skeleton_for_node(&node, dir.path()).unwrap();
         assert_eq!(skel.cfg, None);
         assert!(!skel.render().contains("cfg:"));
+    }
+
+    #[test]
+    fn rust_multiple_cfg_gates_all_recorded() {
+        // #1051: two separate `#[cfg(...)]` on one item AND together; surfacing
+        // only one would misrepresent the condition. Both must appear, in order.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "#[cfg(feature = \"x\")]\n\
+             #[cfg(target_os = \"macos\")]\n\
+             fn f() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let node = make_node("lib.rs", "fn:f", "rust", "function", 3, 5);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert_eq!(
+            skel.cfg.as_deref(),
+            Some("#[cfg(feature = \"x\")] #[cfg(target_os = \"macos\")]")
+        );
+    }
+
+    #[test]
+    fn rust_multiline_cfg_gate_is_collapsed_to_one_line() {
+        // #1051: a cfg split across lines renders on a single `cfg:` line.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(
+            &src,
+            "#[cfg(any(\n    target_os = \"linux\",\n    target_os = \"macos\"\n))]\n\
+             fn f() -> i32 {\n    0\n}\n",
+        )
+        .unwrap();
+        let node = make_node("lib.rs", "fn:f", "rust", "function", 5, 7);
+        let skel = skeleton_for_node(&node, dir.path()).unwrap();
+        assert_eq!(
+            skel.cfg.as_deref(),
+            Some("#[cfg(any( target_os = \"linux\", target_os = \"macos\" ))]")
+        );
     }
 
     // ── SEC guards ────────────────────────────────────────────────────────────
