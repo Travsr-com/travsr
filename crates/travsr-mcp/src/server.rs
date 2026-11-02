@@ -343,6 +343,7 @@ pub const BROWSE_TOOLS: &[&str] = &[
     "repo_languages",
     "get_context",
     "get_architecture_brief",
+    "check_invariants",
 ];
 
 /// The [`BROWSE_TOOLS`] that inspect the index rather than read the graph:
@@ -457,6 +458,12 @@ fn browse_tool_text(
             let provenance = args["provenance"].as_str().unwrap_or("ratified");
             let token_budget = args["token_budget"].as_u64().unwrap_or(8_000) as usize;
             tools::get_architecture_brief(store, provenance, token_budget)
+        }
+        // #1057: `travsr invariants` over MCP. Reads the same rules file from the
+        // repo root; same default provenance ('ratified') as the CLI.
+        "check_invariants" => {
+            let provenance = args["provenance"].as_str().unwrap_or("ratified");
+            tools::check_invariants(store, provenance)
         }
         // The Context Explorer: what an agent would be handed for a question.
         "get_context" => {
@@ -746,6 +753,17 @@ pub fn tools_list() -> serde_json::Value {
                     "properties": {
                         "provenance": { "type": "string", "description": "'ratified' (default) excludes the un-ratified live overlay so a bare-name guess cannot invent a dependency; '' accepts everything; any other value names one provenance exactly." },
                         "token_budget": { "type": "integer", "description": "Approximate size cap for the returned brief, in tokens (default 8000). A brief is meant to be read whole; raise it for a large repository." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "check_invariants",
+                "description": "Check the repository's declared architectural rules (architecture-invariants.json at the repo root) against the resolved dependency graph, and return, per rule, 'holds' or 'VIOLATED' with the violating component edges. Deterministic, read-only. Reports 'nothing to check' when the repository declares no rules. A rule naming a component the graph does not have fails rather than passing vacuously.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "provenance": { "type": "string", "description": "'ratified' (default) excludes the un-ratified live overlay so a bare-name guess cannot invent a dependency; '' accepts everything; any other value names one provenance exactly." }
                     },
                     "additionalProperties": false
                 }
@@ -2134,6 +2152,10 @@ mod tests {
             (
                 "get_architecture_brief",
                 serde_json::json!({ "provenance": "", "token_budget": "4000" }),
+            ),
+            (
+                "check_invariants",
+                serde_json::json!({ "provenance": "ratified" }),
             ),
         ] {
             let via_ui = browse_tool_call(&store, tool, &args).expect(tool);

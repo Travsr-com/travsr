@@ -5282,6 +5282,54 @@ pub fn check_architecture_invariants(
     })
 }
 
+/// The rules file `check_invariants` reads, relative to the repository root.
+/// Same file `travsr invariants` checks (`crates/travsr-cli/src/invariants.rs`).
+pub const INVARIANTS_RULES_FILE: &str = "architecture-invariants.json";
+
+/// MCP surface for `check_architecture_invariants`: reads the rules file from
+/// the repository root and returns the report wrapped in the MCP envelope.
+///
+/// The checker itself returns plain terminal text for `travsr invariants`; this
+/// is the second consumer (issue #1057), so it adds the envelope and a real
+/// size cap. It never returns an `Err`: an agent gets its failure as readable
+/// text, and a missing rules file is "nothing to check", not an error, exactly
+/// as the CLI treats it. `violations` is not surfaced separately because the
+/// report text already states, per rule, `holds` or `VIOLATED`.
+pub fn check_invariants(store: &SqliteStore, provenance: &str) -> String {
+    // An unknown filter matches no edge, which would report every rule as
+    // holding over an empty graph. Reject it, as the brief and the CLI do.
+    if !PROVENANCE_FILTERS.contains(&provenance) {
+        return sanitize_for_mcp(&format!(
+            "unknown provenance '{provenance}'. Use 'ratified' for confirmed edges, '' for \
+             everything, or name one provenance exactly (tree-sitter, lsif, scip, live)."
+        ));
+    }
+    let Some(root) = resolve_repo_root(store) else {
+        return sanitize_for_mcp(
+            "cannot locate the repository root for this index, so there is no \
+             architecture-invariants.json to check.",
+        );
+    };
+    let rules_path = root.join(INVARIANTS_RULES_FILE);
+    let rules = match std::fs::read_to_string(&rules_path) {
+        Ok(s) => s,
+        // Nothing declared is not a failure: a repository that has written down
+        // no rules has none to break.
+        Err(_) => {
+            return sanitize_for_mcp(&format!(
+                "no {INVARIANTS_RULES_FILE} at the repository root, so there is nothing to check."
+            ));
+        }
+    };
+    match check_architecture_invariants(store, &rules, provenance) {
+        Ok(report) => wrap_envelope(&sanitize_mcp_body_with_limit(
+            report.text.trim(),
+            FIND_OUTPUT_LIMIT,
+        )),
+        Err(e) => sanitize_for_mcp(&format!("could not check {INVARIANTS_RULES_FILE}: {e}")),
+    }
+}
+
 // ── get_subsystem_brief ───────────────────────────────────────────────────────
 
 /// The component a file belongs to: the package directory where the repository
@@ -14972,6 +15020,59 @@ mod tests {
         // The shipped file's top-level `$comment` must still parse.
         let commented = r#"{"$comment":"why","invariants":[{"name":"n","acyclic":true}]}"#;
         assert!(check_architecture_invariants(&store, commented, "").is_ok());
+    }
+
+    #[test]
+    fn check_invariants_reads_the_rules_file_and_reports_per_rule() {
+        // #1057: the MCP wrapper reads architecture-invariants.json from the repo
+        // root (resolved from the store's meta) and returns the report inside the
+        // <travsr-data> envelope.
+        use travsr_core::EdgeKind;
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_node("crates/alpha/src/lib.rs", "fn:a");
+        let b = make_node("crates/beta/src/lib.rs", "fn:b");
+        let mut store = make_store(&[a.clone(), b.clone()], &[(a.id, b.id, EdgeKind::RefCall)]);
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+        std::fs::write(
+            dir.path().join(INVARIANTS_RULES_FILE),
+            r#"{"invariants":[
+                {"name":"alpha is pure","components":["crates/alpha"],"mayDependOn":[],"because":"r1"},
+                {"name":"beta is fine","components":["crates/beta"],"mayDependOn":["crates/alpha"]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let out = check_invariants(&store, "");
+        assert!(out.contains("<travsr-data>"), "envelope missing:\n{out}");
+        assert!(out.contains("VIOLATED alpha is pure"), "{out}");
+        assert!(out.contains("depends on 'crates/beta'"), "{out}");
+        assert!(out.contains("holds    beta is fine"), "{out}");
+    }
+
+    #[test]
+    fn check_invariants_fails_open_without_a_rules_file_or_root() {
+        // A repository that declares no rules has none to break; and an index with
+        // no resolvable root is reported, not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = make_store(&[make_node("crates/alpha/src/lib.rs", "fn:a")], &[]);
+        store
+            .set_meta("repo_root", dir.path().to_str().unwrap())
+            .unwrap();
+        let out = check_invariants(&store, "ratified");
+        assert!(
+            out.contains("nothing to check") && out.contains(INVARIANTS_RULES_FILE),
+            "{out}"
+        );
+
+        let rootless = make_store(&[make_node("crates/alpha/src/lib.rs", "fn:a")], &[]);
+        let out = check_invariants(&rootless, "ratified");
+        assert!(out.contains("cannot locate the repository root"), "{out}");
+
+        // An unknown provenance is rejected, as the CLI and the brief reject it.
+        let out = check_invariants(&rootless, "ratifed");
+        assert!(out.contains("unknown provenance"), "{out}");
     }
 
     #[test]
