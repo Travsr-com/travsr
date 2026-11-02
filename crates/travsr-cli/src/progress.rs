@@ -539,7 +539,7 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
         }
         if !changed.is_empty() {
             out.push(format!(
-                "  Updated {} so travsr's files stay on this machine.",
+                "  Updated {} so travsr's local files stay out of your commits.",
                 changed.join(", ")
             ));
         }
@@ -991,7 +991,7 @@ mod tests {
                 "  Claude Code asks once whether to trust this project's tools: accept it \
                  (or run /mcp in Claude Code).",
                 "  Created .travsrignore: edit it to leave generated or vendored folders out.",
-                "  Updated .gitignore so travsr's files stay on this machine.",
+                "  Updated .gitignore so travsr's local files stay out of your commits.",
                 "  Optional: `travsr embed init` adds meaning-based search.",
                 "Ready. Ask your AI about this code.",
                 "  java        needs JDK, Maven or Gradle. Install JDK, Maven or Gradle, then \
