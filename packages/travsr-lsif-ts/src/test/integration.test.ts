@@ -538,6 +538,52 @@ test('an enum member read references variant:Enum.Member as a non-call', () => {
   assert.strictEqual(uses[0]['travsr_call'], false, 'an enum member read is not a call');
 });
 
+// Tree-sitter writes a class field / interface member as `field:Owner.name`
+// (#757). A property access (`this.store`) reads one and is a use site, not a
+// call. UserRepository.store is read three times: get/set/delete.
+test('a class field read references field:Owner.name as a non-call', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const store = parseVertices(result.stdout).find(
+    (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'field:UserRepository.store'
+  );
+  assert.ok(store, 'field:UserRepository.store must have a resultSet');
+  const edges = parseEdges(result.stdout);
+  const refResult = edges.find(
+    (e) => e['label'] === 'textDocument/references' && e['outV'] === store['id']
+  );
+  assert.ok(refResult, 'field:UserRepository.store must have a referenceResult');
+  const uses = edges.filter(
+    (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult['inV']
+  );
+  assert.strictEqual(uses.length, 3, 'the three `this.store` reads must be referenced');
+  assert.ok(
+    uses.every((u) => u['travsr_call'] === false),
+    'a field read is not a call'
+  );
+});
+
+// An interface member is a field too (find_parent_type returns the interface),
+// but a property of a bare object type (`type Result = { ok; value; error }`)
+// has no named owner and must mint no `field:` node — mirroring tree-sitter,
+// which drops it.
+test('interface members are fields, object-type members are not', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const sigs = travsrSignatures(result.stdout, 'types.ts');
+  assert.ok(sigs.includes('field:User.id'), `expected field:User.id in ${JSON.stringify(sigs)}`);
+  const orphanObjectMembers = sigs.filter((s) => /^field:.*\.(ok|value|error)$/.test(s));
+  assert.deepStrictEqual(
+    orphanObjectMembers,
+    [],
+    `object-type members must mint no field node, got ${JSON.stringify(orphanObjectMembers)}`
+  );
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** All travsr_vname signatures in the dump whose path ends with `fileSuffix`. */

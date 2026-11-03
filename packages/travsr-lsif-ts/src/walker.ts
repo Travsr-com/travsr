@@ -223,13 +223,17 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     }
   }
 
-  // ── RefEnumMember: `Tone.Warm` reads an enum member ─────────────────────
-  // Not a call, so it is recorded as a use site only. Restricted to enum
-  // members: any other property access would also resolve to a pass-1 symbol
-  // (a method passed as a value), which is not what this arm is for.
+  // ── RefMember: `Tone.Warm` reads an enum member, `this.itemsByFile` reads a
+  // class field or interface member ──────────────────────────────────────
+  // Not a call, so recorded as a use site only. resolveRefTarget gates on a
+  // pass-1 symbol, so a method passed as a value (SymbolFlags.Method, not
+  // Property) is not swept in — only enum members and fields registered in
+  // pass 1 reach a resultSet here.
   if (
     ts.isPropertyAccessExpression(node) &&
-    ((ctx.checker.getSymbolAtLocation(node.name)?.flags ?? 0) & ts.SymbolFlags.EnumMember) !== 0
+    ((ctx.checker.getSymbolAtLocation(node.name)?.flags ?? 0) &
+      (ts.SymbolFlags.EnumMember | ts.SymbolFlags.Property)) !==
+      0
   ) {
     const info = resolveRefTarget(node.name, ctx.checker, ctx.symbolInfos);
     if (info) {
@@ -343,6 +347,9 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
  *   var:varName              → TOP-LEVEL VariableDeclaration
  *   interface:InterfaceName  → InterfaceDeclaration
  *   variant:Enum.Member      → EnumMember with an identifier name
+ *   field:Owner.name         → PropertyDeclaration / PropertySignature, owner
+ *                              being the nearest named class or interface
+ *                              (#757; mirrors typescript.rs find_parent_type)
  *
  * Returns undefined for unrecognised node kinds AND for non-top-level variable
  * declarations — the caller omits travsr_vname in that case, so the resultSet
@@ -384,6 +391,19 @@ function computeTravsrVName(
     signature = `method:${node.parent.name.text}.${node.name.text}`;
   } else if (ts.isEnumMember(node) && ts.isIdentifier(node.name)) {
     signature = `variant:${node.parent.name.text}.${node.name.text}`;
+  } else if (
+    (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
+    // #757: a class field / interface member is `field:Owner.name`. The owner
+    // is the nearest named class or interface; a member of an anonymous class
+    // expression or a bare object type (`type T = { x }`) has no named owner,
+    // and tree-sitter writes no node for it, so we omit the vname too.
+    const owner = findParentType(node);
+    if (owner === undefined) {
+      return undefined;
+    }
+    signature = `field:${owner}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
     // (lexical_declaration (variable_declarator)))`). A local has no node, so
@@ -441,6 +461,29 @@ function findParentClassName(node: ts.Node): string | undefined {
 }
 
 /**
+ * Owner name for a class field or interface member, mirroring
+ * `find_parent_type` in travsr-analysis/src/typescript.rs so the emitter and
+ * tree-sitter compute the same `field:Owner.name`. Walks up (through object
+ * types, exactly as the Rust walk does) to the nearest class or interface and
+ * returns its name. An anonymous class expression stops the walk and yields
+ * undefined — matching the Rust `?` that returns None when the class node has
+ * no name rather than climbing to an outer owner.
+ */
+function findParentType(node: ts.Node): string | undefined {
+  let current: ts.Node | undefined = node.parent;
+  while (current) {
+    if (ts.isClassDeclaration(current) || ts.isClassExpression(current)) {
+      return current.name?.text;
+    }
+    if (ts.isInterfaceDeclaration(current)) {
+      return current.name.text;
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
+
+/**
  * Given a declaration node, return [symbol, nameNode] if it is a named
  * declaration kind we want to index, otherwise [undefined, undefined].
  */
@@ -467,6 +510,12 @@ function resolveDeclarationSymbol(
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   if (ts.isEnumMember(node) && ts.isIdentifier(node.name)) {
+    return [checker.getSymbolAtLocation(node.name), node.name];
+  }
+  if (
+    (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   return [undefined, undefined];
