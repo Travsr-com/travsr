@@ -225,12 +225,19 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
 
   // ── RefMember: `Tone.Warm` reads an enum member, `this.itemsByFile` reads a
   // class field or interface member ──────────────────────────────────────
-  // Not a call, so recorded as a use site only. resolveRefTarget gates on a
-  // pass-1 symbol, so a method passed as a value (SymbolFlags.Method, not
-  // Property) is not swept in — only enum members and fields registered in
-  // pass 1 reach a resultSet here.
+  // Not a call, so recorded as a use site only. A property access that is the
+  // callee of a call/new (`this.cb()` on a callable field) is already recorded
+  // with travsr_call=true by the RefCall arm above; recording it again here
+  // would double-count the field and emit a nested, overlapping range, so skip
+  // that case. resolveRefTarget gates on a pass-1 symbol, so a method passed as
+  // a value (SymbolFlags.Method, not Property) is not swept in; only enum
+  // members and class/interface fields registered in pass 1 reach a resultSet.
   if (
     ts.isPropertyAccessExpression(node) &&
+    !(
+      (ts.isCallExpression(node.parent) || ts.isNewExpression(node.parent)) &&
+      node.parent.expression === node
+    ) &&
     ((ctx.checker.getSymbolAtLocation(node.name)?.flags ?? 0) &
       (ts.SymbolFlags.EnumMember | ts.SymbolFlags.Property)) !==
       0
@@ -514,8 +521,14 @@ function resolveDeclarationSymbol(
   }
   if (
     (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) &&
-    ts.isIdentifier(node.name)
+    ts.isIdentifier(node.name) &&
+    findParentType(node) !== undefined
   ) {
+    // Only a class field or interface member (a named owner) becomes a
+    // `field:Owner.name` node. An inline object-type member (`type T = { x }`)
+    // has no owner, so computeTravsrVName drops it; registering it here anyway
+    // would emit an opaque, signature-less resultSet that maps to no graph node
+    // (tree-sitter drops it too). Gate on the owner so pass 1 matches the drop.
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
   return [undefined, undefined];

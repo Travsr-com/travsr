@@ -565,6 +565,33 @@ test('a class field read references field:Owner.name as a non-call', () => {
   );
 });
 
+// A callable field invoked directly (`this.onSave()`) is the callee of a call,
+// so the RefCall arm already records it as a call. The RefMember arm must not
+// also record it as a non-call read: that would double-count the field and emit
+// a range nested inside the call range. Exactly one reference, and it is a call.
+test('a directly-invoked callable field is referenced once, as a call', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const onSave = parseVertices(result.stdout).find(
+    (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'field:UserRepository.onSave'
+  );
+  assert.ok(onSave, 'field:UserRepository.onSave must have a resultSet');
+  const edges = parseEdges(result.stdout);
+  const refResult = edges.find(
+    (e) => e['label'] === 'textDocument/references' && e['outV'] === onSave['id']
+  );
+  assert.ok(refResult, 'field:UserRepository.onSave must have a referenceResult');
+  const uses = edges.filter(
+    (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult['inV']
+  );
+  assert.strictEqual(uses.length, 1, 'the one `this.onSave()` call must be referenced exactly once');
+  // A call omits travsr_call (only non-calls set it false), so `undefined` here
+  // means the single reference is the call, not a second, non-call field read.
+  assert.strictEqual(uses[0]['travsr_call'], undefined, 'a direct invocation is a call, not a field read');
+});
+
 // An interface member is a field too (find_parent_type returns the interface),
 // but a property of a bare object type (`type Result = { ok; value; error }`)
 // has no named owner and must mint no `field:` node — mirroring tree-sitter,
