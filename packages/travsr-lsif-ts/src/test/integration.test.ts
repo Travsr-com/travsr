@@ -601,13 +601,26 @@ test('interface members are fields, object-type members are not', () => {
     encoding: 'utf-8',
   });
   assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
-  const sigs = travsrSignatures(result.stdout, 'types.ts');
-  assert.ok(sigs.includes('field:User.id'), `expected field:User.id in ${JSON.stringify(sigs)}`);
-  const orphanObjectMembers = sigs.filter((s) => /^field:.*\.(ok|value|error)$/.test(s));
+  // The exact field set of types.ts: every User/AuthToken member (interfaces)
+  // becomes a field, and no member of `type Result = { ok; value; error }` (a
+  // bare object type with no named owner) does. An exact set, not a name regex,
+  // so a future interface member named ok/value/error is a deliberate addition
+  // to this list rather than a spurious "object-type member leaked" failure.
+  const fields = travsrSignatures(result.stdout, 'types.ts')
+    .filter((s) => s.startsWith('field:'))
+    .sort();
   assert.deepStrictEqual(
-    orphanObjectMembers,
-    [],
-    `object-type members must mint no field node, got ${JSON.stringify(orphanObjectMembers)}`
+    fields,
+    [
+      'field:AuthToken.expiresAt',
+      'field:AuthToken.token',
+      'field:AuthToken.userId',
+      'field:User.createdAt',
+      'field:User.email',
+      'field:User.id',
+      'field:User.name',
+    ],
+    `types.ts field nodes must be exactly the interface members, got ${JSON.stringify(fields)}`
   );
 });
 

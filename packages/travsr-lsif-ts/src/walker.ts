@@ -237,17 +237,19 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     !(
       (ts.isCallExpression(node.parent) || ts.isNewExpression(node.parent)) &&
       node.parent.expression === node
-    ) &&
-    ((ctx.checker.getSymbolAtLocation(node.name)?.flags ?? 0) &
-      (ts.SymbolFlags.EnumMember | ts.SymbolFlags.Property)) !==
-      0
+    )
   ) {
-    const info = resolveRefTarget(node.name, ctx.checker, ctx.symbolInfos);
-    if (info) {
-      const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
-      ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
-      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
-      ctx.refRangeIds.push(rangeId);
+    // Resolve the accessed symbol once: both the flag gate and the resultSet
+    // lookup need it, and this arm now runs for every property access.
+    const sym = ctx.checker.getSymbolAtLocation(node.name);
+    if (((sym?.flags ?? 0) & (ts.SymbolFlags.EnumMember | ts.SymbolFlags.Property)) !== 0) {
+      const info = resolveRefTargetFromSymbol(sym, ctx.checker, ctx.symbolInfos);
+      if (info) {
+        const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
+        ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
+        ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
+        ctx.refRangeIds.push(rangeId);
+      }
     }
   }
 
@@ -543,7 +545,20 @@ function resolveRefTarget(
   checker: ts.TypeChecker,
   symbolInfos: Map<ts.Symbol, SymbolInfo>
 ): SymbolInfo | undefined {
-  const raw = checker.getSymbolAtLocation(node);
+  return resolveRefTargetFromSymbol(checker.getSymbolAtLocation(node), checker, symbolInfos);
+}
+
+/**
+ * Resolve an already-looked-up symbol to its pass-1 SymbolInfo. Split out of
+ * resolveRefTarget so a caller that has already called getSymbolAtLocation (the
+ * RefMember flag gate, which now runs for every property access) does not pay
+ * for a second identical lookup.
+ */
+function resolveRefTargetFromSymbol(
+  raw: ts.Symbol | undefined,
+  checker: ts.TypeChecker,
+  symbolInfos: Map<ts.Symbol, SymbolInfo>
+): SymbolInfo | undefined {
   const resolved = resolveAlias(raw, checker);
   if (!resolved) return undefined;
   const info = symbolInfos.get(resolved);
