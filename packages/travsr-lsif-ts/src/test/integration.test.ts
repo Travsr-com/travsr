@@ -592,6 +592,59 @@ test('a directly-invoked callable field is referenced once, as a call', () => {
   assert.strictEqual(uses[0]['travsr_call'], undefined, 'a direct invocation is a call, not a field read');
 });
 
+// A class-field component used as a JSX tag (`<this.Comp/>`, the React
+// compound-component pattern `<Menu.Item/>`) is the tagName of a
+// JsxSelfClosingElement, which the RefJsx arm already records as a call. The
+// tagName is a PropertyAccessExpression, so without a JSX guard the RefMember
+// arm records it a second time as a non-call field read, nested inside the call
+// range. Exactly one reference, and it is the call.
+test('a class-field JSX tag is referenced once, not double-counted (RefMember JSX guard)', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-jsxfield-')));
+  try {
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { target: 'ES2020', module: 'esnext', moduleResolution: 'bundler', jsx: 'react-jsx', strict: true },
+        include: ['./**/*.tsx'],
+      })
+    );
+    fs.writeFileSync(
+      path.join(repo, 'panel.tsx'),
+      'export class Panel {\n' +
+        '  private Comp = (): null => null;\n' +
+        '  render() {\n' +
+        '    return <this.Comp />;\n' +
+        '  }\n' +
+        '}\n'
+    );
+    const result = spawnSync(
+      process.execPath,
+      [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')],
+      { encoding: 'utf-8' }
+    );
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+    const comp = parseVertices(result.stdout).find(
+      (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'field:Panel.Comp'
+    );
+    assert.ok(comp, 'field:Panel.Comp must have a resultSet');
+    const edges = parseEdges(result.stdout);
+    const refResult = edges.find(
+      (e) => e['label'] === 'textDocument/references' && e['outV'] === comp!['id']
+    );
+    assert.ok(refResult, 'field:Panel.Comp must have a referenceResult');
+    const uses = edges.filter(
+      (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult!['inV']
+    );
+    assert.strictEqual(uses.length, 1, '<this.Comp/> must be referenced exactly once, not double-counted');
+    // A call omits travsr_call; a non-call field read sets it false. The single
+    // reference must be the RefJsx call, so travsr_call is undefined here.
+    assert.strictEqual(uses[0]['travsr_call'], undefined, 'the one reference is the JSX call, not a field read');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 // An interface member is a field too (find_parent_type returns the interface),
 // but a property of a bare object type (`type Result = { ok; value; error }`)
 // has no named owner and must mint no `field:` node — mirroring tree-sitter,
