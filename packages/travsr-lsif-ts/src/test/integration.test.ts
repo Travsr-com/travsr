@@ -538,6 +538,145 @@ test('an enum member read references variant:Enum.Member as a non-call', () => {
   assert.strictEqual(uses[0]['travsr_call'], false, 'an enum member read is not a call');
 });
 
+// Tree-sitter writes a class field / interface member as `field:Owner.name`
+// (#757). A property access (`this.store`) reads one and is a use site, not a
+// call. UserRepository.store is read three times: get/set/delete.
+test('a class field read references field:Owner.name as a non-call', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const store = parseVertices(result.stdout).find(
+    (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'field:UserRepository.store'
+  );
+  assert.ok(store, 'field:UserRepository.store must have a resultSet');
+  const edges = parseEdges(result.stdout);
+  const refResult = edges.find(
+    (e) => e['label'] === 'textDocument/references' && e['outV'] === store['id']
+  );
+  assert.ok(refResult, 'field:UserRepository.store must have a referenceResult');
+  const uses = edges.filter(
+    (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult['inV']
+  );
+  assert.strictEqual(uses.length, 3, 'the three `this.store` reads must be referenced');
+  assert.ok(
+    uses.every((u) => u['travsr_call'] === false),
+    'a field read is not a call'
+  );
+});
+
+// A callable field invoked directly (`this.onSave()`) is the callee of a call,
+// so the RefCall arm already records it as a call. The RefMember arm must not
+// also record it as a non-call read: that would double-count the field and emit
+// a range nested inside the call range. Exactly one reference, and it is a call.
+test('a directly-invoked callable field is referenced once, as a call', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  const onSave = parseVertices(result.stdout).find(
+    (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'field:UserRepository.onSave'
+  );
+  assert.ok(onSave, 'field:UserRepository.onSave must have a resultSet');
+  const edges = parseEdges(result.stdout);
+  const refResult = edges.find(
+    (e) => e['label'] === 'textDocument/references' && e['outV'] === onSave['id']
+  );
+  assert.ok(refResult, 'field:UserRepository.onSave must have a referenceResult');
+  const uses = edges.filter(
+    (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult['inV']
+  );
+  assert.strictEqual(uses.length, 1, 'the one `this.onSave()` call must be referenced exactly once');
+  // A call omits travsr_call (only non-calls set it false), so `undefined` here
+  // means the single reference is the call, not a second, non-call field read.
+  assert.strictEqual(uses[0]['travsr_call'], undefined, 'a direct invocation is a call, not a field read');
+});
+
+// A class-field component used as a JSX tag (`<this.Comp/>`, the React
+// compound-component pattern `<Menu.Item/>`) is the tagName of a
+// JsxSelfClosingElement, which the RefJsx arm already records as a call. The
+// tagName is a PropertyAccessExpression, so without a JSX guard the RefMember
+// arm records it a second time as a non-call field read, nested inside the call
+// range. Exactly one reference, and it is the call.
+test('a class-field JSX tag is referenced once, not double-counted (RefMember JSX guard)', () => {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'travsr-jsxfield-')));
+  try {
+    fs.writeFileSync(
+      path.join(repo, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { target: 'ES2020', module: 'esnext', moduleResolution: 'bundler', jsx: 'react-jsx', strict: true },
+        include: ['./**/*.tsx'],
+      })
+    );
+    fs.writeFileSync(
+      path.join(repo, 'panel.tsx'),
+      'export class Panel {\n' +
+        '  private Comp = (): null => null;\n' +
+        '  render() {\n' +
+        '    return <this.Comp />;\n' +
+        '  }\n' +
+        '}\n'
+    );
+    const result = spawnSync(
+      process.execPath,
+      [EMITTER_BIN, '--project', path.join(repo, 'tsconfig.json')],
+      { encoding: 'utf-8' }
+    );
+    assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+
+    const comp = parseVertices(result.stdout).find(
+      (v) => (v['travsr_vname'] as { signature?: string } | undefined)?.signature === 'field:Panel.Comp'
+    );
+    assert.ok(comp, 'field:Panel.Comp must have a resultSet');
+    const edges = parseEdges(result.stdout);
+    const refResult = edges.find(
+      (e) => e['label'] === 'textDocument/references' && e['outV'] === comp!['id']
+    );
+    assert.ok(refResult, 'field:Panel.Comp must have a referenceResult');
+    const uses = edges.filter(
+      (e) => e['label'] === 'item' && e['property'] === 'references' && e['outV'] === refResult!['inV']
+    );
+    assert.strictEqual(uses.length, 1, '<this.Comp/> must be referenced exactly once, not double-counted');
+    // A call omits travsr_call; a non-call field read sets it false. The single
+    // reference must be the RefJsx call, so travsr_call is undefined here.
+    assert.strictEqual(uses[0]['travsr_call'], undefined, 'the one reference is the JSX call, not a field read');
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// An interface member is a field too (find_parent_type returns the interface),
+// but a property of a bare object type (`type Result = { ok; value; error }`)
+// has no named owner and must mint no `field:` node — mirroring tree-sitter,
+// which drops it.
+test('interface members are fields, object-type members are not', () => {
+  const result = spawnSync(process.execPath, [EMITTER_BIN, '--project', FIXTURE_TSCONFIG], {
+    encoding: 'utf-8',
+  });
+  assert.strictEqual(result.status, 0, `emitter crashed:\n${result.stderr}`);
+  // The exact field set of types.ts: every User/AuthToken member (interfaces)
+  // becomes a field, and no member of `type Result = { ok; value; error }` (a
+  // bare object type with no named owner) does. An exact set, not a name regex,
+  // so a future interface member named ok/value/error is a deliberate addition
+  // to this list rather than a spurious "object-type member leaked" failure.
+  const fields = travsrSignatures(result.stdout, 'types.ts')
+    .filter((s) => s.startsWith('field:'))
+    .sort();
+  assert.deepStrictEqual(
+    fields,
+    [
+      'field:AuthToken.expiresAt',
+      'field:AuthToken.token',
+      'field:AuthToken.userId',
+      'field:User.createdAt',
+      'field:User.email',
+      'field:User.id',
+      'field:User.name',
+    ],
+    `types.ts field nodes must be exactly the interface members, got ${JSON.stringify(fields)}`
+  );
+});
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** All travsr_vname signatures in the dump whose path ends with `fileSuffix`. */

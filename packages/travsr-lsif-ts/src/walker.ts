@@ -163,11 +163,11 @@ export function walk(tsconfigPath: string, emitter: Emitter, rootDir?: string): 
 // ── Pass-1 visitor (module-level — one function object, no per-file allocation) ──
 
 function visitDef(node: ts.Node, ctx: DefCtx): void {
-  const [symbol, nameNode] = resolveDeclarationSymbol(node, ctx.checker);
+  const [symbol, nameNode, owner] = resolveDeclarationSymbol(node, ctx.checker);
 
   if (symbol && nameNode) {
     if (!ctx.symbolInfos.has(symbol)) {
-      const vname = computeTravsrVName(node, ctx.sf, ctx.basePath);
+      const vname = computeTravsrVName(node, ctx.sf, ctx.basePath, owner);
       const resultSetId = ctx.emitter.emitResultSet(vname);
       const defResultId = ctx.emitter.emitDefinitionResult();
       const refResultId = ctx.emitter.emitReferenceResult();
@@ -223,20 +223,40 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
     }
   }
 
-  // ── RefEnumMember: `Tone.Warm` reads an enum member ─────────────────────
-  // Not a call, so it is recorded as a use site only. Restricted to enum
-  // members: any other property access would also resolve to a pass-1 symbol
-  // (a method passed as a value), which is not what this arm is for.
+  // ── RefMember: `Tone.Warm` reads an enum member, `this.itemsByFile` reads a
+  // class field or interface member ──────────────────────────────────────
+  // Not a call, so recorded as a use site only. A property access that is the
+  // callee of a call/new (`this.cb()` on a callable field) is already recorded
+  // with travsr_call=true by the RefCall arm above; a property access that is
+  // the tag of a JSX element (`<this.Comp/>`, `<Menu.Item/>`) is likewise
+  // already recorded by the RefJsx arm below. Recording either again here would
+  // double-count the field and emit a nested, overlapping range, so skip both.
+  // The `(EnumMember | Property)` flag gate below is what excludes a method used
+  // as a value (SymbolFlags.Method, not Property): methods are pass-1 symbols
+  // too, so resolveRefTargetFromSymbol would resolve one; only the flag gate
+  // keeps `const f = obj.method` from recording a spurious non-call reference.
   if (
     ts.isPropertyAccessExpression(node) &&
-    ((ctx.checker.getSymbolAtLocation(node.name)?.flags ?? 0) & ts.SymbolFlags.EnumMember) !== 0
+    !(
+      (ts.isCallExpression(node.parent) || ts.isNewExpression(node.parent)) &&
+      node.parent.expression === node
+    ) &&
+    !(
+      (ts.isJsxOpeningElement(node.parent) || ts.isJsxSelfClosingElement(node.parent)) &&
+      node.parent.tagName === node
+    )
   ) {
-    const info = resolveRefTarget(node.name, ctx.checker, ctx.symbolInfos);
-    if (info) {
-      const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
-      ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
-      ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
-      ctx.refRangeIds.push(rangeId);
+    // Resolve the accessed symbol once: both the flag gate and the resultSet
+    // lookup need it, and this arm now runs for every property access.
+    const sym = ctx.checker.getSymbolAtLocation(node.name);
+    if (((sym?.flags ?? 0) & (ts.SymbolFlags.EnumMember | ts.SymbolFlags.Property)) !== 0) {
+      const info = resolveRefTargetFromSymbol(sym, ctx.checker, ctx.symbolInfos);
+      if (info) {
+        const rangeId = ctx.emitter.emitRange(ctx.sf, node.name);
+        ctx.emitter.emitEdge('next', rangeId, info.resultSetId);
+        ctx.emitter.emitItem(info.referenceResultId, [rangeId], ctx.docId, 'references', false);
+        ctx.refRangeIds.push(rangeId);
+      }
     }
   }
 
@@ -343,6 +363,9 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
  *   var:varName              → TOP-LEVEL VariableDeclaration
  *   interface:InterfaceName  → InterfaceDeclaration
  *   variant:Enum.Member      → EnumMember with an identifier name
+ *   field:Owner.name         → PropertyDeclaration / PropertySignature, owner
+ *                              being the nearest named class or interface
+ *                              (#757; mirrors typescript.rs find_parent_type)
  *
  * Returns undefined for unrecognised node kinds AND for non-top-level variable
  * declarations — the caller omits travsr_vname in that case, so the resultSet
@@ -361,7 +384,8 @@ function visitRef(node: ts.Node, ctx: RefCtx): void {
 function computeTravsrVName(
   node: ts.Node,
   sf: ts.SourceFile,
-  basePath: string
+  basePath: string,
+  owner?: string
 ): { path: string; signature: string } | undefined {
   const relPath = path.relative(basePath, sf.fileName).replace(/\\/g, '/');
   let signature: string;
@@ -384,6 +408,18 @@ function computeTravsrVName(
     signature = `method:${node.parent.name.text}.${node.name.text}`;
   } else if (ts.isEnumMember(node) && ts.isIdentifier(node.name)) {
     signature = `variant:${node.parent.name.text}.${node.name.text}`;
+  } else if (
+    (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
+    // #757: a class field / interface member is `field:Owner.name`. The owner
+    // is the nearest named class or interface, resolved once by the caller
+    // (resolveDeclarationSymbol) and passed in. A member of an anonymous class
+    // expression or a bare object type (`type T = { x }`) has no named owner;
+    // resolveDeclarationSymbol drops it in pass 1 (returns [undefined, undefined])
+    // and tree-sitter writes no node for it either, so this branch is only
+    // reached with an owner defined.
+    signature = `field:${owner}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
     // (lexical_declaration (variable_declarator)))`). A local has no node, so
@@ -441,13 +477,36 @@ function findParentClassName(node: ts.Node): string | undefined {
 }
 
 /**
+ * Owner name for a class field or interface member, mirroring
+ * `find_parent_type` in travsr-analysis/src/typescript.rs so the emitter and
+ * tree-sitter compute the same `field:Owner.name`. Walks up (through object
+ * types, exactly as the Rust walk does) to the nearest class or interface and
+ * returns its name. An anonymous class expression stops the walk and yields
+ * undefined — matching the Rust `?` that returns None when the class node has
+ * no name rather than climbing to an outer owner.
+ */
+function findParentType(node: ts.Node): string | undefined {
+  let current: ts.Node | undefined = node.parent;
+  while (current) {
+    if (ts.isClassDeclaration(current) || ts.isClassExpression(current)) {
+      return current.name?.text;
+    }
+    if (ts.isInterfaceDeclaration(current)) {
+      return current.name.text;
+    }
+    current = current.parent;
+  }
+  return undefined;
+}
+
+/**
  * Given a declaration node, return [symbol, nameNode] if it is a named
  * declaration kind we want to index, otherwise [undefined, undefined].
  */
 function resolveDeclarationSymbol(
   node: ts.Node,
   checker: ts.TypeChecker
-): [ts.Symbol | undefined, ts.Node | undefined] {
+): [ts.Symbol | undefined, ts.Node | undefined, string?] {
   if (ts.isClassDeclaration(node) && node.name) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
@@ -469,6 +528,23 @@ function resolveDeclarationSymbol(
   if (ts.isEnumMember(node) && ts.isIdentifier(node.name)) {
     return [checker.getSymbolAtLocation(node.name), node.name];
   }
+  if (
+    (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) &&
+    ts.isIdentifier(node.name)
+  ) {
+    // Only a class field or interface member (a named owner) becomes a
+    // `field:Owner.name` node. An inline object-type member (`type T = { x }`)
+    // has no owner, so computeTravsrVName drops it; registering it here anyway
+    // would emit an opaque, signature-less resultSet that maps to no graph node
+    // (tree-sitter drops it too). Gate on the owner so pass 1 matches the drop,
+    // and hand the resolved owner back so computeTravsrVName does not walk the
+    // parent chain a second time.
+    const owner = findParentType(node);
+    if (owner === undefined) {
+      return [undefined, undefined];
+    }
+    return [checker.getSymbolAtLocation(node.name), node.name, owner];
+  }
   return [undefined, undefined];
 }
 
@@ -481,7 +557,20 @@ function resolveRefTarget(
   checker: ts.TypeChecker,
   symbolInfos: Map<ts.Symbol, SymbolInfo>
 ): SymbolInfo | undefined {
-  const raw = checker.getSymbolAtLocation(node);
+  return resolveRefTargetFromSymbol(checker.getSymbolAtLocation(node), checker, symbolInfos);
+}
+
+/**
+ * Resolve an already-looked-up symbol to its pass-1 SymbolInfo. Split out of
+ * resolveRefTarget so a caller that has already called getSymbolAtLocation (the
+ * RefMember flag gate, which now runs for every property access) does not pay
+ * for a second identical lookup.
+ */
+function resolveRefTargetFromSymbol(
+  raw: ts.Symbol | undefined,
+  checker: ts.TypeChecker,
+  symbolInfos: Map<ts.Symbol, SymbolInfo>
+): SymbolInfo | undefined {
   const resolved = resolveAlias(raw, checker);
   if (!resolved) return undefined;
   const info = symbolInfos.get(resolved);
