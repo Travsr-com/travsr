@@ -86,7 +86,7 @@ clap = { version = "4", features = ["derive"] }
 blake3 = "1"
 tempfile = "3"
 streaming-iterator = "0.1"
-tree-sitter            = "0.26"
+tree-sitter            = "0.27"
 tree-sitter-typescript = "0.23"
 tree-sitter-rust       = "0.24"
 tree-sitter-python     = "0.25"
