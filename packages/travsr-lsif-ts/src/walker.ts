@@ -414,12 +414,11 @@ function computeTravsrVName(
   ) {
     // #757: a class field / interface member is `field:Owner.name`. The owner
     // is the nearest named class or interface, resolved once by the caller
-    // (resolveDeclarationSymbol) and passed in; a member of an anonymous class
-    // expression or a bare object type (`type T = { x }`) has no named owner,
-    // and tree-sitter writes no node for it, so we omit the vname too.
-    if (owner === undefined) {
-      return undefined;
-    }
+    // (resolveDeclarationSymbol) and passed in. A member of an anonymous class
+    // expression or a bare object type (`type T = { x }`) has no named owner;
+    // resolveDeclarationSymbol drops it in pass 1 (returns [undefined, undefined])
+    // and tree-sitter writes no node for it either, so this branch is only
+    // reached with an owner defined.
     signature = `field:${owner}.${node.name.text}`;
   } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
     // Tree-sitter only indexes program-child declarators (`(program
