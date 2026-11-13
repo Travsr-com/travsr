@@ -24,6 +24,10 @@ All notable changes to Travsr are documented here.
 
 - **`travsr init` now lets a team commit `.travsr/config.toml` (#1000).** The `.gitignore` entry is a managed block (`# travsr-local:begin` ... `# travsr-local:end`) that ignores everything under `.travsr/` except `config.toml`, so team settings can be shared while the graph, locks, logs, embeddings and guard sessions stay local. A repo with the old `/.travsr/` entry is migrated in place on the next `travsr init`; any rule of your own is left alone, and a damaged block is left untouched with a warning. The warning for runtime files git already tracks now names those files and suggests `git rm --cached -- <files>` instead of untracking the whole folder. `graph.db` stays ignored because every reindex rewrites it and a committed copy stops `git pull`; `git add -f .travsr/graph.db` opts in. See ADR-020 and `travsr ask "can my team commit the .travsr folder?"`.
 
+### Fixed
+
+- **A daemon left over from an older binary is replaced for every repository, not only the first one a process queries (#1082 B3).** The version check before a daemon-routed query ran once per process, so `travsr ui` (which switches between repositories) and a long-running `travsr mcp` serving several kept answering from the other repositories' stale daemons. It now runs once per repository.
+
 ---
 
 ## v1.4.0 - 2026-11-01

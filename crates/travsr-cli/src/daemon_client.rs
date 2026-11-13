@@ -6,9 +6,10 @@
 //! protocol version skew, transport error, malformed payload) falls back to
 //! [`open_read_store`], which itself prefers the read-only fast path.
 
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use travsr_store::SqliteStore;
@@ -302,17 +303,37 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     let _ = spawn_background_daemon(repo_root, exe, false);
 }
 
-/// Run [`restart_if_version_skewed`] at most once per process, on the first
-/// daemon-routed query. Keeps a multi-query command or a long-running `travsr
-/// mcp` from re-checking on every call (after one restart the daemon matches,
-/// so the check is a no-op anyway, but the Status round-trip is not free).
+/// Run [`restart_if_version_skewed`] at most once per process *per
+/// repository*, on the first daemon-routed query to it. Keeps a multi-query
+/// command or a long-running `travsr mcp` from re-checking on every call
+/// (after one restart the daemon matches, so the check is a no-op anyway, but
+/// the Status round-trip is not free).
+///
+/// #1082 B3: this was one process-wide `Once`, so a process that serves
+/// several repositories (`travsr ui`, which has a repo picker) checked only
+/// the first repo it queried and kept answering from every other repo's
+/// stale daemon.
 fn ensure_daemon_version_current(repo_root: &Path) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        if let Ok(exe) = std::env::current_exe() {
-            restart_if_version_skewed(repo_root, &exe);
-        }
-    });
+    static CHECKED: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let checked = CHECKED.get_or_init(Default::default);
+    if !first_time_for(checked, repo_root) {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        restart_if_version_skewed(repo_root, &exe);
+    }
+}
+
+/// Whether `repo_root` is new to `seen`, recording it. Keyed by the
+/// canonical path, so `repo` and `repo/.` or a differently cased Windows
+/// spelling count once. A poisoned lock still answers: the set only ever
+/// grows, so whatever it holds is valid.
+fn first_time_for(seen: &std::sync::Mutex<HashSet<PathBuf>>, repo_root: &Path) -> bool {
+    let key = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key)
 }
 
 /// Route one query to a running daemon. `None` means "use the direct path" —
@@ -469,6 +490,23 @@ pub fn warn_if_cross_checkout(db_path: &Path, reads_call_edges: bool) -> bool {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
+
+    /// #1082 B3: the version check is once per repository, not once per
+    /// process, so `travsr ui` checks every repo it is switched to.
+    #[test]
+    fn version_check_runs_once_per_repository() {
+        let seen = std::sync::Mutex::new(HashSet::new());
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert!(first_time_for(&seen, a.path()), "first query to repo a");
+        assert!(!first_time_for(&seen, a.path()), "second query to repo a");
+        assert!(
+            !first_time_for(&seen, &a.path().join(".")),
+            "another spelling of repo a"
+        );
+        assert!(first_time_for(&seen, b.path()), "first query to repo b");
+        assert!(!first_time_for(&seen, b.path()));
+    }
 
     /// The skew decision is the whole policy: a matching version is the only
     /// case left alone; a different version restarts, and a `None` (a daemon
