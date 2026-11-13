@@ -2866,6 +2866,78 @@ fn component_of(path: &str) -> &str {
     &path[..first]
 }
 
+/// Which components a JS/TS file imports by package name (#1082 B7), so the
+/// cross-component gate keeps a real monorepo call made through
+/// `import { x } from "@acme/utils"`, which has no file-to-file edge.
+#[derive(Default)]
+struct PackageImports {
+    /// Caller file -> the package names it imports (non-relative specifiers,
+    /// reduced to the package: `@acme/utils/sub` -> `@acme/utils`).
+    by_file: std::collections::HashMap<String, Vec<String>>,
+    /// Component -> its `package.json` `name`, when it has one.
+    names: std::collections::HashMap<String, Option<String>>,
+}
+
+impl PackageImports {
+    fn imports_component(&mut self, store: &SqliteStore, caller: &str, component: &str) -> bool {
+        if component.is_empty() {
+            return false;
+        }
+        let packages = self
+            .by_file
+            .entry(caller.to_string())
+            .or_insert_with(|| {
+                store
+                    .nodes_at_path(caller)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| n.kind == "import")
+                    .filter_map(|n| {
+                        let spec = n.vname.signature.strip_prefix("import:")?;
+                        package_of_specifier(spec).map(str::to_string)
+                    })
+                    .collect()
+            })
+            .clone();
+        if packages.is_empty() {
+            return false;
+        }
+        let name = self
+            .names
+            .entry(component.to_string())
+            .or_insert_with(|| {
+                let file = store
+                    .repo_root_from_db_path()?
+                    .join(component)
+                    .join("package.json");
+                let json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+                json.get("name")?.as_str().map(str::to_string)
+            })
+            .clone();
+        let folder = component.rsplit('/').next().unwrap_or(component);
+        packages
+            .iter()
+            .any(|p| name.as_deref() == Some(p.as_str()) || p.rsplit('/').next() == Some(folder))
+    }
+}
+
+/// The package a module specifier names, or `None` for a relative or absolute
+/// path: `@acme/utils/sub` -> `@acme/utils`, `lodash/fp` -> `lodash`.
+fn package_of_specifier(spec: &str) -> Option<&str> {
+    let spec = spec.trim_matches(|c| c == '"' || c == '\'');
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') {
+        return None;
+    }
+    let mut ends = spec.match_indices('/').map(|(i, _)| i);
+    let end = if spec.starts_with('@') {
+        ends.nth(1)
+    } else {
+        ends.next()
+    };
+    Some(end.map_or(spec, |i| &spec[..i]))
+}
+
 fn scope_bare_call<'a>(
     caller_path: &str,
     imported_files: &std::collections::HashSet<(String, String)>,
@@ -3153,6 +3225,9 @@ fn resolve_unresolved_calls(
     // #810: (caller file, imported file) pairs, for scoping duplicated bare
     // names. Loaded on the first such call only.
     let mut imported_files: Option<std::collections::HashSet<(String, String)>> = None;
+    // #1082 B7: package-name imports, read lazily per caller file and per
+    // component, for the cross-component gate below.
+    let mut package_imports = PackageImports::default();
 
     // #836: inherited-method resolution. `self.method()` recovers its receiver
     // as the enclosing class, so a method defined on a base class has no
@@ -3499,6 +3574,9 @@ fn resolve_unresolved_calls(
             if !caller_path.is_empty()
                 && component_of(callee_path) != component_of(caller_path)
                 && !imported_files.contains(&(caller_path.to_string(), callee_path.to_string()))
+                // A monorepo reaches another package by name
+                // (`import { x } from "@acme/utils"`), which has no file edge.
+                && !package_imports.imports_component(store, caller_path, component_of(callee_path))
             {
                 continue;
             }
@@ -9380,6 +9458,35 @@ mod tests {
         let (edges, _) = resolve_unresolved_calls(&store, &[call(sibling.id)], &[], &[], &none);
         assert_eq!(edges.len(), 1, "same-component call dropped: {edges:?}");
         assert_eq!(edges[0].dst, ext.id);
+
+        // Review fix: a monorepo call through a package-name import is real.
+        // packages/web imports "@acme/travsr-vscode/util"; the folder name
+        // matches, so the cross-component callee is kept.
+        let web = Node::new(
+            VName::new("", "", "packages/web/src/app.ts", "typescript", "fn:boot"),
+            "function",
+        );
+        let web_import = Node::new(
+            VName::new(
+                "",
+                "",
+                "packages/web/src/app.ts",
+                "typescript",
+                "import:@acme/travsr-vscode/util",
+            ),
+            "import",
+        );
+        store.put_node(&web).unwrap();
+        store.put_node(&web_import).unwrap();
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(web.id)], &[], &[], &none);
+        assert_eq!(edges.len(), 1, "package-import call dropped: {edges:?}");
+        assert_eq!(edges[0].dst, ext.id);
+
+        assert_eq!(package_of_specifier("@acme/utils/sub"), Some("@acme/utils"));
+        assert_eq!(package_of_specifier("lodash/fp"), Some("lodash"));
+        assert_eq!(package_of_specifier("vscode"), Some("vscode"));
+        assert_eq!(package_of_specifier("./local"), None);
+        assert_eq!(package_of_specifier("../up"), None);
     }
 
     #[test]
