@@ -548,3 +548,6 @@ body:not(.ui-page) #brand .word {
   .guide-step { grid-template-columns: 26px minmax(0, 1fr); }
   .guide-act { grid-column: 2; }
 }
+/* The guide, hidden by the reader: one line to bring it back. */
+.guide-collapsed { display: flex; align-items: baseline; gap: 10px; margin: 12px 0 14px; font-size: 12px; }
+.guide-collapsed .muted { font-size: 11px; }

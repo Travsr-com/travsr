@@ -304,7 +304,6 @@
   // until the three required ones are done (or the reader hides it); a step
   // whose state is still being read shows "checking", not a guess.
   function renderGuide(d, hasGraph) {
-    if (ui.pref("guide.hidden." + ui.repo) === "1") return "";
     const tools = Array.isArray(d.connect) ? d.connect : null;
     const auto = tools ? tools.filter((t) => t.setup === "automatic") : [];
     const manual = tools ? tools.filter((t) => t.setup !== "automatic") : [];
@@ -328,6 +327,13 @@
     const required = steps.filter((s) => !s.optional);
     if (required.every((s) => s.known && s.done)) return "";
     const done = required.filter((s) => s.done).length;
+    // Hidden by the reader: keep one line in its place while a required step
+    // is still undone, so the guide can be brought back without clearing
+    // browser storage.
+    if (ui.pref("guide.hidden." + ui.repo) === "1") {
+      return '<div class="guide-collapsed"><button class="link-btn" type="button" data-show-guide="1" title="Show the Getting started steps again">Show getting started</button>' +
+        '<span class="muted">' + done + " of " + required.length + " steps done</span></div>";
+    }
     const next = steps.find((s) => s.known && !s.done && !s.after);
     return '<section class="guide" aria-label="Getting started"><div class="guide-head"><strong>Getting started</strong>' +
       '<span class="muted">' + done + " of " + required.length + " done</span>" +
@@ -851,11 +857,14 @@
   function wire(row) {
     const page = document.getElementById("page");
     page.addEventListener("click", async (ev) => {
-      const hide = ev.target.closest("[data-hide-guide]");
-      if (hide) {
-        ui.pref("guide.hidden." + ui.repo, "1");
-        const g = hide.closest(".guide");
-        if (g) g.remove();
+      const toggleGuide = ev.target.closest("[data-hide-guide], [data-show-guide]");
+      if (toggleGuide) {
+        ui.pref("guide.hidden." + ui.repo, toggleGuide.hasAttribute("data-hide-guide") ? "1" : "0");
+        // Redraw from what the page last read: no need to ask again.
+        const top = document.getElementById("top");
+        if (top && state.data) top.innerHTML = renderTop(state.data);
+        const again = document.querySelector(toggleGuide.hasAttribute("data-hide-guide") ? "[data-show-guide]" : "[data-hide-guide]");
+        if (again) again.focus();
         return;
       }
       const copy = ev.target.closest("[data-copy]");
@@ -943,7 +952,8 @@
     page.innerHTML = pageShell(row);
     wire(row);
     if (!row.indexed) {
-      document.getElementById("top").innerHTML = renderTop({ status: null, statusLoaded: true, index: parseIndexHealth(""), indexLoaded: true, diags: [], diagsLoaded: true, daemonDetail: "", sidecars: null, embedModels: [], integrity: null, languages: null, repos: null });
+      state.data = { status: null, statusLoaded: true, index: parseIndexHealth(""), indexLoaded: true, diags: [], diagsLoaded: true, daemonDetail: "", sidecars: null, embedModels: [], integrity: null, languages: null, repos: null };
+      document.getElementById("top").innerHTML = renderTop(state.data);
       renderLog();
       return;
     }
