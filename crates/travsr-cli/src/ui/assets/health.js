@@ -303,11 +303,21 @@
   // The steps a new repository needs, in order, each with its button. Shown
   // until the three required ones are done (or the reader hides it); a step
   // whose state is still being read shows "checking", not a guess.
-  function renderGuide(d, hasGraph) {
+  /** The AI tools `connect --print --json` found, split the one way both the
+   *  guide and the Agent connections section count them: tools `connect`
+   *  wires by itself (`auto`, of which `wired` already name travsr) and tools
+   *  that need a step in their own settings (`manual`). `tools` is null when
+   *  the answer could not be read. */
+  function connectState(d) {
     const tools = Array.isArray(d.connect) ? d.connect : null;
     const auto = tools ? tools.filter((t) => t.setup === "automatic") : [];
     const manual = tools ? tools.filter((t) => t.setup !== "automatic") : [];
-    const connected = auto.length > 0 && auto.every((t) => t.connected === true);
+    const wired = auto.filter((t) => t.connected === true).length;
+    return { tools, auto, manual, wired, allWired: auto.length > 0 && wired === auto.length };
+  }
+
+  function renderGuide(d, hasGraph) {
+    const { tools, manual, allWired: connected } = connectState(d);
     const embed = Array.isArray(d.sidecars) ? d.sidecars[0] : null;
     const names = (list) => list.map((t) => t.name + (t.setup === "automatic" && t.connected === true ? " (connected)" : "")).join(", ");
     const steps = [
@@ -481,8 +491,7 @@
           act("Register all", "travsr connect"),
           row("Found", "no AI coding tool on this machine yet; install one, then register", undefined, details));
       }
-      const auto = tools.filter((t) => t.setup === "automatic");
-      const wired = auto.filter((t) => t.connected === true).length;
+      const { auto, wired } = connectState(d);
       const chip = !auto.length ? statusChip("warn", "needs a step")
         : wired === auto.length ? statusChip("ok", wired + " connected")
         : wired === 0 ? statusChip("bad", "not connected")
