@@ -617,13 +617,18 @@ fn init_reports_an_already_tracked_travsr_dir_instead_of_untracking_it() {
     travsr_init_isolated(tmp.path(), home.path());
 
     // The state a pre-fix repo is already in.
+    std::fs::write(tmp.path().join(".travsr/daemon.lock"), "").unwrap();
     git(tmp.path(), &["add", "-f", ".travsr"]);
     git(tmp.path(), &["commit", "-q", "-m", "oops"]);
 
     let combined = travsr_init_isolated(tmp.path(), home.path());
     assert!(
-        combined.contains("git rm -r --cached .travsr"),
+        combined.contains("git rm --cached -- ") && combined.contains(".travsr/daemon.lock"),
         "init over a repo that already tracks .travsr/ must name the recovery command, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("git rm -r --cached .travsr"),
+        "the recovery command must name files, not the whole directory (config.toml may stay), got:\n{combined}"
     );
 
     let (_, tracked) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
@@ -658,9 +663,16 @@ fn init_appends_the_gitignore_entry_only_once() {
 
     let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
     assert_eq!(
-        gi.lines().filter(|l| l.trim() == "/.travsr/").count(),
+        gi.lines().filter(|l| l.trim() == "/.travsr/*").count(),
         1,
         "repeated `travsr init` must not stack duplicate entries, got:\n{gi}"
+    );
+    assert_eq!(
+        gi.lines()
+            .filter(|l| l.starts_with("# travsr-local:begin"))
+            .count(),
+        1,
+        "repeated `travsr init` must keep exactly one managed block, got:\n{gi}"
     );
 }
 
@@ -1034,4 +1046,303 @@ fn a_failed_language_install_shows_its_output_and_init_finishes() {
         "the install's own output: {stderr}"
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("Ready"));
+}
+
+// ── #1000: allow-list managed block, only .travsr/config.toml is committable ──
+
+const LOCAL_BLOCK: &str = "# travsr-local:begin (travsr runtime files, managed by `travsr init`)\n/.travsr/*\n!/.travsr/config.toml\n# travsr-local:end\n";
+const LEGACY_COMMENT: &str =
+    "# travsr local code graph. Never commit it, the WAL file changes on every read.";
+
+/// A committed repo with one source file, ready for `travsr init`.
+fn committed_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+    tmp
+}
+
+fn read_gi(dir: &std::path::Path) -> Vec<u8> {
+    std::fs::read(dir.join(".gitignore")).unwrap_or_default()
+}
+
+fn is_ignored(dir: &std::path::Path, rel: &str) -> bool {
+    StdCommand::new("git")
+        .args(["check-ignore", "--no-index", "-q", "--", rel])
+        .current_dir(dir)
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn init_writes_the_exact_allow_list_block_and_rerun_is_byte_identical() {
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(
+        String::from_utf8(read_gi(tmp.path())).unwrap(),
+        LOCAL_BLOCK,
+        "fresh repo must get exactly the managed block"
+    );
+    let first = read_gi(tmp.path());
+    travsr_init_isolated(tmp.path(), home.path());
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(
+        first,
+        read_gi(tmp.path()),
+        "re-running init must not change .gitignore"
+    );
+}
+
+#[test]
+fn every_runtime_file_is_ignored_and_only_config_toml_is_committable() {
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    travsr_init_isolated(tmp.path(), home.path());
+
+    let inventory = [
+        "graph.db",
+        "graph.db-wal",
+        "graph.db-shm",
+        "init.lock",
+        "daemon.lock",
+        "daemon-restart.lock",
+        "daemon-start.err",
+        "daemon-abc.sock",
+        "daemon.log.2026-01-01",
+        "embed.db",
+        "embed.db-wal",
+        "x.hnsw.usearch",
+        "x-docs.hnsw.usearch",
+        "embed.toml",
+        "embed.lock",
+        "embed.lock.info",
+        "embed.cancel",
+        "guard-sessions.json",
+    ];
+    for f in inventory {
+        let rel = format!(".travsr/{f}");
+        assert!(is_ignored(tmp.path(), &rel), "{rel} must be ignored");
+    }
+    assert!(
+        !is_ignored(tmp.path(), ".travsr/config.toml"),
+        "config.toml must stay committable"
+    );
+    // A same-named path nested elsewhere is not swept up by the anchored rule.
+    assert!(!is_ignored(tmp.path(), "vendor/.travsr/config.toml"));
+
+    // Materialize every inventory file plus config.toml, then `git add -A`.
+    let dir = tmp.path().join(".travsr");
+    for f in inventory {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    std::fs::write(dir.join("config.toml"), "# team\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    let (_, staged) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
+    assert_eq!(staged.trim(), ".travsr/config.toml", "got:\n{staged}");
+    // The real graph.db is on disk too and must not be staged.
+    assert!(dir.join("graph.db").exists());
+}
+
+#[test]
+fn legacy_pair_is_replaced_in_place_and_user_lines_survive_byte_for_byte() {
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    let before = "target/\n*.log  \n\n  # indented comment\n";
+    let after = "\n!keep.log\nnode_modules/\n";
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        format!("{before}{LEGACY_COMMENT}\n/.travsr/\n{after}"),
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "legacy"]);
+
+    travsr_init_isolated(tmp.path(), home.path());
+    let got = String::from_utf8(read_gi(tmp.path())).unwrap();
+    assert_eq!(got, format!("{before}{LOCAL_BLOCK}{after}"));
+    assert!(!got.contains(LEGACY_COMMENT));
+    assert!(is_ignored(tmp.path(), ".travsr/graph.db"));
+    assert!(!is_ignored(tmp.path(), ".travsr/config.toml"));
+
+    let again = read_gi(tmp.path());
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(again, read_gi(tmp.path()));
+}
+
+#[test]
+fn a_users_own_travsr_rule_is_left_alone() {
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    let mine = "node_modules/\n/.travsr/\n";
+    std::fs::write(tmp.path().join(".gitignore"), mine).unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "mine"]);
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(String::from_utf8(read_gi(tmp.path())).unwrap(), mine);
+}
+
+#[test]
+fn malformed_markers_leave_gitignore_untouched() {
+    let cases = [
+        "a\n# travsr-local:begin (x)\n/.travsr/*\n",
+        "a\n# travsr-local:end\n",
+        "a\n# travsr-local:end\n# travsr-local:begin (x)\n",
+        &format!("a\n{LOCAL_BLOCK}{LOCAL_BLOCK}"),
+    ];
+    for (i, content) in cases.iter().enumerate() {
+        let tmp = committed_repo();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), content).unwrap();
+        git(tmp.path(), &["add", "-A"]);
+        git(tmp.path(), &["commit", "-q", "-m", "m"]);
+        travsr_init_isolated(tmp.path(), home.path());
+        assert_eq!(
+            String::from_utf8(read_gi(tmp.path())).unwrap(),
+            *content,
+            "case {i} must be untouched"
+        );
+    }
+}
+
+#[test]
+fn crlf_and_missing_trailing_newline_are_preserved() {
+    // CRLF, appended block
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), "a\r\nb\r\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "m"]);
+    travsr_init_isolated(tmp.path(), home.path());
+    let got = String::from_utf8(read_gi(tmp.path())).unwrap();
+    assert_eq!(
+        got.matches("\r\n").count(),
+        got.matches('\n').count(),
+        "mixed EOLs:\n{got:?}"
+    );
+    assert!(got.contains("/.travsr/*\r\n!/.travsr/config.toml\r\n"));
+    assert!(is_ignored(tmp.path(), ".travsr/graph.db"));
+    let again = read_gi(tmp.path());
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(again, read_gi(tmp.path()));
+
+    // CRLF, legacy pair at EOF without trailing newline
+    let tmp = committed_repo();
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        format!("a\r\n{LEGACY_COMMENT}\r\n/.travsr/"),
+    )
+    .unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "m"]);
+    travsr_init_isolated(tmp.path(), home.path());
+    let got = String::from_utf8(read_gi(tmp.path())).unwrap();
+    assert_eq!(
+        got.matches("\r\n").count(),
+        got.matches('\n').count(),
+        "mixed EOLs:\n{got:?}"
+    );
+    assert!(got.starts_with("a\r\n# travsr-local:begin"));
+    assert!(got.ends_with("# travsr-local:end"));
+
+    // LF, no trailing newline, appended block
+    let tmp = committed_repo();
+    std::fs::write(tmp.path().join(".gitignore"), "node_modules/").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "m"]);
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(
+        String::from_utf8(read_gi(tmp.path())).unwrap(),
+        format!("node_modules/\n\n{LOCAL_BLOCK}")
+    );
+}
+
+#[test]
+fn local_block_and_connect_block_coexist_and_neither_duplicates() {
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".claude")).unwrap();
+    travsr_init_isolated(tmp.path(), home.path());
+
+    let connect = || {
+        Command::cargo_bin("travsr")
+            .unwrap()
+            .env("TRAVSR_DISABLE_REGISTRY", "1")
+            .env("HOME", home.path())
+            .current_dir(tmp.path())
+            .arg("connect")
+            .assert()
+            .success();
+    };
+    connect();
+    let gi = String::from_utf8(read_gi(tmp.path())).unwrap();
+    assert_eq!(gi.matches("# travsr-local:begin").count(), 1, "{gi}");
+    assert_eq!(gi.matches("# travsr-local:end").count(), 1, "{gi}");
+    assert_eq!(gi.matches("# travsr:begin").count(), 1, "{gi}");
+    assert_eq!(gi.matches("# travsr:end").count(), 1, "{gi}");
+    assert!(gi.contains(LOCAL_BLOCK), "{gi}");
+    assert!(gi.contains("/.mcp.json"), "{gi}");
+
+    // Re-run both in either order: nothing moves.
+    connect();
+    assert_eq!(gi.as_bytes(), read_gi(tmp.path()).as_slice());
+    travsr_init_isolated(tmp.path(), home.path());
+    assert_eq!(gi.as_bytes(), read_gi(tmp.path()).as_slice());
+    assert!(is_ignored(tmp.path(), ".mcp.json"));
+    assert!(is_ignored(tmp.path(), ".travsr/graph.db"));
+    assert!(!is_ignored(tmp.path(), ".travsr/config.toml"));
+}
+
+#[test]
+fn tracked_config_toml_alone_draws_no_warning_and_tracked_graph_only_a_note() {
+    let tmp = committed_repo();
+    let home = tempfile::tempdir().unwrap();
+    travsr_init_isolated(tmp.path(), home.path());
+    std::fs::write(tmp.path().join(".travsr/config.toml"), "# team\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "config"]);
+    let (_, tracked) = git_try(tmp.path(), &["ls-files", "--", ".travsr"]);
+    assert_eq!(tracked.trim(), ".travsr/config.toml");
+
+    let out = travsr_init_isolated(tmp.path(), home.path());
+    assert!(
+        !out.contains("git tracks") && !out.contains("is committed"),
+        "a tracked config.toml alone must not warn, got:\n{out}"
+    );
+
+    // graph.db alone is the documented opt-in: a quiet note, no untrack advice.
+    git(tmp.path(), &["add", "-f", ".travsr/graph.db"]);
+    git(tmp.path(), &["commit", "-q", "-m", "graph"]);
+    let (_, index_before) = git_try(tmp.path(), &["ls-files", "-s", "--", ".travsr"]);
+    let out = travsr_init_isolated(tmp.path(), home.path());
+    assert!(out.contains("note: .travsr/graph.db is committed"), "{out}");
+    assert!(
+        !out.contains("warning: git tracks") && !out.contains("git rm --cached"),
+        "a deliberate graph.db opt-in must not be told to undo it, got:\n{out}"
+    );
+    let (_, index_after) = git_try(tmp.path(), &["ls-files", "-s", "--", ".travsr"]);
+    assert_eq!(index_before, index_after, "init must not touch the index");
+
+    // Opt-in plus a genuinely accidental file: the warning names only the latter.
+    std::fs::write(tmp.path().join(".travsr/daemon.lock"), "").unwrap();
+    git(tmp.path(), &["add", "-f", ".travsr/daemon.lock"]);
+    git(tmp.path(), &["commit", "-q", "-m", "lock"]);
+    let out = travsr_init_isolated(tmp.path(), home.path());
+    assert!(
+        out.contains("git rm --cached -- .travsr/daemon.lock"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("git rm --cached -- .travsr/graph.db")
+            && !out.contains(".travsr/daemon.lock .travsr/graph.db")
+            && !out.contains("git rm --cached -- .travsr/config.toml"),
+        "graph.db and config.toml must stay out of the untrack command, got:\n{out}"
+    );
 }

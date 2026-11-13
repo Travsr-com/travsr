@@ -120,12 +120,13 @@ pub struct InitStats {
     pub files_skipped_ignored: u64,
     /// Whether `.travsrignore` was freshly created on this run (first `travsr init`).
     pub travsrignore_scaffolded: bool,
-    /// #893: whether a `/.travsr/` entry was appended to `.gitignore` on this run.
+    /// #893: whether the managed `.travsr/` block was written to `.gitignore` on this run.
     pub gitignore_scaffolded: bool,
-    /// #893: git already tracks files under `.travsr/`, so the `.gitignore`
-    /// entry is inert and the user needs `git rm -r --cached .travsr` before
+    /// #893: runtime files git already tracks under `.travsr/` (never
+    /// `config.toml`, which is meant to be committed). The `.gitignore` block is
+    /// inert for them and the user needs `git rm --cached` on these before
     /// `git revert`/`git merge` will run again. Surfaced, never auto-fixed.
-    pub travsr_dir_tracked: bool,
+    pub travsr_local_tracked: Vec<String>,
     /// Net change in node count. `i64` to allow negative values if nodes are
     /// removed in the future (e.g. delete-by-file support); currently always >= 0.
     pub nodes_written: i64,
@@ -673,80 +674,229 @@ pub fn scaffold_travsrignore(repo_root: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Appended to `.gitignore` by [`scaffold_gitignore`].
+/// First line of the block `travsr init` owns in `.gitignore`.
 ///
-/// Leading `/` anchors the rule to the repo root, the same reason `connect.rs`
-/// anchors every entry it generates: a slash-less pattern would also ignore a
-/// `.travsr` directory vendored at any depth. Trailing `/` matches the
-/// directory only.
-///
-/// The comment deliberately does not carry a `# travsr:` prefix: `connect.rs`
-/// finds its own managed block in this same file by substring-counting
-/// `# travsr:begin` / `# travsr:end`, and a sibling comment sharing that prefix
-/// is one careless edit to those markers away from being miscounted.
-const GITIGNORE_TRAVSR_ENTRY: &str =
-    "\n# travsr local code graph. Never commit it, the WAL file changes on every read.\n/.travsr/\n";
+/// The `travsr-local` prefix is deliberate: `connect.rs` finds its own managed
+/// block in this same file by substring-counting `# travsr:begin` /
+/// `# travsr:end`, and these markers contain neither substring, so the two
+/// blocks can never be miscounted as one.
+const GITIGNORE_BEGIN: &str =
+    "# travsr-local:begin (travsr runtime files, managed by `travsr init`)";
+const GITIGNORE_BEGIN_PREFIX: &str = "# travsr-local:begin";
+const GITIGNORE_END: &str = "# travsr-local:end";
 
-/// Ensure git ignores `.travsr/`.
+/// Body of the managed block: ignore everything under `.travsr/` except the
+/// team's `config.toml`.
+///
+/// The directory is ignored with `/.travsr/*` (contents), not `/.travsr/`,
+/// because git never descends into an ignored directory, so a `!` rule for a
+/// file inside it could not take effect. The leading `/` anchors the rule to the
+/// repo root so a `.travsr` vendored at any depth is not swept up.
+const GITIGNORE_BODY: [&str; 2] = ["/.travsr/*", "!/.travsr/config.toml"];
+
+/// The comment + entry older versions wrote. Replaced in place by the block.
+const GITIGNORE_LEGACY_COMMENT: &str =
+    "# travsr local code graph. Never commit it, the WAL file changes on every read.";
+const GITIGNORE_LEGACY_ENTRY: &str = "/.travsr/";
+
+/// Runtime files that must stay out of git. When a user's own rule already
+/// covers all of them, `travsr init` does not append a block.
+const GITIGNORE_PROBE_PATHS: [&str; 4] = [
+    ".travsr/graph.db",
+    ".travsr/graph.db-wal",
+    ".travsr/daemon.lock",
+    ".travsr/init.lock",
+];
+
+/// The text of a line without its terminator.
+fn line_content(line: &str) -> &str {
+    line.trim_end_matches(['\n', '\r'])
+}
+
+/// Pure core of [`scaffold_gitignore`]: the new `.gitignore` text, or `None`
+/// when the file must stay as it is.
+///
+/// Kept free of I/O so the cases (balanced block, malformed block, legacy pair,
+/// foreign rule, missing trailing newline, CRLF) are testable as plain strings.
+/// `user_rule_covers_runtime_files` is only called when no block and no legacy
+/// pair exist, because it shells out to git.
+///
+/// 1. One balanced block: rewrite its body only if it differs.
+/// 2. Any other marker shape (duplicated, unbalanced, out of order): untouched,
+///    since guessing which lines are ours risks eating the user's.
+/// 3. No block, but the exact legacy comment + `/.travsr/` pair: that pair is
+///    replaced in place, so a repo upgraded from an older init has no stale
+///    rule left ignoring the whole directory.
+/// 4. Otherwise append the block, unless the user's own rules already ignore
+///    the runtime files.
+///
+/// User lines are preserved byte for byte. New lines use the file's existing
+/// line ending (CRLF if any line ends in CRLF).
+fn managed_gitignore_text(
+    text: &str,
+    user_rule_covers_runtime_files: impl FnOnce() -> bool,
+) -> Option<String> {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+
+    let begins: Vec<usize> = (0..lines.len())
+        .filter(|&i| {
+            line_content(lines[i])
+                .trim()
+                .starts_with(GITIGNORE_BEGIN_PREFIX)
+        })
+        .collect();
+    let ends: Vec<usize> = (0..lines.len())
+        .filter(|&i| line_content(lines[i]).trim() == GITIGNORE_END)
+        .collect();
+
+    if !begins.is_empty() || !ends.is_empty() {
+        let (&[b], &[e]) = (begins.as_slice(), ends.as_slice()) else {
+            tracing::warn!(".gitignore has a malformed travsr-local block, leaving it untouched");
+            return None;
+        };
+        if b >= e {
+            tracing::warn!(".gitignore has a malformed travsr-local block, leaving it untouched");
+            return None;
+        }
+        let current: Vec<&str> = lines[b + 1..e].iter().map(|l| line_content(l)).collect();
+        if current == GITIGNORE_BODY {
+            return None;
+        }
+        let mut out: String = lines[..=b].concat();
+        for l in GITIGNORE_BODY {
+            out.push_str(l);
+            out.push_str(eol);
+        }
+        out.push_str(&lines[e..].concat());
+        return Some(out);
+    }
+
+    let block_lines = [
+        GITIGNORE_BEGIN,
+        GITIGNORE_BODY[0],
+        GITIGNORE_BODY[1],
+        GITIGNORE_END,
+    ];
+    let legacy_at = |i: usize| {
+        i + 1 < lines.len()
+            && line_content(lines[i]) == GITIGNORE_LEGACY_COMMENT
+            && line_content(lines[i + 1]) == GITIGNORE_LEGACY_ENTRY
+    };
+    if let Some(first) = (0..lines.len()).find(|&i| legacy_at(i)) {
+        let mut out = String::with_capacity(text.len() + 96);
+        let mut i = 0;
+        let mut replaced = false;
+        while i < lines.len() {
+            if legacy_at(i) {
+                // Later duplicate pairs are dropped: left in place they would
+                // keep ignoring the whole directory and defeat the allow-list.
+                if !replaced {
+                    debug_assert_eq!(i, first);
+                    out.push_str(&block_lines.join(eol));
+                    // The pair's last line may be the unterminated end of file.
+                    out.push_str(&lines[i + 1][line_content(lines[i + 1]).len()..]);
+                    replaced = true;
+                }
+                i += 2;
+            } else {
+                out.push_str(lines[i]);
+                i += 1;
+            }
+        }
+        return Some(out);
+    }
+
+    if user_rule_covers_runtime_files() {
+        return None;
+    }
+    let mut out = text.to_string();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push_str(eol);
+        }
+        out.push_str(eol);
+    }
+    out.push_str(&block_lines.join(eol));
+    out.push_str(eol);
+    Some(out)
+}
+
+/// Whether git already ignores every runtime file `travsr init` creates.
+///
+/// One `git check-ignore --no-index` call answers for every mechanism at once
+/// (repo and nested `.gitignore`, `.git/info/exclude`, global excludes).
+/// `--no-index` is load-bearing: without it git reports an already tracked
+/// path as not ignored no matter what rules exist. `-q` is not used because
+/// with several paths it exits 0 when any one is ignored; instead the ignored
+/// paths are counted. A git that cannot answer counts as ignored, so init never
+/// appends blind to a user's `.gitignore`.
+fn runtime_files_already_ignored(repo_root: &Path) -> bool {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["check-ignore", "--no-index", "--"])
+        .args(GITIGNORE_PROBE_PATHS)
+        .current_dir(repo_root)
+        .output()
+    else {
+        return true;
+    };
+    match out.status.code() {
+        Some(0) => {
+            String::from_utf8_lossy(&out.stdout).lines().count() >= GITIGNORE_PROBE_PATHS.len()
+        }
+        Some(1) => false,
+        _ => true,
+    }
+}
+
+/// Ensure git ignores travsr's runtime files and nothing else under `.travsr/`.
 ///
 /// `init_repo` creates `.travsr/graph.db` plus its `-wal`/`-shm` sidecars and
 /// `init.lock` inside the repository. Untracked but un-ignored, the next
 /// `git add -A` commits them; the WAL then changes on every read, so the
 /// working tree is permanently dirty and `git revert` / `git merge` / `git
-/// rebase` refuse to run at all (#893). `travsr init` already takes
-/// responsibility for scaffolding `.travsrignore`, so the `.gitignore` entry
-/// belongs beside it rather than in a second owner.
+/// rebase` refuse to run at all (#893). The managed block ignores everything
+/// under `.travsr/` except `config.toml`, the one file a team can share (see
+/// ADR-020). The decision logic lives in [`managed_gitignore_text`].
 ///
-/// Idempotency goes through `git check-ignore --no-index`, which answers "is a
-/// rule in effect" for every mechanism at once (repo `.gitignore`, nested
-/// `.gitignore`s, `.git/info/exclude`, the user's global excludes) instead of
-/// pattern-matching the file's text. `--no-index` is load-bearing: without it
-/// git reports an *already tracked* `.travsr/` as not-ignored no matter what
-/// rules exist, so every re-init on the repos this fix most needs to help would
-/// append a duplicate entry.
-///
-/// A git that cannot answer is treated as already-ignored, so init never
-/// appends blind to a user's `.gitignore`.
-///
-/// Returns whether an entry was appended.
+/// Returns whether the file was written.
 fn scaffold_gitignore(repo_root: &Path) -> anyhow::Result<bool> {
-    let ignored = std::process::Command::new("git")
-        .args(["check-ignore", "--no-index", "-q", ".travsr/"])
-        .current_dir(repo_root)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(true);
-    if ignored {
-        return Ok(false);
-    }
     let path = repo_root.join(".gitignore");
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    // The entry leads with a blank line, so an existing file whose last line has
-    // no terminator would otherwise gain the comment on the end of that line.
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(GITIGNORE_TRAVSR_ENTRY);
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let Some(new_text) = managed_gitignore_text(&text, || runtime_files_already_ignored(repo_root))
+    else {
+        return Ok(false);
+    };
+    std::fs::write(&path, new_text).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
 }
 
-/// Whether git already tracks anything under `.travsr/`.
+/// Paths git already tracks under `.travsr/`, except `.travsr/config.toml`.
 ///
 /// A `.gitignore` entry has no effect on a path that is already in the index,
-/// so for a repo that committed `.travsr/` before this scaffold existed the
-/// entry alone changes nothing and the revert/merge deadlock survives. The
+/// so for a repo that committed the graph before this scaffold existed the
+/// block alone changes nothing and the revert/merge deadlock survives. The
 /// caller reports that instead of claiming the problem is solved; untracking is
 /// left to the user because it rewrites their index, which `travsr init` has no
-/// mandate to do. Same call the `connect.rs` generated-file path makes for the
-/// same reason.
-fn travsr_dir_tracked(repo_root: &Path) -> bool {
-    std::process::Command::new("git")
-        .args(["ls-files", "--", ".travsr"])
+/// mandate to do. `config.toml` is excluded because committing it is the
+/// supported way to share team settings. Empty when git cannot answer.
+fn travsr_local_tracked(repo_root: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["ls-files", "-z", "--", ".travsr"])
         .current_dir(repo_root)
         .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .filter(|p| p != ".travsr/config.toml")
+        .collect()
 }
 
 /// File count above which an embed pass announces itself before starting.
@@ -1699,9 +1849,9 @@ pub fn init_repo_with_progress(
     // created the files in question, so it is the run that must fence them off.
     let gitignore_scaffolded = scaffold_gitignore(repo_root).unwrap_or(false);
     if gitignore_scaffolded {
-        tracing::info!("added /.travsr/ to .gitignore");
+        tracing::info!("updated the travsr block in .gitignore");
     }
-    let travsr_dir_tracked = travsr_dir_tracked(repo_root);
+    let travsr_local_tracked = travsr_local_tracked(repo_root);
 
     let walker = WalkBuilder::new(repo_root)
         .hidden(false)
@@ -2382,7 +2532,7 @@ pub fn init_repo_with_progress(
         files_skipped_ignored,
         travsrignore_scaffolded: scaffolded,
         gitignore_scaffolded,
-        travsr_dir_tracked,
+        travsr_local_tracked,
         nodes_written: nodes_after - nodes_before,
         edges_written,
         total_nodes: nodes_after as u64,
@@ -6546,6 +6696,82 @@ fn reconcile_head_drift(
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+
+    const BLOCK: &str = "# travsr-local:begin (travsr runtime files, managed by `travsr init`)\n/.travsr/*\n!/.travsr/config.toml\n# travsr-local:end\n";
+
+    fn managed(text: &str) -> Option<String> {
+        managed_gitignore_text(text, || false)
+    }
+
+    #[test]
+    fn gitignore_block_is_appended_to_empty_and_unterminated_files() {
+        assert_eq!(managed("").as_deref(), Some(BLOCK));
+        assert_eq!(
+            managed("node_modules/").as_deref(),
+            Some(format!("node_modules/\n\n{BLOCK}").as_str())
+        );
+    }
+
+    #[test]
+    fn gitignore_balanced_block_is_idempotent_and_body_is_repaired() {
+        let text = format!("a\n\n{BLOCK}b\n");
+        assert_eq!(managed(&text), None);
+        let stale = text.replace("!/.travsr/config.toml\n", "");
+        assert_eq!(managed(&stale), Some(text));
+    }
+
+    #[test]
+    fn gitignore_malformed_markers_are_left_alone() {
+        let twice = format!("{BLOCK}{BLOCK}");
+        assert_eq!(managed(&twice), None);
+        assert_eq!(
+            managed("# travsr-local:end\n# travsr-local:begin x\n"),
+            None
+        );
+        assert_eq!(managed("# travsr-local:begin x\n/.travsr/*\n"), None);
+    }
+
+    #[test]
+    fn gitignore_legacy_pair_is_replaced_in_place() {
+        let legacy = format!("a\n{GITIGNORE_LEGACY_COMMENT}\n/.travsr/\nz\n");
+        assert_eq!(managed(&legacy), Some(format!("a\n{BLOCK}z\n")));
+        let at_eof = format!("a\n{GITIGNORE_LEGACY_COMMENT}\n/.travsr/");
+        assert_eq!(
+            managed(&at_eof),
+            Some(format!("a\n{}", BLOCK.trim_end_matches('\n')))
+        );
+    }
+
+    #[test]
+    fn gitignore_bare_user_rule_is_never_touched_by_the_legacy_path() {
+        // No legacy comment: falls to the append path, which the user's own
+        // rule suppresses.
+        assert_eq!(managed_gitignore_text("/.travsr/\n", || true), None);
+        assert_eq!(managed_gitignore_text(".travsr/\n", || true), None);
+    }
+
+    #[test]
+    fn a_git_that_cannot_answer_counts_as_ignored() {
+        // Outside a repo `git check-ignore` exits 128; a directory that does not
+        // exist fails the spawn. Both must read as "ignored" so init never
+        // appends blind to a user's `.gitignore`.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(runtime_files_already_ignored(tmp.path()));
+        assert!(runtime_files_already_ignored(&tmp.path().join("missing")));
+    }
+
+    #[test]
+    fn gitignore_crlf_files_get_no_mixed_endings() {
+        let out = managed("a\r\nb\r\n").unwrap();
+        assert_eq!(out.matches("\r\n").count(), out.matches('\n').count());
+        assert!(out.starts_with("a\r\nb\r\n\r\n# travsr-local:begin"));
+        assert_eq!(managed(&out), None);
+    }
+
+    #[test]
+    fn gitignore_block_markers_do_not_collide_with_connect_markers() {
+        assert!(!BLOCK.contains("# travsr:begin") && !BLOCK.contains("# travsr:end"));
+    }
     use std::sync::Mutex;
 
     #[test]
