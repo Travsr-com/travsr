@@ -2838,6 +2838,34 @@ impl ClassHierarchy {
 /// `resolves-to` exists only for relative imports (TS/JS `./` `../`, Rust
 /// `self::` `super::`, Python specifiers that map to an indexed file), so a
 /// call through an alias, a package specifier or `crate::` stays a tie.
+/// The component a repo-relative path belongs to (#1082 B7): the first two
+/// segments under a conventional container folder (`crates/travsr-cli`,
+/// `packages/travsr-vscode`, `apps/web`, ...), otherwise the first segment
+/// (`src`, `lib`), and "" for a file at the root.
+fn component_of(path: &str) -> &str {
+    const CONTAINERS: &[&str] = &[
+        "crates",
+        "packages",
+        "apps",
+        "libs",
+        "services",
+        "modules",
+        "plugins",
+        "extensions",
+    ];
+    let path = path.trim_start_matches("./");
+    let mut seg = path.match_indices('/').map(|(i, _)| i);
+    let Some(first) = seg.next() else {
+        return "";
+    };
+    if CONTAINERS.contains(&&path[..first]) {
+        if let Some(second) = seg.next() {
+            return &path[..second];
+        }
+    }
+    &path[..first]
+}
+
 fn scope_bare_call<'a>(
     caller_path: &str,
     imported_files: &std::collections::HashSet<(String, String)>,
@@ -3449,6 +3477,31 @@ fn resolve_unresolved_calls(
         // Only emit a RefCall when the match is unambiguous (exactly one candidate).
         if u.hint_crate.is_none() && filtered.len() != 1 {
             continue;
+        }
+        // #1082 B7: unique is not enough for a JS/TS bare call. ES modules have
+        // no implicit cross-file scope and a plain script shares globals only
+        // with the scripts of its own page, so a lone same-named function in
+        // another component the caller does not import is a name collision.
+        // Resolving it once invented a crates/travsr-cli <-> packages/travsr-vscode
+        // dependency cycle; abstain instead.
+        if bare_fn && u.hint_crate.is_none() && caller_lang == "typescript" {
+            let (_, callee_path, _) = filtered[0];
+            let imported_files = imported_files.get_or_insert_with(|| {
+                store
+                    .file_import_pairs("")
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("resolve_unresolved_calls: import pair lookup failed: {e}");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .collect()
+            });
+            if !caller_path.is_empty()
+                && component_of(callee_path) != component_of(caller_path)
+                && !imported_files.contains(&(caller_path.to_string(), callee_path.to_string()))
+            {
+                continue;
+            }
         }
         for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
@@ -9252,6 +9305,81 @@ mod tests {
         store.put_node(&other).unwrap();
         let (edges, _) = resolve_unresolved_calls(&store, &[call(other.id)], &[], &[], &none);
         assert!(edges.is_empty(), "{edges:?}");
+    }
+
+    /// #1082 B7: a JS/TS bare call whose only candidate lives in another
+    /// component it does not import is a name collision, not a call. The
+    /// same unique match inside the caller's own component still resolves,
+    /// and so does a Rust call (crate reachability decides those).
+    #[test]
+    fn lone_cross_component_ts_match_is_abstained_on() {
+        use travsr_core::{Node, VName};
+        assert_eq!(
+            component_of("crates/travsr-cli/src/ui/assets/pages.js"),
+            "crates/travsr-cli"
+        );
+        assert_eq!(
+            component_of("packages/travsr-vscode/src/commands.ts"),
+            "packages/travsr-vscode"
+        );
+        assert_eq!(component_of("src/a/b.ts"), "src");
+        assert_eq!(component_of("main.ts"), "");
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ui = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/travsr-cli/src/ui/assets/pages.js",
+                "typescript",
+                "fn:render",
+            ),
+            "function",
+        );
+        let ext = Node::new(
+            VName::new(
+                "",
+                "",
+                "packages/travsr-vscode/src/webviews.ts",
+                "typescript",
+                "fn:formatBytes",
+            ),
+            "function",
+        );
+        let sibling = Node::new(
+            VName::new(
+                "",
+                "",
+                "packages/travsr-vscode/src/health.ts",
+                "typescript",
+                "fn:draw",
+            ),
+            "function",
+        );
+        for n in [&ui, &ext, &sibling] {
+            store.put_node(n).unwrap();
+        }
+        let call = |src| travsr_core::UnresolvedCall {
+            src,
+            callee_sig: "fn:formatBytes".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 3,
+            caller_col: None,
+            is_method_call: false,
+            recv_type: None,
+        };
+        let none = std::collections::HashSet::new();
+
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(ui.id)], &[], &[], &none);
+        assert!(
+            edges.is_empty(),
+            "cross-component collision resolved: {edges:?}"
+        );
+
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(sibling.id)], &[], &[], &none);
+        assert_eq!(edges.len(), 1, "same-component call dropped: {edges:?}");
+        assert_eq!(edges[0].dst, ext.id);
     }
 
     #[test]

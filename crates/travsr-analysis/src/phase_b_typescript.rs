@@ -222,6 +222,8 @@ fn extract_file_edges(
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
+    // #1082 B7: names this file binds that Phase A records no node for.
+    let local_only = unrecorded_local_bindings(tree.root_node(), &source);
 
     // ── Call sites ────────────────────────────────────────────────────────────
     {
@@ -316,6 +318,13 @@ fn extract_file_edges(
                             recv_type: None,
                         });
                     }
+                    // A bare call to a name this file binds itself (a const
+                    // inside a function, a parameter) calls that binding,
+                    // which has no node. Resolving it by name elsewhere is
+                    // how a helper in one file got linked to a same-named
+                    // function in an unrelated one (#1082 B7), so emit
+                    // nothing, as the live lane does for a locally bound name.
+                    _ if local_only.contains(callee_name) => {}
                     // Bare `foo()` — free function; daemon resolves by unique sig.
                     _ => {
                         unresolved.push(UnresolvedCall {
@@ -589,6 +598,66 @@ fn collect_nearest_var_ts(
 }
 
 // ── AST helpers ───────────────────────────────────────────────────────────────
+
+/// Variables the file declares that Phase A records no node for (#1082 B7):
+/// `const` / `let` / `var` inside a function or block (Phase A keeps only
+/// top-level function-valued ones) and any top-level one whose value is not a
+/// function. A call to such a name can only mean that variable. A name also
+/// recorded somewhere in the file (a `function` declaration, or a top-level
+/// arrow or function const) is left out, so a call to it still resolves to
+/// that definition.
+///
+/// Parameters are deliberately not collected. Phase B is the recall-biased
+/// lane (#811): a callback parameter named like a module function is often
+/// that function passed in, and the live lane, not this one, is the one that
+/// abstains on it.
+fn unrecorded_local_bindings(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> std::collections::HashSet<String> {
+    let text = |n: tree_sitter::Node<'_>| n.utf8_text(source).ok().map(str::to_string);
+    let mut bound = std::collections::HashSet::new();
+    let mut recorded = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                if let Some(name) = node.child_by_field_name("name").and_then(text) {
+                    recorded.insert(name);
+                }
+            }
+            "variable_declarator" => {
+                let name = node
+                    .child_by_field_name("name")
+                    .filter(|n| n.kind() == "identifier")
+                    .and_then(text);
+                if let Some(name) = name {
+                    let is_fn = node.child_by_field_name("value").is_some_and(|v| {
+                        matches!(v.kind(), "arrow_function" | "function_expression")
+                    });
+                    let top_level = node
+                        .parent()
+                        .and_then(|decl| decl.parent())
+                        .is_some_and(|p| {
+                            p.kind() == "program"
+                                || p.kind() == "export_statement"
+                                    && p.parent().is_some_and(|pp| pp.kind() == "program")
+                        });
+                    if is_fn && top_level {
+                        recorded.insert(name);
+                    } else {
+                        bound.insert(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut c = node.walk();
+        stack.extend(node.named_children(&mut c));
+    }
+    bound.retain(|n| !recorded.contains(n));
+    bound
+}
 
 /// Walk up the AST to find the nearest enclosing named function or method.
 /// Returns `(fn_name, Option<enclosing_class>)`.
@@ -901,6 +970,51 @@ class App {
                 .map(|u| (&u.callee_sig, u.src == file_id))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// #1082 B7: the travsr ui assets' shape. Helpers bound by `const` / `let`
+    /// inside an IIFE have no Phase A node, and a call to one can only mean
+    /// it; those calls must not go out to be resolved by name against some
+    /// other file's function. A name the file does record (a `function`
+    /// declaration, a top-level arrow const), a name it never binds, and a
+    /// parameter (Phase B stays recall-biased there, #811) still go out.
+    #[test]
+    fn calls_to_unrecorded_local_bindings_are_not_resolved_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.js");
+        std::fs::write(
+            &path,
+            "const top = (s) => s;\n\
+             function declared() { return 1; }\n\
+             (function () {\n\
+               const esc = (s) => String(s);\n\
+               let fmt = function (x) { return x; };\n\
+               function run(handle, cb) {\n\
+                 esc('a'); fmt(1); handle(2); cb(3);\n\
+                 top('b'); declared(); external();\n\
+               }\n\
+               run(null, null);\n\
+             })();\n",
+        )
+        .unwrap();
+        let files = vec![(path, "assets/pages.js".to_string())];
+        let (_nodes, _edges, unresolved) =
+            extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        let sigs: std::collections::HashSet<&str> =
+            unresolved.iter().map(|u| u.callee_sig.as_str()).collect();
+        for local in ["fn:esc", "fn:fmt"] {
+            assert!(!sigs.contains(local), "{local} resolved by name: {sigs:?}");
+        }
+        for kept in [
+            "fn:top",
+            "fn:declared",
+            "fn:external",
+            "fn:run",
+            "fn:handle",
+            "fn:cb",
+        ] {
+            assert!(sigs.contains(kept), "{kept} missing: {sigs:?}");
+        }
     }
 
     #[test]
