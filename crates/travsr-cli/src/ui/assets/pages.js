@@ -48,6 +48,56 @@
     return link ? '<a href="' + esc(link) + '" title="Open in VS Code">' + esc(text) + "</a>" : esc(text);
   }
 
+  // ── Inline code preview (#1082 A4) ─────────────────────────────────────
+  // A "code" toggle next to a location opens the lines around it in place,
+  // from /api/source (the Graph page's peek). `sym` lets the server find the
+  // line when the page has only a name, as on the Path page.
+  function peekBtn(path, line, sym) {
+    if (!path) return "";
+    return '<button class="peek-btn" type="button" data-peek="' + esc(path) + '"' +
+      (line ? ' data-line="' + Number(line) + '"' : "") +
+      (sym ? ' data-sym="' + esc(sym) + '"' : "") +
+      ' aria-expanded="false" title="Show the code here">code</button>';
+  }
+  async function togglePeek(b) {
+    const open = b.getAttribute("aria-expanded") === "true";
+    if (b._peek) {
+      b._peek.hidden = open;
+      b.setAttribute("aria-expanded", String(!open));
+      return;
+    }
+    const host = b.closest(".p-body, .ctx-item, .ch-sym, li") || b.parentElement;
+    const box = document.createElement("div");
+    box.className = "peek";
+    box.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Loading the code…</p>';
+    host.append(box);
+    b._peek = box;
+    b.setAttribute("aria-expanded", "true");
+    const q = { repo: ui.repo, path: b.dataset.peek };
+    if (b.dataset.line) q.line = b.dataset.line;
+    if (b.dataset.sym) q.symbol = b.dataset.sym;
+    try {
+      const r = await ui.api("/api/source", q);
+      if (!r.lines.length) { box.innerHTML = '<p class="sub">The file is empty.</p>'; return; }
+      const end = r.end_line || r.line;
+      const mark = (no) => no >= r.line && no <= end;
+      const link = ui.editorLink(r.path, r.line);
+      box.innerHTML = '<div class="peek-head"><span>' + esc(r.path) + ":" + r.line + "</span>" +
+        (link ? '<a href="' + esc(link) + '">open in editor</a>' : "") + "</div>" +
+        '<pre class="peek-code">' + r.lines.map((l) =>
+          '<span class="peek-line' + (mark(l.no) ? " def" : "") + '"><span class="peek-no">' + l.no + "</span>" + esc(l.text) + "</span>").join("") + "</pre>";
+    } catch (err) {
+      box.innerHTML = '<p class="sub err">Cannot show the code: ' + esc(err.message) + "</p>";
+    }
+  }
+  page.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-peek]");
+    if (!b) return;
+    e.preventDefault();
+    e.stopPropagation();
+    togglePeek(b);
+  });
+
   function callerLine(l) {
     const m = ROW.exec(l);
     if (!m) return "<li>" + esc(l) + "</li>";
@@ -55,6 +105,9 @@
     return "<li>" + (edge ? '<span class="muted">[' + esc(edge) + "]</span> " : "") +
       '<a href="' + esc(ui.withRepo("/graph", { q: label })) + '" title="Show in the graph">' + esc(label) + "</a>" +
       ' <span class="muted">(' + esc(kind) + ") —</span> " + editorAnchor(path, line ? Number(line) : null, path + (line ? ":" + line : "")) +
+      // A file-level caller has no line to show; anything else can find its
+      // own definition by name when the row carries no line.
+      (line || kind !== "file" ? " " + peekBtn(path, line, kind === "file" ? null : label) : "") +
       (heuristic ? ' <span class="muted" title="matched by name, not resolved by type">~</span>' : "") + "</li>";
   }
 
@@ -492,6 +545,7 @@
             '<span class="s-kind">' + esc(e.kind) + "</span>" +
             '<a class="ctx-name" href="' + esc(ui.withRepo("/graph", { q: e.sig })) + '" title="Show in the graph">' + esc(name) + "</a>" +
             '<span class="ctx-where">' + editorAnchor(e.path, e.line, where) + "</span>" +
+            (e.snippet ? "" : peekBtn(e.path, e.line, e.sig)) +
             (e.via ? '<span class="ctx-via">' + esc(e.via) + "</span>" : "") + "</div>" +
             (e.snippet ? '<pre class="ctx-code">' + esc(e.snippet) + "</pre>" : "") + "</li>";
         }
@@ -770,7 +824,7 @@
         '<span class="p-num">' + (i + 1) + "</span>" +
         '<span class="p-body"><span class="s-kind">' + esc(s.kind) + "</span> " +
         '<a class="p-name" href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '" title="Show in the graph">' + esc(name) + "</a>" +
-        '<span class="p-where">' + editorAnchor(s.path, null, s.path) + "</span></span></li>";
+        '<span class="p-where">' + editorAnchor(s.path, null, s.path) + "</span>" + peekBtn(s.path, null, s.sig) + "</span></li>";
     }
 
     async function run() {
@@ -1123,9 +1177,10 @@
           html += '<div class="ch-sym"><div class="ch-sym-row"><span class="s-kind">' + esc(s.kind) + "</span>" +
             '<a class="ch-name" href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '">' + esc(nameOf(s.sig)) + "</a>" +
             '<span class="muted">lines ' + s.line + (s.end_line !== s.line ? "–" + s.end_line : "") + "</span>" +
+            (f.status !== "deleted" ? peekBtn(f.path, s.line, s.sig) : "") +
             '<span class="ch-count' + (s.callers_total ? " has" : "") + '">' + s.callers_total + " caller" + (s.callers_total === 1 ? "" : "s") + "</span></div>" +
             (s.callers.length ? '<ul class="ch-callers">' + s.callers.map((c) => "<li>" + '<a href="' + esc(ui.withRepo("/graph", { q: c.sig })) + '">' + esc(c.sig) + "</a> " +
-              '<span class="muted">' + editorAnchor(c.path, c.line, c.path + ":" + c.line) + "</span></li>").join("") +
+              '<span class="muted">' + editorAnchor(c.path, c.line, c.path + ":" + c.line) + "</span> " + peekBtn(c.path, c.line, c.sig) + "</li>").join("") +
               (s.callers_total > s.callers.length ? '<li class="muted">and ' + (s.callers_total - s.callers.length) + " more</li>" : "") + "</ul>" : "") +
             "</div>";
         }

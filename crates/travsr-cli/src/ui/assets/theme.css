@@ -474,3 +474,31 @@ body:not(.ui-page) #brand .word {
 .ch-callers a { font-family: var(--tsr-font-mono); }
 .ch-blast { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--tsr-border-soft); }
 .ch-blast-h { font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+
+/* Inline code preview (#1082 A4). */
+.peek-btn {
+  margin-left: 6px; padding: 0 7px; border-radius: 999px; cursor: pointer;
+  font: 10.5px var(--tsr-font-mono); line-height: 17px;
+  background: transparent; color: var(--tsr-muted); border: 1px solid var(--tsr-border);
+}
+.peek-btn:hover { color: var(--tsr-accent-text); border-color: var(--tsr-accent-line); }
+.peek-btn[aria-expanded="true"] { color: var(--tsr-accent-text); background: var(--tsr-accent-deep); border-color: var(--tsr-accent-line); }
+.peek { flex-basis: 100%; margin: 8px 0 4px; min-width: 0; }
+.peek-head {
+  display: flex; justify-content: space-between; gap: 10px; padding: 5px 12px;
+  font: 11px var(--tsr-font-mono); color: var(--tsr-subtle);
+  background: var(--tsr-surface); border: 1px solid var(--tsr-border-soft); border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+}
+.peek-head a { color: var(--tsr-accent-text); }
+.peek-code {
+  margin: 0; padding: 8px 0; max-height: 420px; overflow: auto; border-radius: 0 0 8px 8px;
+  background: var(--tsr-input); border: 1px solid var(--tsr-border-soft);
+  font: 11.5px/1.55 var(--tsr-font-mono); color: var(--tsr-text); white-space: pre;
+}
+.peek-line { display: block; padding: 0 12px 0 0; }
+.peek-line.def { background: var(--tsr-accent-deep); box-shadow: inset 2px 0 0 var(--tsr-accent); }
+.peek-no {
+  display: inline-block; width: 4.5em; padding-right: 12px; margin-right: 4px; text-align: right;
+  color: var(--tsr-subtle); user-select: none;
+}
