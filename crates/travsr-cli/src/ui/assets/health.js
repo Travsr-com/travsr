@@ -460,12 +460,40 @@
         : langs === null ? unavailable("Could not read the language list.")
         : renderLanguages(langs));
 
-    // Agent connections: the extension reads editor config files on the
-    // machine it runs on. A browser page has no such view, so it names the
-    // command that reports and writes them.
-    const agentSec = section("Agent connections", statusChip("mute", "see CLI"),
-      act("Register all", "travsr connect", "primary"),
-      row("Status", "travsr connect --print shows which AI tools are wired to Travsr", undefined, act("Copy", "travsr connect --print")));
+    // Agent connections: each AI tool found for this repository and whether
+    // it is wired to Travsr, from `connect --print --json` (the same answer
+    // the Getting started guide reads). A tool `connect` wires by itself is
+    // connected or not; one that needs a step in its own settings is said so.
+    const agentSec = (() => {
+      const tools = d.connect;
+      const details = act("Copy", "travsr connect --print");
+      if (tools === undefined) {
+        return section("Agent connections", statusChip("mute", "checking"),
+          act("Register all", "travsr connect"), pending("AI tools"));
+      }
+      if (!Array.isArray(tools)) {
+        return section("Agent connections", statusChip("mute", "see CLI"),
+          act("Register all", "travsr connect", "primary"),
+          row("Status", "could not read which AI tools are wired; travsr connect --print says", undefined, details));
+      }
+      if (!tools.length) {
+        return section("Agent connections", statusChip("mute", "none found"),
+          act("Register all", "travsr connect"),
+          row("Found", "no AI coding tool on this machine yet; install one, then register", undefined, details));
+      }
+      const auto = tools.filter((t) => t.setup === "automatic");
+      const wired = auto.filter((t) => t.connected === true).length;
+      const chip = !auto.length ? statusChip("warn", "needs a step")
+        : wired === auto.length ? statusChip("ok", wired + " connected")
+        : wired === 0 ? statusChip("bad", "not connected")
+        : statusChip("warn", wired + " of " + auto.length + " connected");
+      const rows = tools.map((t) => t.setup !== "automatic"
+        ? row(t.name, "needs a step in its own settings", "warn", details)
+        : t.connected === true ? row(t.name, "connected", "ok")
+        : row(t.name, "not connected", "bad")).join("");
+      return section("Agent connections", chip,
+        act("Register all", "travsr connect", wired < auto.length ? "primary" : ""), rows);
+    })();
 
     // Repositories
     const repos = d.repos;
