@@ -592,6 +592,11 @@ registered one:
   from foundation to entry point, dependency cycles, the dependency edges by
   weight, and what each component owns. Click a component to see what it
   depends on and what depends on it.
+- **Changes:** what your uncommitted work touches. The working tree is
+  compared with the commit the index describes; each edit is mapped to the
+  indexed symbols it overlaps, with their callers, each file's blast radius on
+  demand, and the architecture rules the current state breaks (checked over
+  every edge, uncommitted ones included).
 - **Graph:** the extension's graph view itself (repo map, symbol graph, blast
   view, definition peek, DOT/JSON/PNG export).
 - **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's

@@ -1020,7 +1020,140 @@
     load();
   }
 
-  const VIEWS = { "/architecture": architectureView, "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
+  // ── Changes ────────────────────────────────────────────────────────────
+  // What the uncommitted work touches (/api/changes, changes.rs): the files
+  // changed since the commit the index describes, the indexed symbols each
+  // edit overlaps, their callers, each file's blast radius on demand, and the
+  // architecture rules the change would break (invariants over every edge,
+  // the live overlay of uncommitted edits included).
+  function changesView() {
+    document.title = "Travsr: Changes";
+    page.innerHTML =
+      '<div class="phead"><div><h2>Changes</h2><p class="sub" style="margin:2px 0 0">What your uncommitted work touches: the symbols it edits, who calls them, what each file reaches, and which architecture rules it would break.</p></div>' +
+      '<div class="phead-a"><button class="btn" id="c-refresh">Refresh</button></div></div><div id="out"></div>';
+    const short = (sha) => (sha || "").slice(0, 8);
+    const nameOf = (sig) => (sig.includes(":") ? sig.slice(sig.indexOf(":") + 1) : sig);
+    let rules = null;
+    let data = null;
+
+    async function loadRules() {
+      // Every edge, so an uncommitted edit's live edges count (RFC-027).
+      try {
+        const r = await ui.api("/api/run/invariants", { repo: ui.repo, provenance: "" });
+        const lines = (r.stdout || "").split("\n");
+        const violated = [];
+        for (let i = 0; i < lines.length; i++) {
+          const m = /^VIOLATED\s+(.+)$/.exec(lines[i]);
+          if (!m) continue;
+          const detail = [];
+          for (let j = i + 1; j < lines.length && /^\s+\S/.test(lines[j]); j++) detail.push(lines[j].trim());
+          violated.push({ rule: m[1].trim(), detail });
+        }
+        const held = lines.filter((l) => /^holds\s/.test(l)).length;
+        const noFile = /no such file|not found|could not read the invariants/i.test(r.stderr + r.stdout) && !held && !violated.length;
+        rules = { violated, held, noFile, error: r.code !== 0 && !violated.length && !held ? (r.stderr || r.stdout).trim().split("\n").pop() : "" };
+      } catch (e) {
+        rules = { violated: [], held: 0, noFile: false, error: e.message };
+      }
+      render();
+    }
+
+    async function load() {
+      const out = document.getElementById("out");
+      if (!data) out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Reading the working tree…</p>';
+      try {
+        data = await ui.api("/api/changes", { repo: ui.repo });
+        render();
+      } catch (e) {
+        out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+      }
+      rules = null;
+      loadRules();
+    }
+    refreshView = load;
+
+    function render() {
+      if (!data) return;
+      const out = document.getElementById("out");
+      const files = data.files;
+      const syms = files.reduce((n, f) => n + f.symbols.length, 0);
+      const callerSet = new Set();
+      for (const f of files) for (const s of f.symbols) for (const c of s.callers) callerSet.add(c.sig + "@" + c.path);
+      const card = (k, v, cls, note) => '<div class="card' + (cls ? " " + cls : "") + '"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" + (note ? '<div class="s">' + esc(note) + "</div>" : "") + "</div>";
+      const ruleCard = rules === null ? card("Rules broken", "…", "", "checking")
+        : rules.noFile ? card("Rules broken", "–", "", "no architecture-invariants.json")
+        : rules.error ? card("Rules broken", "?", "warn", "could not check")
+        : card("Rules broken", String(rules.violated.length), rules.violated.length ? "bad" : "", rules.held + rules.violated.length + " rules checked");
+      let html = "";
+      if (data.base && data.head && data.base !== data.head) {
+        html += '<div class="note-box">The index describes <code>' + esc(short(data.base)) + "</code> and HEAD is <code>" + esc(short(data.head)) +
+          "</code>, so commits made since the last index are included here as well.</div>";
+      }
+      html += '<div class="cards a-cards">' +
+        card("Files changed", String(files.length) + (data.truncated ? "+" : ""), "", "since " + short(data.base)) +
+        card("Symbols touched", String(syms)) +
+        card("Callers affected", String(callerSet.size), "", "distinct calling symbols") +
+        ruleCard + "</div>";
+      if (rules && rules.violated.length) {
+        html += '<div class="diag error ch-rules"><div class="diag-t">Architecture rules this state breaks</div>' +
+          rules.violated.map((v) => '<div class="ch-rule"><strong>' + esc(v.rule) + "</strong>" + v.detail.map((d) => '<div class="mono muted">' + esc(d) + "</div>").join("") + "</div>").join("") +
+          '<div class="diag-d">Checked over every edge, uncommitted ones included. A rule that was already broken before your change shows here too; see the Architecture page.</div></div>';
+      }
+      if (!files.length) {
+        html += '<div class="note-box">No uncommitted changes since <code>' + esc(short(data.base)) + "</code>.</div>";
+        out.innerHTML = html;
+        return;
+      }
+      for (const f of files) {
+        const callers = f.symbols.reduce((n, s) => n + s.callers_total, 0);
+        html += '<details class="hsec ch-file" open data-path="' + esc(f.path) + '"><summary>' +
+          '<span class="ch-status ' + esc(f.status) + '">' + esc(f.status) + "</span>" +
+          '<span class="ch-path">' + editorAnchor(f.path, null, f.path) + "</span>" +
+          '<span class="muted ch-meta">' + (f.indexed ? f.symbols.length + " symbol" + (f.symbols.length === 1 ? "" : "s") + " · " + callers + " caller" + (callers === 1 ? "" : "s") : "not in the index yet") + "</span>" +
+          '<span class="ch-acts">' +
+          (f.indexed && f.status !== "deleted" ? '<button class="link-btn" type="button" data-blast="' + esc(f.path) + '">blast radius</button>' : "") +
+          (f.indexed ? '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: f.path })) + '">graph</a>' : "") +
+          "</span></summary><div class=\"ch-body\">";
+        if (!f.indexed) {
+          html += '<p class="sub">' + (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).</p>";
+        } else if (!f.symbols.length) {
+          html += '<p class="sub">' + (f.hunks ? "The edit touches no indexed symbol (comments, imports or whitespace)." : "No line changes against the indexed commit.") + "</p>";
+        }
+        for (const s of f.symbols) {
+          html += '<div class="ch-sym"><div class="ch-sym-row"><span class="s-kind">' + esc(s.kind) + "</span>" +
+            '<a class="ch-name" href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '">' + esc(nameOf(s.sig)) + "</a>" +
+            '<span class="muted">lines ' + s.line + (s.end_line !== s.line ? "–" + s.end_line : "") + "</span>" +
+            '<span class="ch-count' + (s.callers_total ? " has" : "") + '">' + s.callers_total + " caller" + (s.callers_total === 1 ? "" : "s") + "</span></div>" +
+            (s.callers.length ? '<ul class="ch-callers">' + s.callers.map((c) => "<li>" + '<a href="' + esc(ui.withRepo("/graph", { q: c.sig })) + '">' + esc(c.sig) + "</a> " +
+              '<span class="muted">' + editorAnchor(c.path, c.line, c.path + ":" + c.line) + "</span></li>").join("") +
+              (s.callers_total > s.callers.length ? '<li class="muted">and ' + (s.callers_total - s.callers.length) + " more</li>" : "") + "</ul>" : "") +
+            "</div>";
+        }
+        html += '<div class="ch-blast" hidden></div></div></details>';
+      }
+      out.innerHTML = html;
+    }
+
+    page.addEventListener("click", async (e) => {
+      if (e.target.id === "c-refresh") { load(); return; }
+      const b = e.target.closest("[data-blast]");
+      if (!b) return;
+      e.preventDefault();
+      const box = b.closest(".ch-file").querySelector(".ch-blast");
+      box.hidden = false;
+      box.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Blast radius…</p>';
+      try {
+        const files = ui.parseEnvelope(await ui.tool("get_blast_radius", { file: b.dataset.blast, analysis: "tree-sitter" }));
+        box.innerHTML = '<div class="ch-blast-h">Blast radius <span class="badge dim">' + files.length + " file" + (files.length === 1 ? "" : "s") + "</span></div>" +
+          (files.length ? '<ul class="results">' + files.map((p) => "<li>" + editorAnchor(p, null, p) + "</li>").join("") + "</ul>" : '<p class="sub">Nothing else reaches this file.</p>');
+      } catch (err) {
+        box.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(err.message) + "</div></div>";
+      }
+    });
+    load();
+  }
+
+  const VIEWS = { "/architecture": architectureView, "/changes": changesView, "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
 
   (async function main() {
     const path = location.pathname.replace(/\/+$/, "");
