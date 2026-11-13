@@ -751,6 +751,10 @@
 
     function render(entry, rec) {
       entry.dataset.id = String(rec.id);
+      // What rerun needs lives on the entry itself: the stored log keeps only
+      // the last LOG_MAX results (fewer when storage is full), but the page
+      // keeps showing older ones, whose rerun must still work.
+      entry.dataset.args = JSON.stringify(rec.args || {});
       entry.dataset.cmd = rec.cmd;
       if (rec.error) {
         entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(rec.cmd) + '</span><span class="t-meta bad">not run</span>' +
@@ -920,8 +924,9 @@
       const entry = t.closest(".t-entry");
       const id = Number(entry.dataset.id);
       if (t.dataset.rerun) {
-        const rec = saved.find((s) => s.id === id);
-        if (rec) run(rec.cmd, null, rec.args);
+        let args = null;
+        try { args = JSON.parse(entry.dataset.args || "null"); } catch (_) { args = null; }
+        if (entry.dataset.cmd && TCMDS[entry.dataset.cmd] && args) run(entry.dataset.cmd, null, args);
         return;
       }
       if (t.dataset.close) {
@@ -1300,6 +1305,9 @@
       if (data.base && data.head && data.base !== data.head) {
         html += '<div class="note-box">The index describes <code>' + esc(short(data.base)) + "</code> and HEAD is <code>" + esc(short(data.head)) +
           "</code>, so commits made since the last index are included here as well.</div>";
+      }
+      if (data.diff_incomplete) {
+        html += '<div class="note-box">The line-by-line diff was too large to read in time, so the changed files are listed but their edits are not mapped to symbols.</div>';
       }
       html += '<div class="cards a-cards">' +
         card("Files changed", String(files.length) + (data.truncated ? "+" : ""), "", "since " + short(data.base)) +

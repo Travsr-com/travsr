@@ -17,7 +17,7 @@ use axum::Json;
 use serde::Serialize;
 
 use super::{resolve_repo, ApiError, UiState};
-use crate::git_bounded::git_stdout_bounded;
+use crate::git_bounded::{git_output_bounded, git_stdout_bounded};
 
 /// Most files listed; a branch switch can leave thousands.
 const MAX_FILES: usize = 200;
@@ -63,6 +63,9 @@ pub(super) struct ChangesResponse {
     head: String,
     files: Vec<ChangedFile>,
     truncated: bool,
+    /// The line-level diff could not be read in time, so files are listed
+    /// but no edit is mapped to a symbol.
+    diff_incomplete: bool,
 }
 
 /// One `git diff --name-status` or porcelain status letter, in words.
@@ -102,16 +105,24 @@ pub(super) fn parse_name_status(out: &str) -> Vec<(&'static str, String)> {
 pub(super) fn parse_hunks(diff: &str) -> BTreeMap<String, Vec<(i64, i64)>> {
     let mut out: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
     let mut current: Option<String> = None;
+    // `---` / `+++` are headers only between `diff --git` and the first `@@`.
+    // In a hunk body they are content: deleting the line `-- note` (an SQL or
+    // Lua comment) prints `--- note`, which must not end the file.
+    let mut in_header = false;
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("--- ") {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+            current = None;
+        } else if in_header && line.starts_with("--- ") {
             // The old side names the file as the index knows it; a new file
             // has /dev/null there and takes its name from `+++`.
-            current = rest.strip_prefix("a/").map(str::to_string);
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            current = header_path(&line[4..], "a/");
+        } else if in_header && line.starts_with("+++ ") {
             if current.is_none() {
-                current = rest.strip_prefix("b/").map(str::to_string);
+                current = header_path(&line[4..], "b/");
             }
         } else if let Some(rest) = line.strip_prefix("@@ -") {
+            in_header = false;
             let Some(path) = current.clone() else {
                 continue;
             };
@@ -128,6 +139,54 @@ pub(super) fn parse_hunks(diff: &str) -> BTreeMap<String, Vec<(i64, i64)>> {
         }
     }
     out
+}
+
+/// The repo-relative path on a `---` / `+++` header line, without its `a/` or
+/// `b/` side prefix. Git ends a path that contains a space with a TAB, and
+/// quotes one with special characters C-style (`"a/caf\303\251.rs"`); both
+/// are undone here so the path matches `--name-status -z`'s raw spelling.
+fn header_path(rest: &str, side: &str) -> Option<String> {
+    let rest = rest.strip_suffix('\t').unwrap_or(rest);
+    let path = if rest.starts_with('"') {
+        unquote_c(rest)?
+    } else {
+        rest.to_string()
+    };
+    path.strip_prefix(side).map(str::to_string)
+}
+
+/// Git's C-style quoting: `\\`, `\"`, the usual letter escapes and `\ooo`
+/// octal bytes (UTF-8 encoded one byte at a time).
+fn unquote_c(s: &str) -> Option<String> {
+    let inner = s.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let next = *bytes.get(i + 1)?;
+        let (byte, used) = match next {
+            b'0'..=b'7' => {
+                let oct = std::str::from_utf8(bytes.get(i + 1..i + 4)?).ok()?;
+                (u8::from_str_radix(oct, 8).ok()?, 4)
+            }
+            b'a' => (0x07, 2),
+            b'b' => (0x08, 2),
+            b't' => (b'\t', 2),
+            b'n' => (b'\n', 2),
+            b'v' => (0x0b, 2),
+            b'f' => (0x0c, 2),
+            b'r' => (b'\r', 2),
+            other => (other, 2),
+        };
+        out.push(byte);
+        i += used;
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Keep only the innermost of nested spans: an `impl` block and the method
@@ -223,28 +282,54 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
         )
         .unwrap_or_else(|_| head.clone());
     let base = if base.is_empty() { head.clone() } else { base };
-    let names = git_stdout_bounded(
-        Some(root),
-        ["diff", "--name-status", "-z", "--no-renames", &base],
-    )
-    .ok_or_else(|| anyhow::anyhow!("git diff against {base} failed"))?;
-    let untracked = git_stdout_bounded(
-        Some(root),
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-    )
-    .unwrap_or_default();
-    let diff = git_stdout_bounded(
+    // The index may record an abbreviated id (`9738b7d69`); the full one is
+    // what HEAD is compared with, so an index at HEAD does not read as behind.
+    let base = git_stdout_bounded(
         Some(root),
         [
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .unwrap_or(base);
+    // `--` after the commit: a file or folder named like an abbreviated
+    // commit id would otherwise make the revision ambiguous.
+    let names = match git_text(
+        root,
+        &["diff", "--name-status", "-z", "--no-renames", &base, "--"],
+    ) {
+        // No output is a clean tree, not a failure.
+        GitText::Out(s) => s,
+        GitText::Failed(why) => anyhow::bail!("git diff against {base} failed: {why}"),
+        GitText::NoAnswer => anyhow::bail!("git diff against {base} did not answer in time"),
+    };
+    let untracked = match git_text(root, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+        GitText::Out(s) => s,
+        _ => String::new(),
+    };
+    // Paths left unquoted (quotePath=false) so they match the -z listing;
+    // header_path still undoes the quoting git keeps for special characters.
+    let (diff, diff_incomplete) = match git_text(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "-U0",
             "--no-color",
             "--no-ext-diff",
             "--no-renames",
             &base,
+            "--",
         ],
-    )
-    .unwrap_or_default();
+    ) {
+        GitText::Out(s) => (s, false),
+        // Too big or too slow for the bounded call: list the files anyway,
+        // and say their symbols could not be mapped.
+        _ => (String::new(), true),
+    };
     let hunks = parse_hunks(&diff);
 
     let mut list = parse_name_status(&names);
@@ -280,7 +365,31 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
         head,
         files,
         truncated,
+        diff_incomplete,
     })
+}
+
+/// What a bounded git call gave back.
+enum GitText {
+    /// Exit 0: its stdout, which may be empty.
+    Out(String),
+    /// A non-zero exit: its stderr, for the message.
+    Failed(String),
+    /// It could not start, or did not finish within the bound.
+    NoAnswer,
+}
+
+/// `git <args>` in `root`, bounded like the rest of travsr's git calls. Unlike
+/// `git_stdout_bounded`, an empty stdout is an answer: a clean tree has no
+/// diff, and that must not read as "git failed".
+fn git_text(root: &Path, args: &[&str]) -> GitText {
+    match git_output_bounded(Some(root), args) {
+        None => GitText::NoAnswer,
+        Some(out) if out.status.success() => {
+            GitText::Out(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+        Some(out) => GitText::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
 }
 
 /// `GET /api/changes?repo=<repo>`
@@ -330,6 +439,63 @@ mod tests {
         let h = parse_hunks(diff);
         assert_eq!(h["src/a.rs"], vec![(10, 12), (40, 40), (50, 51)]);
         assert_eq!(h["new.rs"], vec![(1, 2)]);
+    }
+
+    /// Review fixes: content lines that look like headers, a path with a space
+    /// (git ends it with a TAB) and a quoted non-ASCII path, all taken from
+    /// what git actually prints.
+    #[test]
+    fn hunks_survive_header_lookalikes_and_quoted_paths() {
+        let diff = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n\
+                    @@ -1 +0,0 @@\n--- note\n@@ -5 +4 @@\n-x\n+++ added\n\
+                    diff --git a/my file.rs b/my file.rs\n--- a/my file.rs\t\n+++ b/my file.rs\t\n@@ -2 +2 @@\n\
+                    diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n--- \"a/caf\\303\\251.rs\"\n+++ \"b/caf\\303\\251.rs\"\n@@ -7,2 +7,2 @@\n";
+        let h = parse_hunks(diff);
+        assert_eq!(h["q.sql"], vec![(1, 1), (5, 5)], "{h:?}");
+        assert_eq!(h["my file.rs"], vec![(2, 2)], "{h:?}");
+        assert_eq!(h["caf\u{e9}.rs"], vec![(7, 8)], "{h:?}");
+        assert_eq!(h.len(), 3, "no stray file from a body line: {h:?}");
+        assert_eq!(
+            unquote_c("\"a\\\\b\\\"c\\t\"").as_deref(),
+            Some("a\\b\"c\t")
+        );
+    }
+
+    /// Review fix: a clean tree gives git no output, which is an answer.
+    #[test]
+    fn an_empty_git_diff_is_a_clean_tree_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "x\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "i",
+        ]);
+        let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        let head = head.trim();
+        assert!(matches!(
+            git_text(root, &["diff", "--name-status", "-z", "--no-renames", head, "--"]),
+            GitText::Out(ref s) if s.is_empty()
+        ));
+        assert!(matches!(
+            git_text(root, &["diff", "no-such-commit", "--"]),
+            GitText::Failed(_)
+        ));
     }
 
     #[test]
