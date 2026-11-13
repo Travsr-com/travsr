@@ -55,6 +55,7 @@ const COMMON_JS: &str = include_str!("assets/common.js");
 const HEALTH_JS: &str = include_str!("assets/health.js");
 const PAGES_JS: &str = include_str!("assets/pages.js");
 const GRAPH_HOST_JS: &str = include_str!("assets/graph-host.js");
+const GRAPH_MENU_JS: &str = include_str!("assets/graph-menu.js");
 
 // The Graph page is the extension's, byte for byte: one source of truth, so a
 // change to the extension's graph view reaches `travsr ui` on the next build.
@@ -185,6 +186,10 @@ fn router(state: Arc<UiState>) -> Router {
         .route(
             "/assets/graph-host.js",
             get(|| async { asset(JS, GRAPH_HOST_JS) }),
+        )
+        .route(
+            "/assets/graph-menu.js",
+            get(|| async { asset(JS, GRAPH_MENU_JS) }),
         )
         .route("/assets/graph.js", get(|| async { asset(JS, GRAPH_JS) }))
         .route("/assets/graph.css", get(|| async { asset(CSS, GRAPH_CSS) }))
@@ -1054,6 +1059,18 @@ mod tests {
             let resp = get_with_host(page, "localhost").await;
             assert_eq!(resp.status(), StatusCode::OK, "{page}");
         }
+    }
+
+    #[tokio::test]
+    async fn every_asset_a_page_references_is_served() {
+        for html in [HEALTH_HTML, PAGES_HTML, GRAPH_HTML] {
+            for part in html.split("\"/assets/").skip(1) {
+                let name = part.split('"').next().unwrap_or_default();
+                let resp = get_with_host(&format!("/assets/{name}"), "localhost").await;
+                assert_eq!(resp.status(), StatusCode::OK, "/assets/{name}");
+            }
+        }
+        assert!(GRAPH_HTML.contains("/assets/graph-menu.js"));
     }
 
     #[tokio::test]

@@ -602,7 +602,9 @@ registered one:
   demand, and the architecture rules the current state breaks (checked over
   every edge, uncommitted ones included).
 - **Graph:** the extension's graph view itself (repo map, symbol graph, blast
-  view, definition peek, DOT/JSON/PNG export).
+  view, definition peek, DOT/JSON/PNG export). Right-click a symbol for its
+  callers, references, context or blast radius, or to start or end an
+  execution path there.
 - **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's
   panels of the same names. The lookup boxes suggest matching symbols or
   indexed files as you type.
