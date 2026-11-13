@@ -445,14 +445,53 @@ window.TravsrUi = (function () {
         method: "POST",
         headers: { "X-Travsr-Token": s.token },
       });
-      const body = await resp.json().catch(() => ({}));
-      if (!resp.ok) throw new Error(body.error || resp.status + " " + resp.statusText);
-      result = body;
-      text = (body.stderr ? body.stderr.replace(/\s+$/, "") + "\n" : "") + (body.stdout || "").replace(/\s+$/, "");
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        throw new Error(body.error || resp.status + " " + resp.statusText);
+      }
+      // The output streams as one JSON record per line (#1082 A2): lines as
+      // the command writes them, then `done`. A line ended by a carriage
+      // return is progress, which the next line replaces.
+      const out = $(".tsr-modal-out");
+      const lines = [];
+      let lastWasProgress = false;
+      const paint = () => {
+        const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 24;
+        text = lines.join("\n");
+        out.textContent = text || "Running…";
+        if (atBottom) out.scrollTop = out.scrollHeight;
+      };
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const raw = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          let ev;
+          try { ev = JSON.parse(raw); } catch (_) { continue; }
+          if (ev.t === "out" || ev.t === "err") {
+            if (lastWasProgress) lines.pop();
+            lines.push(ev.line);
+            lastWasProgress = !!ev.cr;
+            paint();
+          } else if (ev.t === "done") {
+            result = ev;
+            if (ev.note) { lines.push(ev.note); paint(); }
+            if (ev.truncated) { lines.push("(output cut at 2 MB)"); paint(); }
+          }
+        }
+      }
+      if (!result) throw new Error("the command's output ended early");
+      text = lines.join("\n");
       $(".tsr-modal-state").textContent =
-        (body.code == null ? "still running" : body.code === 0 ? "done, exit 0" : "failed, exit " + body.code) + " · " + Math.round(body.millis / 1000) + " s";
-      $(".tsr-modal-state").className = "tsr-modal-state " + (body.code === 0 ? "ok" : "bad");
-      $(".tsr-modal-out").textContent = text || "(no output)";
+        (result.code == null ? "still running" : result.code === 0 ? "done, exit 0" : "failed, exit " + result.code) + " · " + Math.round(result.millis / 1000) + " s";
+      $(".tsr-modal-state").className = "tsr-modal-state " + (result.code === 0 ? "ok" : "bad");
+      if (!text) out.textContent = "(no output)";
     } catch (e) {
       $(".tsr-modal-state").textContent = "not run";
       $(".tsr-modal-state").className = "tsr-modal-state bad";

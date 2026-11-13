@@ -3942,6 +3942,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tower 0.4.13",
  "tracing",
