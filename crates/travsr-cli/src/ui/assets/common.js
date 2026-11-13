@@ -586,7 +586,9 @@ window.TravsrUi = (function () {
   async function suggestSymbols(typed) {
     const seen = new Set();
     const out = [];
-    for (const line of stripEnvelope(await tool("search_symbol", { name: typed })).split("\n")) {
+    // suggest=1: answered at once, from the index when the daemon is busy
+    // with another page's query (#1082 B2).
+    for (const line of stripEnvelope(await tool("search_symbol", { name: typed, suggest: "1" })).split("\n")) {
       const m = SYMBOL_LINE.exec(line);
       if (!m || m[2] === "import") continue;
       const name = m[1].split("::").pop();

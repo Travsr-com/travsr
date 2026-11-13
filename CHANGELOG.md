@@ -26,6 +26,7 @@ All notable changes to Travsr are documented here.
 
 ### Fixed
 
+- **`travsr ui` symbol suggestions no longer wait behind a busy daemon (#1082 B2).** The server sends one query at a time to a repository's daemon, so suggestions queued for up to 5 s behind a slow query from another panel (a Context or Architecture read). A suggestion lookup now uses the daemon only when it is free and otherwise answers at once from a read-only open of the index.
 - **The daemon log names what asked it to shut down (#1082 B4).** A control-pipe shutdown now carries a reason (`daemon stop`, `daemon restart`, or `version skew (daemon X, client Y)`), the requesting process id and its version, logged on receipt and on the final line: `travsr daemon shutting down (control pipe: daemon stop, from pid 4242 (travsr 1.4.0+...))`. Wire compatible both ways: an older client's bare shutdown still works (logged as an unknown requester), and an older daemon ignores the new fields.
 - **A daemon left over from an older binary is replaced for every repository, not only the first one a process queries (#1082 B3).** The version check before a daemon-routed query ran once per process, so `travsr ui` (which switches between repositories) and a long-running `travsr mcp` serving several kept answering from the other repositories' stale daemons. It now runs once per repository.
 
