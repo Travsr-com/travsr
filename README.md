@@ -624,7 +624,9 @@ registered one:
   each with its read-only options as fields. Only these run, as this same
   binary with no shell, and only after a read-only open of the index
   succeeds. `fsck` is not offered: even its report mode opens the index
-  writable.
+  writable. Up and Down in a box step through what you ran from it before;
+  each result has a rerun button; the log survives a reload of the tab; and a
+  filter shows only the output lines containing some text.
 
 Every graph answer is the text the matching MCP tool (`search_symbol`,
 `get_callers`, `get_dependencies`, `get_blast_radius`, `get_graph_json`, ...)

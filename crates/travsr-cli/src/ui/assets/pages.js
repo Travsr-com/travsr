@@ -690,6 +690,10 @@
       Object.keys(TCMDS).map((c) => '<button class="pill-btn" type="button" role="tab" data-tab="' + c + '">' + esc(c) + "</button>").join("") + "</div>" +
       '<p class="sub t-help" id="t-help"></p>' +
       Object.entries(TCMDS).map(([c, s]) => terminalForm(c, s)).join("") +
+      '<div class="t-logbar" id="t-logbar" hidden>' +
+      '<span class="lookup-box t-filter-box"><input id="t-filter" type="search" placeholder="Filter output lines" aria-label="Filter output lines" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<span class="muted t-filter-count" id="t-filter-count"></span>' +
+      '<button class="link-btn t-clear" type="button" data-clear-log="1" title="Remove every entry from this tab\'s log">clear log</button></div>' +
       '<div id="t-log" class="t-log"></div>';
 
     const forms = Object.fromEntries(Object.keys(TCMDS).map((c) => [c, document.getElementById("t-" + c)]));
@@ -725,10 +729,67 @@
       return Object.assign(out, extra);
     }
 
-    async function run(cmd, extra) {
-      const args = fields(cmd, extra);
+    // ── The log (#1082 A6): kept in sessionStorage for this tab and repo, so
+    // a reload or a trip to another page brings it back. Newest first.
+    const LOG_KEY = "travsr.ui.tlog." + (ui.repo || "");
+    const LOG_MAX = 20;
+    const STORED_OUT_MAX = 200 * 1024; // per stream, per entry
+    let saved = [];
+    try { saved = JSON.parse(sessionStorage.getItem(LOG_KEY) || "[]"); } catch (_) { saved = []; }
+    if (!Array.isArray(saved)) saved = [];
+    let nextId = saved.reduce((m, s) => Math.max(m, s.id || 0), 0) + 1;
+    function persist() {
+      const keep = saved.slice(0, LOG_MAX);
+      for (let n = keep.length; n >= 0; n--) {
+        try { sessionStorage.setItem(LOG_KEY, JSON.stringify(keep.slice(0, n))); saved = keep.slice(0, n); return; } catch (_) { /* full: drop the oldest */ }
+      }
+    }
+    const cut = (s) => (s.length > STORED_OUT_MAX ? s.slice(0, STORED_OUT_MAX) : s);
+
+    // Each output line its own block, so the filter can hide lines.
+    const lines = (text) => text.split("\n").map((l) => '<span class="t-line">' + linkify(l) + "</span>").join("");
+
+    function render(entry, rec) {
+      entry.dataset.id = String(rec.id);
+      entry.dataset.cmd = rec.cmd;
+      if (rec.error) {
+        entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(rec.cmd) + '</span><span class="t-meta bad">not run</span>' +
+          '<span class="t-acts"><button class="link-btn" type="button" data-rerun="1">rerun</button>' +
+          '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
+          '<div class="diag error"><div class="diag-t">' + esc(rec.error) + "</div></div>";
+        return;
+      }
+      const ok = rec.code === 0;
+      const secs = rec.millis / 1000;
+      const out = rec.stdout.replace(/\s+$/, "");
+      const notes = rec.stderr.replace(/\s+$/, "");
+      entry.innerHTML =
+        '<div class="t-head"><span class="t-cmd">$ ' + esc(rec.command) + "</span>" +
+        '<span class="t-meta ' + (ok ? "" : "bad") + '">' + (rec.code == null ? "timed out" : "exit " + rec.code) + " · " + (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + " s" +
+        (rec.at ? " · " + new Date(rec.at).toLocaleTimeString() : "") + "</span>" +
+        '<span class="t-acts"><button class="link-btn" type="button" data-rerun="1" title="Run the same command again">rerun</button>' +
+        '<button class="link-btn" type="button" data-copy-cmd="1">copy command</button>' +
+        '<button class="link-btn" type="button" data-copy-out="1">copy output</button>' +
+        '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
+        (notes ? '<pre class="t-out t-err">' + lines(notes) + "</pre>" : "") +
+        '<pre class="t-out">' + (out ? lines(out) : '<span class="muted">(no output)</span>') + "</pre>" +
+        '<div class="t-hidden-note" hidden></div>' +
+        (rec.truncated ? '<div class="note-box">Output cut at 2 MB. Run the command in a shell for all of it.</div>' : "") +
+        (rec.storedCut ? '<div class="note-box">Restored from this tab\'s log, which keeps the first 200 KB of each output. Rerun for all of it.</div>' : "");
+      entry.dataset.command = rec.command;
+      entry.dataset.output = (notes ? notes + "\n" : "") + out;
+    }
+
+    function newEntry() {
       const entry = document.createElement("section");
       entry.className = "t-entry";
+      return entry;
+    }
+
+    async function run(cmd, extra, exactArgs) {
+      const args = exactArgs || fields(cmd, extra);
+      if (!exactArgs) remember(cmd);
+      const entry = newEntry();
       entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(cmd) + ' <span class="spinner">⟳</span></span>' +
         '<span class="t-meta">running <span class="t-time">0 s</span></span></div>';
       log.prepend(entry);
@@ -737,43 +798,140 @@
         const t = entry.querySelector(".t-time");
         if (t) t.textContent = Math.round((Date.now() - started) / 1000) + " s";
       }, 1000);
+      const rec = { id: nextId++, cmd, args, at: Date.now() };
       try {
         const r = await ui.api("/api/run/" + cmd, Object.assign({ repo: ui.repo }, args));
-        const ok = r.code === 0;
-        const secs = r.millis / 1000;
-        const out = r.stdout.replace(/\s+$/, "");
-        const notes = r.stderr.replace(/\s+$/, "");
-        entry.innerHTML =
-          '<div class="t-head"><span class="t-cmd">$ ' + esc(r.command) + "</span>" +
-          '<span class="t-meta ' + (ok ? "" : "bad") + '">' + (r.code == null ? "timed out" : "exit " + r.code) + " · " + (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + " s</span>" +
-          '<span class="t-acts"><button class="link-btn" type="button" data-copy-cmd="1">copy command</button>' +
-          '<button class="link-btn" type="button" data-copy-out="1">copy output</button>' +
-          '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
-          (notes ? '<pre class="t-out t-err">' + notes.split("\n").map(linkify).join("\n") + "</pre>" : "") +
-          '<pre class="t-out">' + (out ? out.split("\n").map(linkify).join("\n") : '<span class="muted">(no output)</span>') + "</pre>" +
-          (r.truncated ? '<div class="note-box">Output cut at 2 MB. Run the command in a shell for all of it.</div>' : "");
-        entry.dataset.command = r.command;
-        entry.dataset.output = (notes ? notes + "\n" : "") + out;
+        Object.assign(rec, { command: r.command, code: r.code, millis: r.millis, stdout: r.stdout, stderr: r.stderr, truncated: !!r.truncated });
       } catch (e) {
-        entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(cmd) + '</span><span class="t-meta bad">not run</span>' +
-          '<span class="t-acts"><button class="link-btn" type="button" data-close="1">✕</button></span></div>' +
-          '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+        rec.error = e.message;
       } finally {
         clearInterval(tick);
       }
+      render(entry, rec);
+      applyFilter();
+      const stored = Object.assign({}, rec);
+      if (!rec.error) {
+        stored.stdout = cut(rec.stdout);
+        stored.stderr = cut(rec.stderr);
+        stored.storedCut = stored.stdout.length < rec.stdout.length || stored.stderr.length < rec.stderr.length;
+      }
+      saved.unshift(stored);
+      persist();
+      updateLogBar();
     }
 
     for (const f of Object.values(forms)) {
       f.addEventListener("submit", (e) => { e.preventDefault(); run(f.dataset.cmd); });
     }
 
+    // ── Per-field history: Up and Down in a text box step through what was
+    // run from it before, as in a shell. Only while its suggestions are shut.
+    const HIST_MAX = 30;
+    const histKey = (cmd, k) => "thist." + cmd + "." + k;
+    function history(cmd, k) {
+      try { const h = JSON.parse(ui.pref(histKey(cmd, k)) || "[]"); return Array.isArray(h) ? h : []; } catch (_) { return []; }
+    }
+    function remember(cmd) {
+      for (const f of TCMDS[cmd].fields) {
+        if (f.check || f.opts) continue;
+        const input = el(cmd, f.k);
+        const v = input.disabled ? "" : input.value.trim();
+        if (!v) continue;
+        const h = history(cmd, f.k).filter((x) => x !== v);
+        h.push(v);
+        ui.pref(histKey(cmd, f.k), JSON.stringify(h.slice(-HIST_MAX)));
+        input._hist = null;
+      }
+    }
+    for (const [cmd, spec] of Object.entries(TCMDS)) {
+      for (const f of spec.fields.filter((x) => !x.check && !x.opts)) {
+        const input = el(cmd, f.k);
+        input.addEventListener("input", () => { input._hist = null; });
+        input.addEventListener("keydown", (e) => {
+          if ((e.key !== "ArrowUp" && e.key !== "ArrowDown") || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+          const list = document.getElementById(input.getAttribute("aria-controls") || "");
+          if (list && !list.hidden) return; // the suggestions own the arrows
+          if (!input._hist) input._hist = { items: history(cmd, f.k), at: -1, draft: input.value };
+          const s = input._hist;
+          if (!s.items.length) return;
+          e.preventDefault();
+          if (e.key === "ArrowUp") s.at = s.at < 0 ? s.items.length - 1 : Math.max(0, s.at - 1);
+          else if (s.at >= 0) s.at = s.at + 1 >= s.items.length ? -1 : s.at + 1;
+          input.value = s.at < 0 ? s.draft : s.items[s.at];
+          const end = input.value.length;
+          input.setSelectionRange(end, end);
+        });
+      }
+    }
+
+    // ── Output filter: show only the lines containing the text, in every
+    // entry; an entry with no match collapses to its header.
+    const filterBox = document.getElementById("t-filter");
+    const logBar = document.getElementById("t-logbar");
+    function applyFilter() {
+      const q = filterBox.value.trim().toLowerCase();
+      let shown = 0;
+      let total = 0;
+      for (const entry of log.querySelectorAll(".t-entry")) {
+        let hit = 0;
+        let all = 0;
+        for (const line of entry.querySelectorAll(".t-line")) {
+          const keep = !q || line.textContent.toLowerCase().includes(q);
+          line.hidden = !keep;
+          all++;
+          if (keep) hit++;
+        }
+        shown += hit;
+        total += all;
+        entry.classList.toggle("t-nomatch", !!q && all > 0 && hit === 0);
+        const note = entry.querySelector(".t-hidden-note");
+        if (note) {
+          note.hidden = !q || hit === all;
+          note.textContent = hit + " of " + all + " lines match “" + filterBox.value.trim() + "”";
+        }
+      }
+      document.getElementById("t-filter-count").textContent = q ? shown + " of " + total + " lines" : "";
+    }
+    filterBox.addEventListener("input", applyFilter);
+    filterBox.addEventListener("keydown", (e) => { if (e.key === "Escape") { filterBox.value = ""; applyFilter(); } });
+    function updateLogBar() { logBar.hidden = !log.querySelector(".t-entry"); }
+
+    // Bring back this tab's log, oldest first so the newest ends on top.
+    for (const rec of saved.slice().reverse()) {
+      const entry = newEntry();
+      render(entry, rec);
+      log.prepend(entry);
+    }
+    updateLogBar();
+
     page.addEventListener("click", async (e) => {
-      const t = e.target.closest("[data-tab],[data-examples],[data-copy-cmd],[data-copy-out],[data-close]");
+      const t = e.target.closest("[data-tab],[data-examples],[data-copy-cmd],[data-copy-out],[data-close],[data-rerun],[data-clear-log]");
       if (!t) return;
       if (t.dataset.tab) { tab(t.dataset.tab); return; }
       if (t.dataset.examples) { run("ask", { examples: "1" }); return; }
+      if (t.dataset.clearLog) {
+        log.replaceChildren();
+        saved = [];
+        persist();
+        updateLogBar();
+        applyFilter();
+        return;
+      }
       const entry = t.closest(".t-entry");
-      if (t.dataset.close) { entry.remove(); return; }
+      const id = Number(entry.dataset.id);
+      if (t.dataset.rerun) {
+        const rec = saved.find((s) => s.id === id);
+        if (rec) run(rec.cmd, null, rec.args);
+        return;
+      }
+      if (t.dataset.close) {
+        entry.remove();
+        saved = saved.filter((s) => s.id !== id);
+        persist();
+        updateLogBar();
+        applyFilter();
+        return;
+      }
       const text = t.dataset.copyCmd ? entry.dataset.command : entry.dataset.output;
       const label = t.textContent;
       try { await navigator.clipboard.writeText(text || ""); t.textContent = "copied"; } catch (_) { t.textContent = "copy failed"; }
