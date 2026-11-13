@@ -584,6 +584,10 @@ travsr ui --port 0   # pick any free port
 The pages are the VS Code extension's, for the current repository or any other
 registered one:
 
+- **Search (Ctrl+K, or Cmd+K on macOS), on every page:** find a symbol, an
+  indexed file or a page and open it where you want: a symbol in Graph,
+  Callers, References, Context or Path, a file in Graph, Dependencies, Blast
+  radius or your editor. Recent picks come first.
 - **Health:** the extension's Health page: verdict, metric tiles, daemon,
   index freshness, sidecars, storage and integrity, languages, repositories,
   recent activity and the daemon log with its filters.

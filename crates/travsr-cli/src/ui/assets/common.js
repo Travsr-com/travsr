@@ -202,12 +202,19 @@ window.TravsrUi = (function () {
       [["auto", "Auto"], ["dark", "Dark"], ["light", "Light"]].map(([v, t]) =>
         el("option", { value: v, text: t, selected: (pref("theme") || "auto") === v })));
     themeSel.addEventListener("change", () => { pref("theme", themeSel.value); applyTheme(); });
+    const isMac = /Mac|iPhone|iPad/.test(navigator.platform || "");
+    const searchBtn = el("button", {
+      type: "button", class: "tsr-search", title: "Search symbols, files and pages",
+      "aria-keyshortcuts": isMac ? "Meta+K" : "Control+K",
+    }, [el("span", { text: "Search" }), el("kbd", { text: isMac ? "⌘K" : "Ctrl K" })]);
+    searchBtn.addEventListener("click", () => openPalette());
     const conn = el("span", { class: "tsr-conn", id: "tsr-conn" }, [el("span", { class: "tsr-dot" })]);
     const nav = el("header", { class: "tsr-nav" }, [
       el("a", { class: "tsr-brand", href: withRepo("/health") },
         [el("img", { src: "/assets/icon.png", alt: "" }), el("span", { text: "travsr" })]),
       tabs,
       el("span", { class: "tsr-spacer" }),
+      searchBtn,
       conn,
       el("label", null, [document.createTextNode("Repo"), repoSel]),
       el("label", null, [document.createTextNode("Theme"), themeSel]),
@@ -702,7 +709,190 @@ window.TravsrUi = (function () {
     input.addEventListener("blur", () => setTimeout(close, 120));
   }
 
+  // ── Search from any page (Ctrl+K / Cmd+K) ───────────────────────────────
+  // One box for symbols, files and pages. Each result offers the places it
+  // can be opened; Enter takes the first, Left and Right pick another, and a
+  // click on any of them opens that one. Recent picks are kept per repository.
+  const SYMBOL_GOES = [
+    ["Graph", (v) => withRepo("/graph", { q: v })],
+    ["Callers", (v) => withRepo("/callers", { symbol: v })],
+    ["References", (v) => withRepo("/terminal", { cmd: "references", q: v })],
+    ["Context", (v) => withRepo("/context", { q: v })],
+    ["Path from", (v) => withRepo("/path", { from: v })],
+    ["Path to", (v) => withRepo("/path", { to: v })],
+  ];
+  const FILE_GOES = [
+    ["Graph", (v) => withRepo("/graph", { file: v })],
+    ["Dependencies", (v) => withRepo("/dependencies", { file: v })],
+    ["Blast radius", (v) => withRepo("/blast", { file: v })],
+    ["Editor", (v) => editorLink(v)],
+  ];
+  const PAGE_GOES = [["Open", (v) => withRepo(v)]];
+  const RECENT_MAX = 8;
+  const PAL_PER_GROUP = 8;
+
+  function goesFor(item) {
+    const goes = item.kind === "page" ? PAGE_GOES : item.kind === "file" ? FILE_GOES : SYMBOL_GOES;
+    // Without a known repository root there is no editor link to offer.
+    return goes.filter(([, url]) => url(item.value));
+  }
+  function recentKey() { return "recent." + (repo || ""); }
+  function recentPicks() {
+    try {
+      const list = JSON.parse(pref(recentKey()) || "[]");
+      return Array.isArray(list) ? list.filter((x) => x && x.value && x.kind) : [];
+    } catch (_) { return []; }
+  }
+  function remember(item) {
+    const keep = { value: item.value, label: item.label, kind: item.kind, detail: item.detail || "" };
+    const same = (x) => x.value === keep.value && x.kind === keep.kind && x.detail === keep.detail;
+    pref(recentKey(), JSON.stringify([keep].concat(recentPicks().filter((x) => !same(x))).slice(0, RECENT_MAX)));
+  }
+  function pageItems(typed) {
+    const low = (typed || "").toLowerCase();
+    return PAGES.filter(([, label]) => !low || label.toLowerCase().includes(low))
+      .map(([href, label]) => ({ value: href, label, kind: "page", detail: href }));
+  }
+
+  let palette = null;
+  function openPalette() {
+    if (!palette) palette = buildPalette();
+    palette.open();
+  }
+  function buildPalette() {
+    const input = el("input", {
+      type: "search", class: "tsr-pal-input", placeholder: "Search symbols, files and pages",
+      "aria-label": "Search symbols, files and pages", autocomplete: "off", spellcheck: "false",
+      maxlength: "200", role: "combobox", "aria-expanded": "true", "aria-controls": "tsr-pal-list",
+    });
+    const list = el("ul", { class: "tsr-pal-list", id: "tsr-pal-list", role: "listbox" });
+    const hint = el("div", { class: "tsr-pal-hint",
+      text: "Enter opens  ·  Left/Right picks where  ·  Up/Down moves  ·  Esc closes" });
+    const box = el("div", { class: "tsr-pal", role: "dialog", "aria-modal": "true", "aria-label": "Search" },
+      [input, list, hint]);
+    const back = el("div", { class: "tsr-pal-back" }, [box]);
+    back.hidden = true;
+    document.body.append(back);
+
+    let rows = [];   // [{item, goes}]
+    let active = 0;
+    let choice = 0;  // which of the active row's places
+    let timer = null;
+    let seq = 0;
+    let lastFocus = null;
+
+    function close() {
+      back.hidden = true;
+      clearTimeout(timer);
+      seq++;
+      if (lastFocus && lastFocus.focus) lastFocus.focus();
+    }
+    function go(row, i) {
+      const [, url] = row.goes[i] || row.goes[0];
+      const href = url(row.item.value);
+      if (!href) return;
+      remember(row.item);
+      close();
+      location.href = href;
+    }
+    function paint() {
+      [...list.querySelectorAll("li[data-row]")].forEach((li) => {
+        const on = Number(li.dataset.row) === active;
+        li.classList.toggle("active", on);
+        li.setAttribute("aria-selected", on ? "true" : "false");
+        li.querySelectorAll(".tsr-pal-go").forEach((b, j) => b.classList.toggle("chosen", on && j === choice));
+        if (on) li.scrollIntoView({ block: "nearest" });
+      });
+    }
+    function note(text) {
+      rows = [];
+      list.replaceChildren(el("li", { class: "tsr-pal-note", text }));
+    }
+    function show(groups) {
+      rows = [];
+      list.replaceChildren();
+      for (const [title, items] of groups) {
+        if (!items.length) continue;
+        list.append(el("li", { class: "tsr-pal-group", text: title, role: "presentation" }));
+        for (const item of items) {
+          const goes = goesFor(item);
+          if (!goes.length) continue;
+          const r = rows.length;
+          rows.push({ item, goes });
+          const chips = goes.map(([label], j) => {
+            const b = el("button", { type: "button", class: "tsr-pal-go", tabindex: "-1", text: label });
+            b.addEventListener("mousedown", (e) => { e.preventDefault(); go(rows[r], j); });
+            return b;
+          });
+          const li = el("li", { role: "option", "data-row": String(r) }, [
+            el("span", { class: "tsr-pal-name", text: item.label }),
+            el("span", { class: "tsr-pal-kind", text: item.kind }),
+            el("span", { class: "tsr-pal-path", text: item.detail || "", title: item.detail || "" }),
+            el("span", { class: "tsr-pal-goes" }, chips),
+          ]);
+          li.addEventListener("mousedown", (e) => { if (e.target === li || !e.target.closest("button")) { e.preventDefault(); go(rows[r], 0); } });
+          li.addEventListener("mousemove", () => { if (active !== r) { active = r; choice = 0; paint(); } });
+          list.append(li);
+        }
+      }
+      active = 0;
+      choice = 0;
+      if (!rows.length) { note("Nothing matches."); return; }
+      paint();
+    }
+    function startPage() {
+      const recent = recentPicks();
+      show([["Recent", recent], ["Pages", pageItems("")]]);
+    }
+    async function search(typed) {
+      const mine = ++seq;
+      note("Searching for “" + typed + "”…");
+      const [syms, files] = await Promise.allSettled([suggestSymbols(typed), suggestFiles(typed)]);
+      if (mine !== seq || input.value.trim() !== typed) return;
+      const take = (r) => (r.status === "fulfilled" ? r.value : []).slice(0, PAL_PER_GROUP);
+      show([["Symbols", take(syms)], ["Files", take(files)], ["Pages", pageItems(typed)]]);
+    }
+
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      const typed = input.value.trim();
+      if (!typed) { seq++; startPage(); return; }
+      if (typed.length < 2) { seq++; show([["Pages", pageItems(typed)]]); return; }
+      timer = setTimeout(() => { search(typed).catch(() => note("Search failed. Is `travsr ui` still running?")); }, 180);
+    });
+    input.addEventListener("keydown", (e) => {
+      const row = rows[active];
+      if (e.key === "Escape") { e.preventDefault(); close(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); if (rows.length) { active = (active + 1) % rows.length; choice = 0; paint(); } }
+      else if (e.key === "ArrowUp") { e.preventDefault(); if (rows.length) { active = (active - 1 + rows.length) % rows.length; choice = 0; paint(); } }
+      else if (e.key === "ArrowRight" && row && input.selectionStart === input.value.length) {
+        e.preventDefault(); choice = (choice + 1) % row.goes.length; paint();
+      } else if (e.key === "ArrowLeft" && row && choice > 0) {
+        e.preventDefault(); choice -= 1; paint();
+      } else if (e.key === "Enter") { e.preventDefault(); if (row) go(row, choice); }
+    });
+    back.addEventListener("mousedown", (e) => { if (e.target === back) close(); });
+
+    return {
+      open() {
+        if (!back.hidden) { input.select(); return; }
+        lastFocus = document.activeElement;
+        back.hidden = false;
+        input.value = "";
+        startPage();
+        input.focus();
+      },
+    };
+  }
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      openPalette();
+    }
+  });
+
   return {
+    openPalette,
     esc, api, tool, cli, holdCliUntil, init, setConnection, withRepo, editorLink, watch,
     stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
     suggest, suggestSymbols, suggestFiles, parseExecutionPath, canRun, runCommand,
