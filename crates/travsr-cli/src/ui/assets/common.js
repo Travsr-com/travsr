@@ -731,6 +731,7 @@ window.TravsrUi = (function () {
   ];
   const PAGE_GOES = [["Open", (v) => withRepo(v)]];
   const RECENT_MAX = 8;
+  const LRM = String.fromCharCode(0x200e);
   const PAL_PER_GROUP = 8;
 
   function goesFor(item) {
@@ -829,7 +830,14 @@ window.TravsrUi = (function () {
           const li = el("li", { role: "option", "data-row": String(r) }, [
             el("span", { class: "tsr-pal-name", text: item.label }),
             el("span", { class: "tsr-pal-kind", text: item.kind }),
-            el("span", { class: "tsr-pal-path", text: item.detail || "", title: item.detail || "" }),
+            // Right-aligned and clipped from the left (CSS rtl) so the file
+            // name stays; left-to-right marks keep a leading "/" or a
+            // trailing ":line" from being reordered, as the lookup boxes do.
+            el("span", {
+              class: "tsr-pal-path",
+              text: LRM + (item.detail || "") + LRM,
+              title: item.detail || "",
+            }),
             el("span", { class: "tsr-pal-goes" }, chips),
           ]);
           li.addEventListener("mousedown", (e) => { if (e.target === li || !e.target.closest("button")) { e.preventDefault(); go(rows[r], 0); } });
