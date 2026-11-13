@@ -6,6 +6,10 @@ All notable changes to Travsr are documented here.
 
 ## Unreleased
 
+### Upgrading
+
+- **Building from source needs Rust 1.89 (was 1.88).** rusqlite 0.41, which bundles the SQLite that fixes RUSTSEC-2026-0459, declares 1.89; every rusqlite release with the fix does. Prebuilt binaries and npm installs are unaffected.
+
 ### Added
 
 - **`travsr ui` Graph right-click menu (#1082 A5).** Right-click a symbol on the Graph page for Callers, References, Context, its file's blast radius, Path from here / Path to here (the second draws the path on the graph) and Open in editor; a file node offers Dependencies, Blast radius and its file graph. The extension's graph.js runs unchanged; the menu is a separate script.

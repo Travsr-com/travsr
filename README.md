@@ -11,7 +11,7 @@
   <a href="https://github.com/Travsr-com/travsr/releases/latest"><img src="https://img.shields.io/github/v/release/Travsr-com/travsr?style=flat-square&logo=github&label=release&color=blue" alt="Latest release"/></a>
   <a href="https://www.npmjs.com/package/@travsr.com/travsr"><img src="https://img.shields.io/npm/v/%40travsr.com%2Ftravsr?style=flat-square&logo=npm&logoColor=white&label=npm" alt="npm"/></a>
   <a href="https://marketplace.visualstudio.com/items?itemName=travsr.travsr-vscode"><img src="https://img.shields.io/badge/vs%20code-extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white" alt="VS Code extension"/></a>
-  <a href="#build-from-source"><img src="https://img.shields.io/badge/rust-1.88%2B-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+"/></a>
+  <a href="#build-from-source"><img src="https://img.shields.io/badge/rust-1.89%2B-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.89+"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-1f6feb?style=flat-square" alt="MCP"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache 2.0"/></a>
 </p>
@@ -796,7 +796,7 @@ git clone https://github.com/Travsr-com/travsr
 cd travsr
 
 # Build (SQLite backend)
-cargo build --release   # requires Rust 1.88+
+cargo build --release   # requires Rust 1.89+
 
 # Override the npm-installed binary with a local build
 cp target/release/travsr $(which travsr)
@@ -807,7 +807,7 @@ export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 **Platform support:** macOS (x86\_64 + arm64), Linux (x86\_64 + aarch64), Windows (x86\_64).
 Pre-built binaries are available on the [Releases](https://github.com/Travsr-com/travsr/releases) page.
 
-**MSRV:** Rust 1.88 (verified in CI on every commit).
+**MSRV:** Rust 1.89 (verified in CI on every commit).
 
 ---
 

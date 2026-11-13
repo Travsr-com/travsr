@@ -154,7 +154,7 @@ jobs:
             "emitter bundle (build + smoke) (ubuntu-latest)"
             "emitter bundle (build + smoke) (macos-latest)"
             "emitter bundle (build + smoke) (windows-latest)"
-            "MSRV (rust 1.88)"
+            "MSRV (rust 1.89)"
             "cargo-deny"
             "plugin-hashes.lock"
             "release/installer target maps"

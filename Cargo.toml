@@ -24,7 +24,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["Travsr Contributors"]
 repository = "https://github.com/Travsr-com/travsr"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 travsr-error           = { path = "crates/travsr-error" }
@@ -41,8 +41,8 @@ travsr-plugin-host     = { path = "crates/travsr-plugin-host" }
 # (2) The 0.21.x line pinned `time = ">=0.3.23, <0.3.42"` in tract-linalg's
 #     build script, which capped the whole workspace below the RUSTSEC-2026-0009
 #     fix (time 0.3.47). 0.22.x relaxes that to `time = "^0.3.23"`.
-# tract 0.22 declares rust_version 1.85. That is below this workspace's 1.88
-# MSRV, which is set by `time` itself (0.3.46+ all require 1.88), so tract is
+# tract 0.22 declares rust_version 1.85. That is below this workspace's 1.89
+# MSRV, set by rusqlite 0.41 (1.89; `time` 0.3.46+ needs 1.88), so tract is
 # not the binding constraint. 0.23+ would drop `time` entirely but needs 1.91.
 tract-onnx = "0.22.2"
 # tract's SimplePlan does not itself parallelize across the batch dimension
@@ -58,7 +58,7 @@ rayon = "1"
 # encode), so they stay off for no functional loss. The MSRV half of this note
 # has expired: `progressbar` (indicatif -> console -> time-core) needs
 # edition2024, which was the blocker at the old 1.75 MSRV but is stable from
-# 1.85 and so is fine at the current 1.88. Being training-only is now the whole
+# 1.85 and so is fine at the current 1.89. Being training-only is now the whole
 # reason, and it is reason enough.
 # One of onig/fancy-regex is mandatory (pre-tokenizer regex splitting) -
 # fancy-regex is pure Rust, unlike onig which needs the Oniguruma C library
