@@ -472,6 +472,10 @@ window.TravsrUi = (function () {
       const decoder = new TextDecoder();
       let buf = "";
       for (;;) {
+        // `done` ends the dialog even when the stream stays open: past its
+        // deadline a command keeps running (and writing) in the background,
+        // and the page must not wait for it.
+        if (result) { reader.cancel().catch(() => {}); break; }
         const { value, done } = await reader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });

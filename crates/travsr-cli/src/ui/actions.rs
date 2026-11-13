@@ -263,6 +263,12 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
         };
         buf.extend_from_slice(&chunk[..n]);
         while let Some(i) = buf.iter().position(|b| *b == b'\n' || *b == b'\r') {
+            // A `\r` that ends this read may be the first half of a CRLF split
+            // across two reads; classifying it now would mark an ordinary line
+            // as a progress redraw that the next line replaces. Wait for more.
+            if buf[i] == b'\r' && i + 1 == buf.len() {
+                break;
+            }
             let cr = buf[i] == b'\r' && buf.get(i + 1) != Some(&b'\n');
             let skip = if buf[i] == b'\r' && buf.get(i + 1) == Some(&b'\n') {
                 2
@@ -276,10 +282,12 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
-    if !buf.is_empty() {
+    // A `\r` held back above that was the last byte of all: just a line end.
+    let rest = buf.strip_suffix(b"\r").unwrap_or(&buf);
+    if !rest.is_empty() {
         let _ = tx.send(StreamLine {
             stream,
-            text: String::from_utf8_lossy(&buf).into_owned(),
+            text: String::from_utf8_lossy(rest).into_owned(),
             cr: false,
         });
     }
@@ -352,6 +360,29 @@ mod tests {
                 ("err", "10%".to_string(), true),
                 ("err", "20%".to_string(), true),
                 ("err", "last\u{fffd}partial".to_string(), false),
+            ]
+        );
+    }
+
+    /// Review fix: a CRLF split across two reads is one ordinary line end,
+    /// not a progress redraw (which the page would overwrite and lose).
+    #[tokio::test]
+    async fn a_crlf_split_across_reads_is_not_progress() {
+        use tokio::io::AsyncReadExt as _;
+        let input = (&b"first\r"[..]).chain(&b"\nsecond\r\n10%\r"[..]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        read_lines(input, "out", tx).await;
+        let mut got = Vec::new();
+        while let Some(l) = rx.recv().await {
+            got.push((l.text, l.cr));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("first".to_string(), false),
+                ("second".to_string(), false),
+                // A trailing `\r` with nothing after it ends the last line.
+                ("10%".to_string(), false),
             ]
         );
     }
