@@ -111,7 +111,7 @@ window.TravsrUi = (function () {
   function holdCliUntil(p) { cliGate = Promise.resolve(p).then(() => {}, () => {}); }
   // Answered inside the server from the CLI's own code, so they start no
   // process and need neither the hold nor a slot.
-  const CLI_IN_PROCESS = ["version", "daemon-status", "config-list", "embed-list"];
+  const CLI_IN_PROCESS = ["version", "daemon-status", "config-list", "embed-list", "connect-print"];
   async function cli(name) {
     if (CLI_IN_PROCESS.includes(name)) return api("/api/cli/" + name, { repo });
     await cliGate;

@@ -70,12 +70,44 @@ pub struct Connected {
 
 /// `connect --print --json`: each AI tool found for `repo` and whether it
 /// connects by itself (`automatic`) or needs a step of the user's own.
+///
+/// Each entry also carries `connected` (#1082 A7, `travsr ui`'s first-run
+/// guide): for a tool `connect` wires by itself, whether every config file it
+/// would write the server into already names a `"travsr"` server; `null` for a
+/// tool that needs the user's own step, which nothing on disk records.
 pub fn found_tools_json(repo: &Path) -> Value {
-    tools_json(&found_tools(
-        repo,
-        dirs::home_dir().as_deref(),
-        &McpCommand::resolve(),
-    ))
+    let home = dirs::home_dir();
+    let cmd = McpCommand::resolve();
+    let found = found_tools(repo, home.as_deref(), &cmd);
+    let mut out = tools_json(&found);
+    if let Some(list) = out.as_array_mut() {
+        for (entry, (id, by_itself)) in list.iter_mut().zip(&found) {
+            let connected = if *by_itself {
+                Tool::ALL.iter().find(|t| t.id() == *id).map(|tool| {
+                    let paths: Vec<PathBuf> = tool
+                        .plan(repo, &cmd, None)
+                        .into_iter()
+                        .filter(|p| p.content.carries_server())
+                        .map(|p| p.path)
+                        .collect();
+                    server_written(&paths)
+                })
+            } else {
+                None
+            };
+            entry["connected"] = json!(connected);
+        }
+    }
+    out
+}
+
+/// Whether each of `paths` exists and names a `"travsr"` server. An empty
+/// list is not connected: there is nothing the tool would read.
+fn server_written(paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths
+            .iter()
+            .all(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains("\"travsr\"")))
 }
 
 fn tools_json(found: &[(&'static str, bool)]) -> Value {
@@ -2298,6 +2330,51 @@ mod tests {
                 {"tool": "codex", "name": "Codex", "setup": "one_step"},
             ])
         );
+    }
+
+    #[test]
+    fn a_tool_is_connected_once_every_server_file_names_travsr() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        assert!(!server_written(&[]));
+        assert!(!server_written(std::slice::from_ref(&a)), "missing file");
+        std::fs::write(&a, r#"{"mcpServers":{"other":{}}}"#).unwrap();
+        assert!(
+            !server_written(std::slice::from_ref(&a)),
+            "another server only"
+        );
+        std::fs::write(&a, r#"{"mcpServers":{"travsr":{"command":"travsr"}}}"#).unwrap();
+        assert!(server_written(std::slice::from_ref(&a)));
+        assert!(
+            !server_written(&[a.clone(), b.clone()]),
+            "one of two missing"
+        );
+        std::fs::write(&b, "[mcp.\"travsr\"]").unwrap();
+        assert!(server_written(&[a, b]));
+    }
+
+    /// The real repo-level shape: a Claude Code project before and after
+    /// `connect` writes its `.mcp.json`.
+    #[test]
+    fn found_tools_json_reports_connected_for_claude_code() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        let cmd = McpCommand::resolve();
+        let paths: Vec<PathBuf> = Tool::ClaudeCode
+            .plan(repo, &cmd, None)
+            .into_iter()
+            .filter(|p| p.content.carries_server())
+            .map(|p| p.path)
+            .collect();
+        assert_eq!(paths, vec![repo.join(".mcp.json")]);
+        assert!(!server_written(&paths));
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{"mcpServers":{"travsr":{"command":"travsr","args":["mcp","--stdio"]}}}"#,
+        )
+        .unwrap();
+        assert!(server_written(&paths));
     }
 
     #[test]

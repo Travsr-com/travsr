@@ -590,7 +590,10 @@ registered one:
   radius or your editor. Recent picks come first.
 - **Health:** the extension's Health page: verdict, metric tiles, daemon,
   index freshness, sidecars, storage and integrity, languages, repositories,
-  recent activity and the daemon log with its filters.
+  recent activity and the daemon log with its filters. Until a repository
+  is indexed, watched by the daemon and connected to your AI tools, a
+  "Getting started" checklist at the top runs each step with one click
+  (semantic search is the optional fourth).
 - **Architecture:** how the repository is put together, from the
   `get_architecture_brief` facts agents get: components stacked in layers
   from foundation to entry point, dependency cycles, the dependency edges by

@@ -21,7 +21,7 @@ use super::{resolve_repo, ApiError, UiState};
 
 /// The read-only commands the extension's Health page spawns, by the name the
 /// page asks for. Nothing outside this table can be run, and none of these
-/// writes: the page has no way to name an argument. The first four are
+/// writes: the page has no way to name an argument. Those that need no process are
 /// answered in-process (see [`in_process`]); the argv here is what they mean
 /// and what the read-only test checks.
 const CLI_COMMANDS: &[(&str, &[&str], u64)] = &[
@@ -30,6 +30,9 @@ const CLI_COMMANDS: &[(&str, &[&str], u64)] = &[
     // reported in the CLI's words rather than cut off here.
     ("daemon-status", &["daemon", "status"], 30),
     ("embed-list", &["embed", "list", "--json"], 15),
+    // The first-run guide's "connect" step (#1082 A7): which AI tools are
+    // found and whether each is already wired. Writes nothing.
+    ("connect-print", &["connect", "--print", "--json"], 15),
     // `lang list` sweeps PATH per catalog language: ~17 s on a cold Windows
     // cache, which is why the extension gives it a minute. Measured at 116 s
     // on a Windows machine whose endpoint scanner slows every process start,
@@ -147,6 +150,12 @@ async fn in_process(name: &str, root: &Path) -> Option<String> {
             .ok()?,
         "config-list" => crate::config::list_json(Some(&root)),
         "embed-list" => crate::embed::list_json(Some(&root)),
+        // Reads the tools' config files; off the async workers.
+        "connect-print" => {
+            tokio::task::spawn_blocking(move || crate::connect::found_tools_json(&root).to_string())
+                .await
+                .ok()?
+        }
         _ => return None,
     };
     Some(text + "\n")
@@ -868,6 +877,11 @@ mod tests {
                     *a,
                     "init" | "install" | "remove" | "set" | "unset" | "start" | "stop" | "restart"
                 )),
+                "{args:?}"
+            );
+            // `connect` writes the tools' config unless it only prints.
+            assert!(
+                !args.contains(&"connect") || args.contains(&"--print"),
                 "{args:?}"
             );
         }
