@@ -16200,7 +16200,12 @@ impl Daemon {
                         break;
                     }
                     _ = pipe_shutdown_wait => {
-                        tracing::info!("travsr daemon shutting down (control pipe)");
+                        let who = shutdown_requested_by()
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                            .unwrap_or_else(|| "unknown requester".to_string());
+                        tracing::info!("travsr daemon shutting down (control pipe: {who})");
                         break;
                     }
                 }
@@ -16821,6 +16826,13 @@ fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
     }
 }
 
+/// Who sent the last accepted control-pipe Shutdown (#1082 B4), for the
+/// daemon's final "shutting down" log line.
+fn shutdown_requested_by() -> &'static std::sync::Mutex<Option<String>> {
+    static WHO: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    WHO.get_or_init(Default::default)
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
@@ -17341,7 +17353,15 @@ fn handle_control_message(
             resp.daemon_exe = daemon_exe().map(str::to_string);
             (resp, false)
         }
-        Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
+        Ok(msg @ ControlMessage::Shutdown { .. }) => {
+            // #1082 B4: name who asked, here and on the final shutdown line.
+            let who = msg.shutdown_requester().unwrap_or_default();
+            tracing::info!(requested_by = %who, "control: shutdown requested by {who}");
+            *shutdown_requested_by()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(who);
+            (ControlResponse::ok(None), true)
+        }
         // WS3 (#420): pause auto-reindex and gracefully cancel any in-flight run.
         Ok(ControlMessage::StopEmbed) => {
             tracing::info!("control: stop-embed, pausing auto-reindex + cancelling in-flight");

@@ -295,7 +295,15 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     }
     // Stop the stale daemon, then wait for it to release the repo lock (as
     // `daemon restart` does) so the spawn never races its shutdown.
-    let _ = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Shutdown);
+    let reason = format!(
+        "version skew (daemon {}, client {})",
+        resp.daemon_version.as_deref().unwrap_or("unknown"),
+        our_build_version()
+    );
+    let _ = send_daemon_command(
+        repo_root,
+        &travsr_ipc::ControlMessage::shutdown(reason, our_build_version()),
+    );
     let cutoff = std::time::Instant::now() + RESTART_STOP_BUDGET;
     while daemon_lock_held(repo_root) && std::time::Instant::now() < cutoff {
         std::thread::sleep(std::time::Duration::from_millis(50));

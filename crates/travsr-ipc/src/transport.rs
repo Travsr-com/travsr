@@ -364,14 +364,14 @@ mod tests {
         // surfaced as "Resource temporarily unavailable (os error 35)" and the
         // Shutdown never reached the daemon.
         let mut s = stream(3, 0, usize::MAX);
-        let resp = send_request_line(&mut s, &ControlMessage::Shutdown).unwrap();
+        let resp = send_request_line(&mut s, &ControlMessage::shutdown("test", "0")).unwrap();
         assert!(resp.ok);
     }
 
     #[test]
     fn would_block_on_read_is_retried_not_fatal() {
         let mut s = stream(0, 5, usize::MAX);
-        let resp = send_request_line(&mut s, &ControlMessage::Shutdown).unwrap();
+        let resp = send_request_line(&mut s, &ControlMessage::shutdown("test", "0")).unwrap();
         assert!(resp.ok);
     }
 
@@ -380,7 +380,7 @@ mod tests {
         // The old `writeln!` path could leave a half-written JSON line in the
         // daemon's buffer when a timeout landed mid-message.
         let mut s = stream(0, 0, 3);
-        send_request_line(&mut s, &ControlMessage::Shutdown).unwrap();
+        send_request_line(&mut s, &ControlMessage::shutdown("test", "0")).unwrap();
         let sent = String::from_utf8(s.written.clone()).unwrap();
         assert!(sent.ends_with('\n'), "message must be newline-terminated");
         serde_json::from_str::<ControlMessage>(sent.trim())

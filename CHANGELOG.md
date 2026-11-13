@@ -26,6 +26,7 @@ All notable changes to Travsr are documented here.
 
 ### Fixed
 
+- **The daemon log names what asked it to shut down (#1082 B4).** A control-pipe shutdown now carries a reason (`daemon stop`, `daemon restart`, or `version skew (daemon X, client Y)`), the requesting process id and its version, logged on receipt and on the final line: `travsr daemon shutting down (control pipe: daemon stop, from pid 4242 (travsr 1.4.0+...))`. Wire compatible both ways: an older client's bare shutdown still works (logged as an unknown requester), and an older daemon ignores the new fields.
 - **A daemon left over from an older binary is replaced for every repository, not only the first one a process queries (#1082 B3).** The version check before a daemon-routed query ran once per process, so `travsr ui` (which switches between repositories) and a long-running `travsr mcp` serving several kept answering from the other repositories' stale daemons. It now runs once per repository.
 
 ---
