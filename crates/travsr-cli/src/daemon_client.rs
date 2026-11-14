@@ -344,6 +344,25 @@ fn first_time_for(seen: &std::sync::Mutex<HashSet<PathBuf>>, repo_root: &Path) -
         .insert(key)
 }
 
+/// How long a daemon gets to answer the liveness probe before a query.
+const LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the repo's daemon answers a Status within `within`.
+///
+/// The probe runs on its own thread so a daemon that accepts the connection
+/// but never replies cannot hold the caller past `within`; that thread ends on
+/// the transport's own deadline. No daemon at all fails fast, as before.
+fn daemon_answers_within(repo_root: &Path, within: std::time::Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let root = repo_root.to_path_buf();
+    std::thread::spawn(move || {
+        let ok =
+            send_daemon_command(&root, &travsr_ipc::ControlMessage::Status).is_ok_and(|r| r.ok);
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(within).unwrap_or(false)
+}
+
 /// Route one query to a running daemon. `None` means "use the direct path" —
 /// no daemon listening, version skew (old/new daemon), or a payload the CLI
 /// cannot parse. Never errors: daemon routing is best-effort by design.
@@ -356,6 +375,15 @@ pub fn try_query<T: DeserializeOwned>(
     // version; a stale one is transparently restarted so the answer comes from
     // current code rather than the image it was spawned with.
     ensure_daemon_version_current(repo_root);
+    // A query may now wait QUERY_READ_DEADLINE (90 s) for its answer, which is
+    // right for a daemon busy computing it but wrong for one that is wedged or
+    // still on another client's long request: that used to cost ~20 s before
+    // the direct fallback, and would now cost ~95 s (review of #1098). A
+    // Status is answered in milliseconds by a free daemon, so it decides
+    // quickly whether committing to the long read is worth it.
+    if !daemon_answers_within(repo_root, LIVENESS_WINDOW) {
+        return None;
+    }
     let msg = travsr_ipc::ControlMessage::Query {
         protocol: travsr_ipc::QUERY_PROTOCOL_VERSION,
         tool: tool.to_string(),
@@ -501,6 +529,23 @@ mod lock_tests {
 
     /// #1082 B3: the version check is once per repository, not once per
     /// process, so `travsr ui` checks every repo it is switched to.
+    /// Review of #1098: the liveness probe answers false quickly when no
+    /// daemon serves the repository, so a query falls back at once.
+    #[test]
+    fn liveness_probe_fails_fast_without_a_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        assert!(!daemon_answers_within(
+            dir.path(),
+            std::time::Duration::from_secs(3)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn version_check_runs_once_per_repository() {
         let seen = std::sync::Mutex::new(HashSet::new());
