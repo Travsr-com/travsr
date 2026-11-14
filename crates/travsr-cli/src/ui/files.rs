@@ -427,11 +427,23 @@ pub(super) async fn source(
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
-    let Ok(Some(span)) = looked_up else {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            format!("'{wanted}' is not a file in this repository's index"),
-        ));
+    // Still fail closed: nothing is served unless the index says the file is
+    // its own. But an index that could not be read (busy, locked) is reported
+    // as that, not as "not a file in the index" (review of #1098).
+    let span = match looked_up {
+        Ok(Some(span)) => span,
+        Ok(None) => {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                format!("'{wanted}' is not a file in this repository's index"),
+            ))
+        }
+        Err(e) => {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("could not read the index to check '{wanted}': {e}"),
+            ))
+        }
     };
     let line = asked_line.or(span.map(|(l, _)| l)).unwrap_or(1);
     let end_line = span.filter(|(l, _)| *l == line).map(|(_, e)| e);
