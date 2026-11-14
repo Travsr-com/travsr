@@ -681,19 +681,26 @@ fn declares(
     }
 }
 
-/// Whether `value` is a `require(...)` call or a member read off one:
-/// `require('./h')`, `require('./h').member`, `require('./h').default` (the
-/// CommonJS/ESM interop shape), `require('./h')['x']` or a chain of those
-/// (review of #1098: a member read was taken for a plain local and dropped).
+/// Whether `value` is a `require(...)` or dynamic `import(...)` call or a
+/// member read off one: `require('./h')`, `require('./h').member`,
+/// `require('./h').default` (the CommonJS/ESM interop shape),
+/// `require('./h')['x']`, `(await import('./h')).default`, a chain of those,
+/// or a conditional with one in either branch (reviews of #1098: these were
+/// taken for plain locals and their calls dropped).
 fn from_require(value: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut v = value;
     loop {
         match v.kind() {
             "call_expression" => {
-                return v
-                    .child_by_field_name("function")
-                    .and_then(|f| f.utf8_text(source).ok())
-                    == Some("require");
+                return v.child_by_field_name("function").is_some_and(|f| {
+                    f.kind() == "import" || f.utf8_text(source).ok() == Some("require")
+                });
+            }
+            "ternary_expression" => {
+                return ["consequence", "alternative"].iter().any(|field| {
+                    v.child_by_field_name(field)
+                        .is_some_and(|branch| from_require(branch, source))
+                });
             }
             "member_expression" | "subscript_expression" => {
                 let Some(object) = v.child_by_field_name("object") else {
@@ -701,7 +708,7 @@ fn from_require(value: tree_sitter::Node<'_>, source: &[u8]) -> bool {
                 };
                 v = object;
             }
-            "parenthesized_expression" => {
+            "parenthesized_expression" | "await_expression" => {
                 let Some(inner) = v.named_child(0) else {
                     return false;
                 };
@@ -1151,18 +1158,29 @@ class App {
              const deep = require('./helper').a.b;\n\
              const idx = require('./helper')['x'];\n\
              const notReq = load('./helper').member;\n\
-             function b() { member(); dflt(); deep(); idx(); notReq(); }\n",
+             const tern = process.env.X ? require('./helper').tern : null;\n\
+             const notTern = process.env.X ? load('./helper').tern : null;\n\
+             function b() { member(); dflt(); deep(); idx(); notReq(); tern(); notTern(); }\n\
+             async function c() { const dyn = (await import('./helper.js')).default; dyn(); }\n",
         )
         .unwrap();
         let files = vec![(path, "src/mod.js".to_string())];
         let (_nodes, _edges, unresolved) =
             extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
         let sigs: Vec<&str> = unresolved.iter().map(|u| u.callee_sig.as_str()).collect();
-        for kept in ["fn:member", "fn:dflt", "fn:deep", "fn:idx"] {
+        for kept in [
+            "fn:member",
+            "fn:dflt",
+            "fn:deep",
+            "fn:idx",
+            "fn:tern",
+            "fn:dyn",
+        ] {
             assert!(sigs.contains(&kept), "{kept} dropped: {sigs:?}");
         }
         // A member read off something else is still a plain local.
         assert!(!sigs.contains(&"fn:notReq"), "{sigs:?}");
+        assert!(!sigs.contains(&"fn:notTern"), "{sigs:?}");
     }
 
     #[test]
