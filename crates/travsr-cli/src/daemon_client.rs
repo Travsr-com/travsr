@@ -269,14 +269,21 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
     if !daemon_lock_held(repo_root) {
         return;
     }
+    let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
+        return; // transiently unreachable (starting, busy pipe) — leave it be
+    };
+    restart_if_stale(repo_root, exe, &resp);
+}
+
+/// [`restart_if_version_skewed`] given the daemon's Status reply, for a caller
+/// that already has one (the query path's liveness probe), so the check costs
+/// no second round trip under a second, longer deadline.
+fn restart_if_stale(repo_root: &Path, exe: &Path, resp: &travsr_ipc::ControlResponse) {
     let stale = |r: &travsr_ipc::ControlResponse| {
         version_is_skewed(r.daemon_version.as_deref(), our_build_version())
             && daemon_replaceable_from(r.daemon_exe.as_deref(), exe)
     };
-    let Ok(resp) = send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Status) else {
-        return; // transiently unreachable (starting, busy pipe) — leave it be
-    };
-    if !stale(&resp) {
+    if !stale(resp) {
         return;
     }
     // Single-flight: only the lock holder performs the swap, so two concurrent
@@ -321,15 +328,17 @@ pub(crate) fn restart_if_version_skewed(repo_root: &Path, exe: &Path) {
 /// several repositories (`travsr ui`, which has a repo picker) checked only
 /// the first repo it queried and kept answering from every other repo's
 /// stale daemon.
-fn ensure_daemon_version_current(repo_root: &Path) {
+fn ensure_daemon_version_current(repo_root: &Path, status: &travsr_ipc::ControlResponse) {
     static CHECKED: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
     let checked = CHECKED.get_or_init(Default::default);
     if !first_time_for(checked, repo_root) {
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        restart_if_version_skewed(repo_root, &exe);
+    if daemon_lock_held(repo_root) {
+        if let Ok(exe) = std::env::current_exe() {
+            restart_if_stale(repo_root, &exe, status);
+        }
     }
 }
 
@@ -347,20 +356,62 @@ fn first_time_for(seen: &std::sync::Mutex<HashSet<PathBuf>>, repo_root: &Path) -
 /// How long a daemon gets to answer the liveness probe before a query.
 const LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Whether the repo's daemon answers a Status within `within`.
+/// What the liveness probe found.
+#[derive(Debug)]
+pub(crate) enum Probe {
+    /// The daemon answered Status in time; its reply carries the version.
+    Answered(travsr_ipc::ControlResponse),
+    /// Nothing serves this repository.
+    NoDaemon,
+    /// A daemon holds the repository but did not answer in time (wedged, or
+    /// still on another client's long request).
+    NotAnswering,
+}
+
+/// One Status to the repo's daemon, answered within `within` or not at all.
 ///
-/// The probe runs on its own thread so a daemon that accepts the connection
+/// The request runs on its own thread so a daemon that accepts the connection
 /// but never replies cannot hold the caller past `within`; that thread ends on
 /// the transport's own deadline. No daemon at all fails fast, as before.
-fn daemon_answers_within(repo_root: &Path, within: std::time::Duration) -> bool {
+pub(crate) fn probe_daemon(repo_root: &Path, within: std::time::Duration) -> Probe {
     let (tx, rx) = std::sync::mpsc::channel();
     let root = repo_root.to_path_buf();
     std::thread::spawn(move || {
-        let ok =
-            send_daemon_command(&root, &travsr_ipc::ControlMessage::Status).is_ok_and(|r| r.ok);
-        let _ = tx.send(ok);
+        let _ = tx.send(send_daemon_command(
+            &root,
+            &travsr_ipc::ControlMessage::Status,
+        ));
     });
-    rx.recv_timeout(within).unwrap_or(false)
+    match rx.recv_timeout(within) {
+        Ok(Ok(resp)) if resp.ok => Probe::Answered(resp),
+        // A refused or failed request while the lock is held is a daemon still
+        // binding its pipe, or one that has stopped answering: either way it
+        // is there and not serving.
+        Ok(_) if daemon_lock_held(repo_root) => Probe::NotAnswering,
+        Ok(_) => Probe::NoDaemon,
+        Err(_) => Probe::NotAnswering,
+    }
+}
+
+/// Repositories whose daemon failed the probe in this process, so a caller
+/// that fell back can say the daemon is stuck rather than absent.
+fn unresponsive() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+fn repo_key(repo_root: &Path) -> PathBuf {
+    std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf())
+}
+
+/// Whether this process last found `repo_root`'s daemon running but not
+/// answering, so a fallback note does not say "no daemon is running".
+pub(crate) fn daemon_was_unresponsive(repo_root: &Path) -> bool {
+    unresponsive()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&repo_key(repo_root))
 }
 
 /// Route one query to a running daemon. `None` means "use the direct path" —
@@ -371,19 +422,33 @@ pub fn try_query<T: DeserializeOwned>(
     tool: &str,
     args: serde_json::Value,
 ) -> Option<T> {
-    // Before serving from it, make sure the running daemon is this binary's
-    // version; a stale one is transparently restarted so the answer comes from
-    // current code rather than the image it was spawned with.
-    ensure_daemon_version_current(repo_root);
-    // A query may now wait QUERY_READ_DEADLINE (90 s) for its answer, which is
+    // A query may wait QUERY_READ_DEADLINE (90 s) for its answer, which is
     // right for a daemon busy computing it but wrong for one that is wedged or
-    // still on another client's long request: that used to cost ~20 s before
-    // the direct fallback, and would now cost ~95 s (review of #1098). A
-    // Status is answered in milliseconds by a free daemon, so it decides
-    // quickly whether committing to the long read is worth it.
-    if !daemon_answers_within(repo_root, LIVENESS_WINDOW) {
-        return None;
-    }
+    // still on another client's long request. One Status, answered within
+    // LIVENESS_WINDOW, decides whether the long read is worth it, and its
+    // reply also serves the once-per-repository version check, which used to
+    // send its own Status under the 15 s READ_DEADLINE first (re-review of
+    // #1098: a wedged daemon cost ~18 s before the fallback, not 3 s).
+    let status = match probe_daemon(repo_root, LIVENESS_WINDOW) {
+        Probe::Answered(resp) => {
+            unresponsive()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&repo_key(repo_root));
+            resp
+        }
+        Probe::NotAnswering => {
+            unresponsive()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(repo_key(repo_root));
+            return None;
+        }
+        Probe::NoDaemon => return None,
+    };
+    // Make sure the running daemon is this binary's version; a stale one is
+    // transparently restarted so the answer comes from current code.
+    ensure_daemon_version_current(repo_root, &status);
     let msg = travsr_ipc::ControlMessage::Query {
         protocol: travsr_ipc::QUERY_PROTOCOL_VERSION,
         tool: tool.to_string(),
@@ -527,17 +592,15 @@ pub fn warn_if_cross_checkout(db_path: &Path, reads_call_edges: bool) -> bool {
 mod lock_tests {
     use super::*;
 
-    /// #1082 B3: the version check is once per repository, not once per
-    /// process, so `travsr ui` checks every repo it is switched to.
-    /// Review of #1098: the liveness probe answers false quickly when no
-    /// daemon serves the repository, so a query falls back at once.
+    /// Review of #1098: with no daemon serving the repository the probe says
+    /// so quickly, so a query falls back at once.
     #[test]
     fn liveness_probe_fails_fast_without_a_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
-        assert!(!daemon_answers_within(
-            dir.path(),
-            std::time::Duration::from_secs(3)
+        assert!(matches!(
+            probe_daemon(dir.path(), std::time::Duration::from_secs(3)),
+            Probe::NoDaemon
         ));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
@@ -546,6 +609,57 @@ mod lock_tests {
         );
     }
 
+    /// Re-review of #1098: the case the probe exists for. A listener that
+    /// accepts the connection and never replies (a wedged daemon) is reported
+    /// as not answering within the window, not after the transport's 15 s.
+    #[test]
+    fn liveness_probe_gives_up_on_a_daemon_that_never_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".travsr")).unwrap();
+        let addr = travsr_ipc::ControlAddr::for_repo(dir.path());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        #[cfg(windows)]
+        let _server = {
+            let server = rt.block_on(async {
+                tokio::net::windows::named_pipe::ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(addr.pipe_name())
+                    .unwrap()
+            });
+            // Accept in the background and hold the connection, unanswered.
+            rt.spawn(async move {
+                let _ = server.connect().await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                drop(server);
+            })
+        };
+        #[cfg(unix)]
+        let _server = {
+            let listener = std::os::unix::net::UnixListener::bind(
+                addr.socket_path(&dir.path().join(".travsr")),
+            )
+            .unwrap();
+            std::thread::spawn(move || {
+                let held = listener.accept();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                drop(held);
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let probe = probe_daemon(dir.path(), std::time::Duration::from_secs(1));
+        let took = started.elapsed();
+        assert!(matches!(probe, Probe::NotAnswering), "{probe:?}");
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "gave up after {took:?}, not within the window"
+        );
+        drop(rt);
+    }
+
+    /// #1082 B3: the version check is once per repository, not once per
+    /// process, so `travsr ui` checks every repo it is switched to.
     #[test]
     fn version_check_runs_once_per_repository() {
         let seen = std::sync::Mutex::new(HashSet::new());
