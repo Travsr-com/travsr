@@ -671,18 +671,44 @@ fn declares(
                 let value = decl.child_by_field_name("value");
                 let is_fn = value
                     .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"));
-                let is_require = value.is_some_and(|v| {
-                    v.kind() == "call_expression"
-                        && v.child_by_field_name("function")
-                            .and_then(|f| f.utf8_text(source).ok())
-                            == Some("require")
-                });
+                let is_require = value.is_some_and(|v| from_require(v, source));
                 let top_level = scope.kind() == "program";
                 Some(!(is_require || (is_fn && top_level)))
             });
             found
         }
         _ => None,
+    }
+}
+
+/// Whether `value` is a `require(...)` call or a member read off one:
+/// `require('./h')`, `require('./h').member`, `require('./h').default` (the
+/// CommonJS/ESM interop shape), `require('./h')['x']` or a chain of those
+/// (review of #1098: a member read was taken for a plain local and dropped).
+fn from_require(value: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut v = value;
+    loop {
+        match v.kind() {
+            "call_expression" => {
+                return v
+                    .child_by_field_name("function")
+                    .and_then(|f| f.utf8_text(source).ok())
+                    == Some("require");
+            }
+            "member_expression" | "subscript_expression" => {
+                let Some(object) = v.child_by_field_name("object") else {
+                    return false;
+                };
+                v = object;
+            }
+            "parenthesized_expression" => {
+                let Some(inner) = v.named_child(0) else {
+                    return false;
+                };
+                v = inner;
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -1110,6 +1136,33 @@ class App {
             !has("fn:helper", 6),
             "shadowing local resolved by name: {calls:?}"
         );
+    }
+
+    /// Re-review of #1098, finding 1: a member read off `require(...)` is the
+    /// import too, including the CommonJS/ESM `.default` interop shape.
+    #[test]
+    fn member_reads_off_require_keep_their_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.js");
+        std::fs::write(
+            &path,
+            "const member = require('./helper').member;\n\
+             const dflt = require('./helper').default;\n\
+             const deep = require('./helper').a.b;\n\
+             const idx = require('./helper')['x'];\n\
+             const notReq = load('./helper').member;\n\
+             function b() { member(); dflt(); deep(); idx(); notReq(); }\n",
+        )
+        .unwrap();
+        let files = vec![(path, "src/mod.js".to_string())];
+        let (_nodes, _edges, unresolved) =
+            extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        let sigs: Vec<&str> = unresolved.iter().map(|u| u.callee_sig.as_str()).collect();
+        for kept in ["fn:member", "fn:dflt", "fn:deep", "fn:idx"] {
+            assert!(sigs.contains(&kept), "{kept} dropped: {sigs:?}");
+        }
+        // A member read off something else is still a plain local.
+        assert!(!sigs.contains(&"fn:notReq"), "{sigs:?}");
     }
 
     #[test]
