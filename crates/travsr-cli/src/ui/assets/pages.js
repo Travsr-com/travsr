@@ -1349,6 +1349,9 @@
           (f.indexed && f.status !== "deleted" ? '<button class="link-btn" type="button" data-blast="' + esc(f.path) + '">blast radius</button>' : "") +
           (f.indexed ? '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: f.path })) + '">graph</a>' : "") +
           "</span></summary><div class=\"ch-body\">";
+        if (f.index_between) {
+          html += '<p class="sub">The index holds an earlier save of this file (the daemon indexed it, then stopped), so these symbols are matched with today\'s line numbers and may be slightly off. Reindex for an exact list.</p>';
+        }
         if (!f.indexed) {
           html += '<p class="sub">' + (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).</p>";
         } else if (!f.symbols.length) {

@@ -54,6 +54,10 @@ pub(super) struct ChangedFile {
     indexed: bool,
     hunks: usize,
     symbols: Vec<Symbol>,
+    /// The index holds a version of this file that is neither the base commit
+    /// nor what is on disk (a save the daemon indexed before it stopped), so
+    /// the edits are mapped with today's line numbers and may be off.
+    index_between: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -380,7 +384,12 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
             .unwrap_or(None);
         let indexed = stored.is_some() || hash_stmt.exists([&path]).unwrap_or(false);
         let sides = hunks.get(&path).cloned().unwrap_or_default();
-        let ranges = ranges_for_index(&sides, stored.as_deref(), &root.join(&path));
+        let (ranges, index_between) =
+            ranges_for_index(&sides, stored.as_deref(), &root.join(&path), || {
+                git_output_bounded(Some(root), ["show", &format!("{base}:{path}")])
+                    .filter(|o| o.status.success())
+                    .map(|o| o.stdout)
+            });
         let symbols = if indexed {
             touched_symbols(&conn, &path, &ranges)?
         } else {
@@ -392,6 +401,7 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
             indexed,
             hunks: ranges.len(),
             symbols,
+            index_between,
         });
     }
     Ok(ChangesResponse {
@@ -403,36 +413,52 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
     })
 }
 
-/// The side of the diff whose line numbers the index's nodes are in.
+/// Hex SHA-256 of `bytes`, the hash the index stores per file.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// The side of the diff whose line numbers the index's nodes are in, and
+/// whether the index holds neither side.
 ///
 /// The diff is against the commit the index describes, but a running daemon
-/// re-indexes every save, so a saved file's nodes already carry working-tree
-/// line numbers while `last_commit` stays put. Matching old-side ranges
-/// against them attributed every edit below an insertion to the wrong symbol
-/// (review of #1098). When the file's stored hash is the hash of its bytes on
-/// disk (the daemon's own `file_matches_index` test) the index holds the
-/// working tree, so the new side is used; otherwise the base version, the old.
+/// re-indexes every save, so a saved file's nodes carry working-tree line
+/// numbers while `last_commit` stays put (review of #1098). The file's stored
+/// hash says which version the index holds:
+/// - the bytes on disk (the daemon's own `file_matches_index` test): the new
+///   side;
+/// - the base commit's version (`base_bytes`, read only when needed): the old
+///   side;
+/// - neither: a save indexed before the daemon stopped, then edited again
+///   (re-review). That version is far closer to today's file than to the base,
+///   so the new side is used and the file is flagged as approximate.
+///
+/// No stored hash (a file the index lacks) keeps the old side.
 fn ranges_for_index(
     sides: &HunkSides,
     stored_hash: Option<&str>,
     on_disk: &Path,
-) -> Vec<(i64, i64)> {
-    let current = stored_hash.is_some_and(|h| {
-        std::fs::read(on_disk).is_ok_and(|bytes| {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(&bytes);
-            let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            });
-            hex.eq_ignore_ascii_case(h)
-        })
-    });
-    if current {
-        sides.new.clone()
-    } else {
-        sides.old.clone()
+    base_bytes: impl FnOnce() -> Option<Vec<u8>>,
+) -> (Vec<(i64, i64)>, bool) {
+    let Some(stored) = stored_hash else {
+        return (sides.old.clone(), false);
+    };
+    let matches = |bytes: &[u8]| sha256_hex(bytes).eq_ignore_ascii_case(stored);
+    if std::fs::read(on_disk).is_ok_and(|b| matches(&b)) {
+        return (sides.new.clone(), false);
+    }
+    match base_bytes() {
+        Some(base) if matches(&base) => (sides.old.clone(), false),
+        // The base version cannot be read (a file added since): the index can
+        // only hold a save of it, so it is the in-between case too.
+        _ => (sides.new.clone(), true),
     }
 }
 
@@ -531,11 +557,29 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         };
+        let base = b"base commit bytes\n".to_vec();
+        let base_hash = sha256_hex(&base);
+        let base_fn = || Some(base.clone());
         // Index re-read the saved file: new side.
-        assert_eq!(ranges_for_index(sides, Some(&disk_hash), &file), sides.new);
+        assert_eq!(
+            ranges_for_index(sides, Some(&disk_hash), &file, base_fn),
+            (sides.new.clone(), false)
+        );
         // Index still holds the base version: old side.
-        assert_eq!(ranges_for_index(sides, Some("00"), &file), sides.old);
-        assert_eq!(ranges_for_index(sides, None, &file), sides.old);
+        assert_eq!(
+            ranges_for_index(sides, Some(&base_hash), &file, base_fn),
+            (sides.old.clone(), false)
+        );
+        // Re-review: the index holds a save that is neither (the daemon indexed
+        // it, then stopped, and the file was edited again): new side, flagged.
+        assert_eq!(
+            ranges_for_index(sides, Some("00"), &file, base_fn),
+            (sides.new.clone(), true)
+        );
+        assert_eq!(
+            ranges_for_index(sides, None, &file, base_fn),
+            (sides.old.clone(), false)
+        );
 
         // Through the symbol mapping: nodes as the daemon stored them.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -555,7 +599,7 @@ mod tests {
         };
         // The insertion sits between a and b; the edit is in b.
         assert_eq!(
-            sig(&ranges_for_index(sides, Some(&disk_hash), &file)),
+            sig(&ranges_for_index(sides, Some(&disk_hash), &file, base_fn).0),
             vec!["fn:b"]
         );
         assert!(
