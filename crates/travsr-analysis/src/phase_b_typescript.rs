@@ -222,8 +222,6 @@ fn extract_file_edges(
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut unresolved: Vec<UnresolvedCall> = Vec::new();
-    // #1082 B7: names this file binds that Phase A records no node for.
-    let local_only = unrecorded_local_bindings(tree.root_node(), &source);
 
     // ── Call sites ────────────────────────────────────────────────────────────
     {
@@ -318,13 +316,14 @@ fn extract_file_edges(
                             recv_type: None,
                         });
                     }
-                    // A bare call to a name this file binds itself (a const
-                    // inside a function, a parameter) calls that binding,
-                    // which has no node. Resolving it by name elsewhere is
-                    // how a helper in one file got linked to a same-named
-                    // function in an unrelated one (#1082 B7), so emit
-                    // nothing, as the live lane does for a locally bound name.
-                    _ if local_only.contains(callee_name) => {}
+                    // A bare call to a variable bound in one of the call's own
+                    // scopes with no node of its own (a const helper inside a
+                    // function or IIFE) calls that variable. Resolving it by
+                    // name elsewhere is how a helper in one file got linked to
+                    // a same-named function in an unrelated one (#1082 B7), so
+                    // emit nothing. Imports, require(...), recorded functions
+                    // and parameters keep the call (see bound_without_node).
+                    _ if bound_without_node(cap.node, callee_name, source.as_slice()) => {}
                     // Bare `foo()` — free function; daemon resolves by unique sig.
                     _ => {
                         unresolved.push(UnresolvedCall {
@@ -599,64 +598,117 @@ fn collect_nearest_var_ts(
 
 // ── AST helpers ───────────────────────────────────────────────────────────────
 
-/// Variables the file declares that Phase A records no node for (#1082 B7):
-/// `const` / `let` / `var` inside a function or block (Phase A keeps only
-/// top-level function-valued ones) and any top-level one whose value is not a
-/// function. A call to such a name can only mean that variable. A name also
-/// recorded somewhere in the file (a `function` declaration, or a top-level
-/// arrow or function const) is left out, so a call to it still resolves to
-/// that definition.
+/// Whether the bare call at `call` names a variable bound in one of the
+/// call's own enclosing scopes that Phase A records no node for (#1082 B7):
+/// a `const` / `let` / `var` inside a function or block, or a top-level one
+/// whose value is not a function. A call to such a name can only mean that
+/// variable, so it must not be resolved by name against another file.
 ///
-/// Parameters are deliberately not collected. Phase B is the recall-biased
-/// lane (#811): a callback parameter named like a module function is often
-/// that function passed in, and the live lane, not this one, is the one that
-/// abstains on it.
-fn unrecorded_local_bindings(
-    root: tree_sitter::Node<'_>,
-    source: &[u8],
-) -> std::collections::HashSet<String> {
-    let text = |n: tree_sitter::Node<'_>| n.utf8_text(source).ok().map(str::to_string);
-    let mut bound = std::collections::HashSet::new();
-    let mut recorded = std::collections::HashSet::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "function_declaration" | "generator_function_declaration" => {
-                if let Some(name) = node.child_by_field_name("name").and_then(text) {
-                    recorded.insert(name);
-                }
+/// The nearest scope that binds the name decides, so a binding in a sibling
+/// function never shadows the call (review of #1098). These bindings keep the
+/// call:
+/// - an `import` and a `const x = require(...)`: the cross-file reference the
+///   resolver exists to follow;
+/// - a `function` declaration, or a top-level arrow or function const: Phase A
+///   records it, so the call resolves to it in the same file;
+/// - a parameter: Phase B is the recall-biased lane (#811), and a callback
+///   named like a module function is often that function passed in.
+fn bound_without_node(call: tree_sitter::Node<'_>, name: &str, source: &[u8]) -> bool {
+    let is_name = |n: tree_sitter::Node<'_>| n.utf8_text(source).ok() == Some(name);
+    let mut scope = call.parent();
+    while let Some(s) = scope {
+        // A parameter of an enclosing function binds the name for its body.
+        if let Some(params) = s.child_by_field_name("parameters") {
+            if binds_identifier(params, &is_name) {
+                return false;
             }
-            "variable_declarator" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .filter(|n| n.kind() == "identifier")
-                    .and_then(text);
-                if let Some(name) = name {
-                    let is_fn = node.child_by_field_name("value").is_some_and(|v| {
-                        matches!(v.kind(), "arrow_function" | "function_expression")
-                    });
-                    let top_level = node
-                        .parent()
-                        .and_then(|decl| decl.parent())
-                        .is_some_and(|p| {
-                            p.kind() == "program"
-                                || p.kind() == "export_statement"
-                                    && p.parent().is_some_and(|pp| pp.kind() == "program")
-                        });
-                    if is_fn && top_level {
-                        recorded.insert(name);
-                    } else {
-                        bound.insert(name);
-                    }
-                }
-            }
-            _ => {}
         }
-        let mut c = node.walk();
-        stack.extend(node.named_children(&mut c));
+        if s.child_by_field_name("parameter").is_some_and(&is_name) {
+            return false;
+        }
+        let mut c = s.walk();
+        for child in s.named_children(&mut c) {
+            if let Some(verdict) = declares(child, s, source, &is_name) {
+                return verdict;
+            }
+        }
+        scope = s.parent();
     }
-    bound.retain(|n| !recorded.contains(n));
-    bound
+    false
+}
+
+/// What `child`, a statement directly inside the scope `scope`, says about
+/// the name `is_name` tests: `Some(true)` for a binding with no node, `Some(false)` for one that
+/// keeps the call, `None` when it does not bind the name.
+fn declares(
+    child: tree_sitter::Node<'_>,
+    scope: tree_sitter::Node<'_>,
+    source: &[u8],
+    is_name: &dyn Fn(tree_sitter::Node<'_>) -> bool,
+) -> Option<bool> {
+    match child.kind() {
+        // `export const f = ...` / `export function f`: look inside.
+        "export_statement" => {
+            let mut c = child.walk();
+            let found = child
+                .named_children(&mut c)
+                .find_map(|inner| declares(inner, scope, source, is_name));
+            found
+        }
+        "import_statement" => binds_identifier(child, is_name).then_some(false),
+        "function_declaration" | "generator_function_declaration" => child
+            .child_by_field_name("name")
+            .is_some_and(is_name)
+            .then_some(false),
+        "lexical_declaration" | "variable_declaration" => {
+            let mut c = child.walk();
+            let found = child.named_children(&mut c).find_map(|decl| {
+                if decl.kind() != "variable_declarator"
+                    || !decl.child_by_field_name("name").is_some_and(is_name)
+                {
+                    return None;
+                }
+                let value = decl.child_by_field_name("value");
+                let is_fn = value
+                    .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"));
+                let is_require = value.is_some_and(|v| {
+                    v.kind() == "call_expression"
+                        && v.child_by_field_name("function")
+                            .and_then(|f| f.utf8_text(source).ok())
+                            == Some("require")
+                });
+                let top_level = scope.kind() == "program";
+                Some(!(is_require || (is_fn && top_level)))
+            });
+            found
+        }
+        _ => None,
+    }
+}
+
+/// Whether any identifier under `node` is the name (an import clause or a
+/// parameter list, including destructured and defaulted forms).
+fn binds_identifier(
+    node: tree_sitter::Node<'_>,
+    is_name: &dyn Fn(tree_sitter::Node<'_>) -> bool,
+) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "identifier" | "shorthand_property_identifier_pattern"
+        ) && is_name(n)
+        {
+            return true;
+        }
+        // A default value or a type is not a binding.
+        if matches!(n.kind(), "type_annotation" | "string") {
+            continue;
+        }
+        let mut c = n.walk();
+        stack.extend(n.named_children(&mut c));
+    }
+    false
 }
 
 /// Walk up the AST to find the nearest enclosing named function or method.
@@ -1015,6 +1067,49 @@ class App {
         ] {
             assert!(sigs.contains(kept), "{kept} missing: {sigs:?}");
         }
+    }
+
+    /// Review of #1098 (blocker 2), the reviewer's reproduction: a local
+    /// `const format` in a sibling function must not hide a real call to the
+    /// imported `format`, and a CommonJS `const helper = require(...)` is the
+    /// cross-file reference itself. A helper bound in the call's own scope,
+    /// and a shadowing local inside the calling function, still go.
+    #[test]
+    fn local_binding_check_is_scoped_and_keeps_imports_and_require() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mod.js");
+        std::fs::write(
+            &path,
+            "import { format } from './fmt';\n\
+             const helper = require('./helper');\n\
+             function a() { const format = 1; return format; }\n\
+             function b() { format('x'); helper(); }\n\
+             function c() { const pad = (s) => s; pad('y'); }\n\
+             function d() { const helper = () => 0; helper(); }\n",
+        )
+        .unwrap();
+        let files = vec![(path, "src/mod.js".to_string())];
+        let (_nodes, _edges, unresolved) =
+            extract_native_phase_b("c", dir.path(), Some(&files)).unwrap();
+        // (callee, line) pairs, so the two `helper()` calls are told apart.
+        let calls: Vec<(String, u32)> = unresolved
+            .iter()
+            .map(|u| (u.callee_sig.clone(), u.caller_line))
+            .collect();
+        let has = |sig: &str, line: u32| calls.iter().any(|(s, l)| s == sig && *l == line);
+        assert!(
+            has("fn:format", 4),
+            "import shadowed by a sibling: {calls:?}"
+        );
+        assert!(has("fn:helper", 4), "require binding dropped: {calls:?}");
+        assert!(
+            !has("fn:pad", 5),
+            "local helper resolved by name: {calls:?}"
+        );
+        assert!(
+            !has("fn:helper", 6),
+            "shadowing local resolved by name: {calls:?}"
+        );
     }
 
     #[test]
