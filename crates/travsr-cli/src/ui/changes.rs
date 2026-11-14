@@ -386,9 +386,7 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
         let sides = hunks.get(&path).cloned().unwrap_or_default();
         let (ranges, index_between) =
             ranges_for_index(&sides, stored.as_deref(), &root.join(&path), || {
-                git_output_bounded(Some(root), ["show", &format!("{base}:{path}")])
-                    .filter(|o| o.status.success())
-                    .map(|o| o.stdout)
+                base_as_checked_out(root, &base, &path)
             });
         let symbols = if indexed {
             touched_symbols(&conn, &path, &ranges)?
@@ -411,6 +409,22 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
         truncated,
         diff_incomplete,
     })
+}
+
+/// The base commit's version of `path` as a checkout would write it.
+///
+/// The index hashes the bytes on disk, so the base must go through the same
+/// eol and smudge filters before its hash can match: `git show` gives the raw
+/// blob, which under `core.autocrlf=true` (the Git for Windows default) is LF
+/// while the checkout is CRLF (re-review of #1098). `cat-file --filters`
+/// applies the checkout conversion.
+fn base_as_checked_out(root: &Path, base: &str, path: &str) -> Option<Vec<u8>> {
+    git_output_bounded(
+        Some(root),
+        ["cat-file", "--filters", &format!("{base}:{path}")],
+    )
+    .filter(|o| o.status.success())
+    .map(|o| o.stdout)
 }
 
 /// Hex SHA-256 of `bytes`, the hash the index stores per file.
@@ -663,6 +677,56 @@ mod tests {
             git_text(root, &["diff", "no-such-commit", "--"]),
             GitText::Failed(_)
         ));
+    }
+
+    /// Re-review: under `core.autocrlf=true` the blob is LF and the checkout
+    /// CRLF, so the base must be read with the checkout filters to match the
+    /// hash the index took from disk.
+    #[test]
+    fn the_base_is_read_as_checked_out_under_autocrlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "true"]);
+        let crlf = b"fn a() {}\r\nfn b() {}\r\n";
+        std::fs::write(root.join("m.rs"), crlf).unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "i",
+        ]);
+        // The blob itself was normalized to LF on add.
+        let raw = git(&["show", "HEAD:m.rs"]).stdout;
+        assert_eq!(raw, b"fn a() {}\nfn b() {}\n");
+        // Read as checked out, it hashes like the file the index read.
+        let base = base_as_checked_out(root, "HEAD", "m.rs").unwrap();
+        assert_eq!(sha256_hex(&base), sha256_hex(crlf));
+
+        // So an index built at the commit maps a later edit with the old side.
+        let sides = HunkSides {
+            old: vec![(1, 1)],
+            new: vec![(3, 3)],
+        };
+        std::fs::write(root.join("m.rs"), b"x\r\ny\r\nfn a() {}\r\n").unwrap();
+        assert_eq!(
+            ranges_for_index(&sides, Some(&sha256_hex(crlf)), &root.join("m.rs"), || {
+                base_as_checked_out(root, "HEAD", "m.rs")
+            }),
+            (vec![(1, 1)], false)
+        );
     }
 
     #[test]
