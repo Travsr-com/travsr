@@ -41,6 +41,7 @@ use travsr_mcp::query::{self, StatusPayload, ToolPayload, ToolQueryArgs};
 use crate::daemon_client;
 
 mod actions;
+mod changes;
 mod files;
 mod terminal;
 
@@ -54,6 +55,7 @@ const COMMON_JS: &str = include_str!("assets/common.js");
 const HEALTH_JS: &str = include_str!("assets/health.js");
 const PAGES_JS: &str = include_str!("assets/pages.js");
 const GRAPH_HOST_JS: &str = include_str!("assets/graph-host.js");
+const GRAPH_MENU_JS: &str = include_str!("assets/graph-menu.js");
 
 // The Graph page is the extension's, byte for byte: one source of truth, so a
 // change to the extension's graph view reaches `travsr ui` on the next build.
@@ -170,6 +172,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/blast", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/context", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/path", get(|| async { asset(HTML, PAGES_HTML) }))
+        .route("/changes", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/architecture", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/terminal", get(|| async { asset(HTML, PAGES_HTML) }))
         .route("/repos", get(|| async { asset(HTML, PAGES_HTML) }))
@@ -183,6 +186,10 @@ fn router(state: Arc<UiState>) -> Router {
         .route(
             "/assets/graph-host.js",
             get(|| async { asset(JS, GRAPH_HOST_JS) }),
+        )
+        .route(
+            "/assets/graph-menu.js",
+            get(|| async { asset(JS, GRAPH_MENU_JS) }),
         )
         .route("/assets/graph.js", get(|| async { asset(JS, GRAPH_JS) }))
         .route("/assets/graph.css", get(|| async { asset(CSS, GRAPH_CSS) }))
@@ -206,6 +213,7 @@ fn router(state: Arc<UiState>) -> Router {
         .route("/api/logs", get(files::logs))
         .route("/api/source", get(files::source))
         .route("/api/files", get(files::files))
+        .route("/api/changes", get(changes::changes))
         .route("/api/run/:cmd", get(terminal::run))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
@@ -500,12 +508,31 @@ where
     T: serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(&travsr_store::SqliteStore) -> anyhow::Result<T> + Send + 'static,
 {
+    run_query_turn(repo, tool, args, direct, use_daemon, deadline, TURN_WAIT).await
+}
+
+/// [`run_query_via`] with its own wait for the daemon turn: `Duration::ZERO`
+/// takes the daemon only when it is free right now and otherwise answers from
+/// the index at once (#1082 B2, suggestions).
+async fn run_query_turn<T, F>(
+    repo: NamedRepo,
+    tool: &'static str,
+    args: serde_json::Value,
+    direct: F,
+    use_daemon: bool,
+    deadline: std::time::Duration,
+    turn_wait: std::time::Duration,
+) -> Result<(T, Route), ApiError>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(&travsr_store::SqliteStore) -> anyhow::Result<T> + Send + 'static,
+{
     let work = tokio::task::spawn_blocking(move || {
-        // No turn within TURN_WAIT means another query is still talking to the
-        // daemon (possibly one whose page already gave up on it at the
+        // No turn within `turn_wait` means another query is still talking to
+        // the daemon (possibly one whose page already gave up on it at the
         // deadline): answer from the index, as the CLI does when no daemon
         // answers, instead of queueing behind it.
-        if let Some(_turn) = use_daemon.then(take_daemon_turn).flatten() {
+        if let Some(_turn) = use_daemon.then(|| take_daemon_turn(turn_wait)).flatten() {
             if let Some(v) = daemon_client::try_query::<T>(&repo.root, tool, args) {
                 return Ok((v, Route::Daemon));
             }
@@ -543,13 +570,23 @@ fn open_index_read_only(repo: &NamedRepo) -> anyhow::Result<travsr_store::Sqlite
 /// Longest a query waits for the daemon turn before answering from the index.
 const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The daemon turn, or `None` if it stayed taken for [`TURN_WAIT`]. A poisoned
-/// lock only means an earlier query panicked; the turn guards no data that
-/// panic could have left half-written, so it is taken anyway.
-fn take_daemon_turn() -> Option<std::sync::MutexGuard<'static, ()>> {
-    let until = std::time::Instant::now() + TURN_WAIT;
+/// The daemon turn, or `None` if it stayed taken for `wait` (tried once when
+/// `wait` is zero). A poisoned lock only means an earlier query panicked; the
+/// turn guards no data that panic could have left half-written, so it is taken
+/// anyway.
+fn take_daemon_turn(wait: std::time::Duration) -> Option<std::sync::MutexGuard<'static, ()>> {
+    take_turn(&DAEMON_TURN, wait)
+}
+
+/// [`take_daemon_turn`] on any lock, so a test can use its own instead of
+/// holding the process-wide turn while other tests run.
+fn take_turn<'a>(
+    turn: &'a std::sync::Mutex<()>,
+    wait: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'a, ()>> {
+    let until = std::time::Instant::now() + wait;
     loop {
-        match DAEMON_TURN.try_lock() {
+        match turn.try_lock() {
             Ok(g) => return Some(g),
             Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
@@ -676,6 +713,12 @@ async fn tool(
         }));
     }
     let repo = resolve_repo(&state, params.remove("repo").as_deref())?;
+    // #1082 B2: a lookup box's suggestions fire on every pause in typing and
+    // are stale a keystroke later, so they must not queue behind a slow
+    // daemon query (a get_context can hold the turn for most of a minute).
+    // Marked by the page, never forwarded to the tool.
+    let for_suggestions =
+        params.remove("suggest").as_deref() == Some("1") && tool == "search_symbol";
     let args = ToolQueryArgs {
         tool: tool.clone(),
         args: serde_json::Value::Object(
@@ -701,13 +744,19 @@ async fn tool(
         tool: args.tool.clone(),
         args: args.args.clone(),
     };
-    let (mut payload, mut route): (ToolPayload, Route) = run_query_via(
+    let turn_wait = if for_suggestions {
+        std::time::Duration::ZERO
+    } else {
+        TURN_WAIT
+    };
+    let (mut payload, mut route): (ToolPayload, Route) = run_query_turn(
         repo.clone(),
         "tool",
         wire,
         move |store| Ok(query::tool_query(store, &args)),
         use_daemon,
         deadline,
+        turn_wait,
     )
     .await?;
     // A daemon built before this tool joined BROWSE_TOOLS refuses it by name.
@@ -1043,6 +1092,7 @@ mod tests {
             "/dependencies",
             "/blast",
             "/path",
+            "/changes",
             "/context",
             "/terminal",
             "/repos",
@@ -1050,6 +1100,41 @@ mod tests {
             let resp = get_with_host(page, "localhost").await;
             assert_eq!(resp.status(), StatusCode::OK, "{page}");
         }
+    }
+
+    /// #1082 B2: with no wait, a busy daemon turn is given up at once, so a
+    /// suggestion is answered from the index instead of queueing.
+    #[test]
+    fn a_zero_wait_never_queues_for_the_daemon_turn() {
+        // A private lock: holding the process-wide DAEMON_TURN here would make
+        // every ui test running beside this one wait out its turn (review of
+        // #1098). take_daemon_turn is take_turn on DAEMON_TURN.
+        let turn = std::sync::Mutex::new(());
+        let held = turn.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(take_turn(&turn, std::time::Duration::ZERO).is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        let started = std::time::Instant::now();
+        assert!(take_turn(&turn, std::time::Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        drop(held);
+        assert!(take_turn(&turn, std::time::Duration::ZERO).is_some());
+    }
+
+    #[tokio::test]
+    async fn every_asset_a_page_references_is_served() {
+        for html in [HEALTH_HTML, PAGES_HTML, GRAPH_HTML] {
+            for part in html.split("\"/assets/").skip(1) {
+                let name = part.split('"').next().unwrap_or_default();
+                let resp = get_with_host(&format!("/assets/{name}"), "localhost").await;
+                assert_eq!(resp.status(), StatusCode::OK, "/assets/{name}");
+            }
+        }
+        assert!(GRAPH_HTML.contains("/assets/graph-menu.js"));
     }
 
     #[tokio::test]

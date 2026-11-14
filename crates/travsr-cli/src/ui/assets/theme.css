@@ -441,3 +441,116 @@ body:not(.ui-page) #brand .word {
   .a-edges td .link-btn { word-break: break-all; text-align: left; }
   .a-bar { width: 36px; }
 }
+
+/* ── Changes (pages.js changesView) ───────────────────────────────────── */
+.ch-rules { margin: 12px 0; }
+.ch-rule { margin: 6px 0; font-size: 12.5px; }
+.ch-rule .mono { font: 11.5px var(--tsr-font-mono); margin-left: 12px; }
+.ch-file { margin-top: 10px; }
+.ch-file > summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 10px; }
+.ch-status {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--tsr-border); color: var(--tsr-muted);
+}
+.ch-status.modified { color: var(--tsr-accent-text); border-color: var(--tsr-accent-line); }
+.ch-status.added, .ch-status.untracked { color: var(--tsr-success); border-color: var(--tsr-success); }
+.ch-status.deleted { color: var(--tsr-error); border-color: var(--tsr-error); }
+.ch-path { font: 600 12.5px var(--tsr-font-mono); word-break: break-all; }
+.ch-meta { font-size: 11.5px; }
+.ch-acts { margin-left: auto; display: flex; gap: 10px; }
+.ch-body { padding: 6px 12px 10px; }
+.ch-sym { padding: 6px 0; border-top: 1px solid var(--tsr-border-soft); }
+.ch-sym:first-child { border-top: 0; }
+.ch-sym-row { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; font-size: 12.5px; }
+.ch-sym-row .s-kind {
+  font-size: 10px; color: var(--tsr-accent-text); border: 1px solid var(--tsr-accent-line);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.ch-name { font: 600 12.5px var(--tsr-font-mono); }
+.ch-count { margin-left: auto; font-size: 11.5px; color: var(--tsr-muted); }
+.ch-count.has { color: var(--tsr-secondary); }
+.ch-callers { margin: 4px 0 0 18px; padding: 0; font-size: 12px; }
+.ch-callers li { padding: 2px 0; }
+.ch-callers a { font-family: var(--tsr-font-mono); }
+.ch-blast { margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--tsr-border-soft); }
+.ch-blast-h { font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+
+/* Inline code preview (#1082 A4). */
+.peek-btn {
+  margin-left: 6px; padding: 0 7px; border-radius: 999px; cursor: pointer;
+  font: 10.5px var(--tsr-font-mono); line-height: 17px;
+  background: transparent; color: var(--tsr-muted); border: 1px solid var(--tsr-border);
+}
+.peek-btn:hover { color: var(--tsr-accent-text); border-color: var(--tsr-accent-line); }
+.peek-btn[aria-expanded="true"] { color: var(--tsr-accent-text); background: var(--tsr-accent-deep); border-color: var(--tsr-accent-line); }
+.peek { flex-basis: 100%; margin: 8px 0 4px; min-width: 0; }
+.peek-head {
+  display: flex; justify-content: space-between; gap: 10px; padding: 5px 12px;
+  font: 11px var(--tsr-font-mono); color: var(--tsr-subtle);
+  background: var(--tsr-surface); border: 1px solid var(--tsr-border-soft); border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+}
+.peek-head a { color: var(--tsr-accent-text); }
+.peek-code {
+  margin: 0; padding: 8px 0; max-height: 420px; overflow: auto; border-radius: 0 0 8px 8px;
+  background: var(--tsr-input); border: 1px solid var(--tsr-border-soft);
+  font: 11.5px/1.55 var(--tsr-font-mono); color: var(--tsr-text); white-space: pre;
+}
+.peek-line { display: block; padding: 0 12px 0 0; }
+.peek-line.def { background: var(--tsr-accent-deep); box-shadow: inset 2px 0 0 var(--tsr-accent); }
+.peek-no {
+  display: inline-block; width: 4.5em; padding-right: 12px; margin-right: 4px; text-align: right;
+  color: var(--tsr-subtle); user-select: none;
+}
+
+/* Terminal log: filter, rerun, restored entries (#1082 A6). */
+.t-logbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0 2px; }
+.t-logbar[hidden] { display: none; }
+.t-filter-box { flex: 0 1 340px; }
+.t-filter-box input { width: 100%; }
+.t-filter-count { font-size: 11px; }
+.t-clear { margin-left: auto; }
+.t-line { display: block; min-height: 1.55em; }
+.t-line[hidden] { display: none; }
+.t-entry.t-nomatch .t-out { display: none; }
+.t-entry.t-nomatch .t-head { border-bottom: 0; opacity: .6; }
+.t-hidden-note { padding: 4px 12px; font-size: 11px; color: var(--tsr-subtle); border-top: 1px solid var(--tsr-border-soft); }
+
+/* Health: first-run guide (#1082 A7). */
+.guide {
+  margin: 12px 0 14px; padding: 10px 14px 6px; border-radius: 10px;
+  background: var(--tsr-surface); border: 1px solid var(--tsr-accent-line);
+}
+.guide-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.guide-head strong { font: 600 13px var(--tsr-font-sans); color: var(--tsr-text); }
+.guide-head .muted { font-size: 11px; }
+.guide-hide { margin-left: auto; }
+.guide-steps { list-style: none; margin: 0; padding: 0; }
+.guide-step {
+  display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 10px;
+  padding: 8px 0; border-top: 1px solid var(--tsr-border-soft);
+}
+.guide-step:first-child { border-top: 0; }
+.guide-mark { display: inline-flex; justify-content: center; }
+.guide-n {
+  display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px;
+  border-radius: 50%; font: 600 11px var(--tsr-font-sans);
+  color: var(--tsr-muted); border: 1px solid var(--tsr-border);
+}
+.guide-step.next .guide-n { color: var(--tsr-on-accent); background: var(--tsr-accent-fill); border-color: var(--tsr-accent-fill); }
+.guide-step.done .guide-mark { color: var(--tsr-success); }
+.guide-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.guide-title { font-size: 12.5px; color: var(--tsr-text); }
+.guide-step.done .guide-title, .guide-step.later .guide-title { color: var(--tsr-muted); }
+.guide-why { font-size: 11.5px; color: var(--tsr-subtle); }
+.guide-act { white-space: nowrap; font-size: 11px; }
+@media (max-width: 620px) {
+  .guide-step { grid-template-columns: 26px minmax(0, 1fr); }
+  .guide-act { grid-column: 2; }
+}
+/* The guide, hidden by the reader: one line to bring it back. */
+.guide-collapsed { display: flex; align-items: baseline; gap: 10px; margin: 12px 0 14px; font-size: 12px; }
+.guide-collapsed .muted { font-size: 11px; }
+
+/* Changes: the rules card sits in its own slot so it can update alone. */
+.ch-slot { display: contents; }

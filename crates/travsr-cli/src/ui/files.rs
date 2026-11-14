@@ -21,7 +21,7 @@ use super::{resolve_repo, ApiError, UiState};
 
 /// The read-only commands the extension's Health page spawns, by the name the
 /// page asks for. Nothing outside this table can be run, and none of these
-/// writes: the page has no way to name an argument. The first four are
+/// writes: the page has no way to name an argument. Those that need no process are
 /// answered in-process (see [`in_process`]); the argv here is what they mean
 /// and what the read-only test checks.
 const CLI_COMMANDS: &[(&str, &[&str], u64)] = &[
@@ -30,6 +30,9 @@ const CLI_COMMANDS: &[(&str, &[&str], u64)] = &[
     // reported in the CLI's words rather than cut off here.
     ("daemon-status", &["daemon", "status"], 30),
     ("embed-list", &["embed", "list", "--json"], 15),
+    // The first-run guide's "connect" step (#1082 A7): which AI tools are
+    // found and whether each is already wired. Writes nothing.
+    ("connect-print", &["connect", "--print", "--json"], 15),
     // `lang list` sweeps PATH per catalog language: ~17 s on a cold Windows
     // cache, which is why the extension gives it a minute. Measured at 116 s
     // on a Windows machine whose endpoint scanner slows every process start,
@@ -147,6 +150,12 @@ async fn in_process(name: &str, root: &Path) -> Option<String> {
             .ok()?,
         "config-list" => crate::config::list_json(Some(&root)),
         "embed-list" => crate::embed::list_json(Some(&root)),
+        // Reads the tools' config files; off the async workers.
+        "connect-print" => {
+            tokio::task::spawn_blocking(move || crate::connect::found_tools_json(&root).to_string())
+                .await
+                .ok()?
+        }
         _ => return None,
     };
     Some(text + "\n")
@@ -355,27 +364,37 @@ pub(super) struct SourceLine {
 pub(super) struct SourceResponse {
     path: String,
     line: usize,
+    /// Last line of the definition at `line`, when `symbol` named one the
+    /// index knows, so the page can mark its whole body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<usize>,
     lines: Vec<SourceLine>,
 }
 
 /// Largest file the peek will read.
 const SOURCE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// `GET /api/source?repo=<repo>&path=<rel>&line=<n>`: the lines around a
-/// definition, for the Graph page's peek panel (8 before, 25 after, as the
-/// extension shows). Only repo-relative paths that stay inside the repo after
-/// symlinks are resolved.
+/// `GET /api/source?repo=<repo>&path=<rel>&line=<n>[&symbol=<sig>]`: the
+/// lines around a definition, for the Graph page's peek panel and the inline
+/// previews on the Callers, Path, Context and Changes pages (8 before, 25
+/// after, as the extension shows). `symbol` finds the line from the index when
+/// the caller has only a name (the Path page's steps carry no line); `line`
+/// wins when both are given. Only repo-relative paths that stay inside the
+/// repo after symlinks are resolved.
 pub(super) async fn source(
     State(state): State<Arc<UiState>>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<Json<SourceResponse>, ApiError> {
     let repo = resolve_repo(&state, params.get("repo").map(String::as_str))?;
     let rel = params.get("path").cloned().unwrap_or_default();
-    let line = params
+    let asked_line = params
         .get("line")
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1)
-        .max(1);
+        .filter(|n| *n > 0);
+    let symbol = params
+        .get("symbol")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= 300);
     let bad = |m: &str| ApiError(StatusCode::BAD_REQUEST, m.to_string());
     if !is_plain_relative(&rel) {
         return Err(bad("path must be relative to the repository"));
@@ -392,19 +411,42 @@ pub(super) async fn source(
     // graph's to show, and with `--allow-remote` it would be served to
     // whoever can reach the port.
     let wanted = index_path(&rel);
-    let indexed = {
+    let looked_up = {
         let db = repo.db_path();
         let wanted = wanted.clone();
-        tokio::task::spawn_blocking(move || is_indexed_file(&db, &wanted))
-            .await
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            if !is_indexed_file(&db, &wanted)? {
+                return Ok(None);
+            }
+            let span = match symbol {
+                Some(sym) => symbol_span(&db, &wanted, &sym, asked_line)?,
+                None => None,
+            };
+            Ok::<_, rusqlite::Error>(Some(span))
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
-    if !matches!(indexed, Ok(true)) {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            format!("'{wanted}' is not a file in this repository's index"),
-        ));
-    }
+    // Still fail closed: nothing is served unless the index says the file is
+    // its own. But an index that could not be read (busy, locked) is reported
+    // as that, not as "not a file in the index" (review of #1098).
+    let span = match looked_up {
+        Ok(Some(span)) => span,
+        Ok(None) => {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                format!("'{wanted}' is not a file in this repository's index"),
+            ))
+        }
+        Err(e) => {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("could not read the index to check '{wanted}': {e}"),
+            ))
+        }
+    };
+    let line = asked_line.or(span.map(|(l, _)| l)).unwrap_or(1);
+    let end_line = span.filter(|(l, _)| *l == line).map(|(_, e)| e);
     let root = std::fs::canonicalize(&repo.root).map_err(|e| bad(&e.to_string()))?;
     let full = std::fs::canonicalize(root.join(&rel))
         .map_err(|_| ApiError(StatusCode::NOT_FOUND, format!("no file '{rel}'")))?;
@@ -447,6 +489,7 @@ pub(super) async fn source(
     Ok(Json(SourceResponse {
         path: rel,
         line,
+        end_line,
         lines,
     }))
 }
@@ -524,6 +567,89 @@ fn is_indexed_file(db: &Path, path: &str) -> rusqlite::Result<bool> {
         [path],
         |r| r.get(0),
     )
+}
+
+/// The `(line, end_line)` of the definition `symbol` names in `path`.
+///
+/// `symbol` is a node signature as the tools print it (`fn:run`,
+/// `Store.open`) or a bare name. An exact signature wins; otherwise the
+/// definitions whose last name segment equals the symbol's. When several
+/// match, the one at or nearest after `near` (the line the page already had),
+/// else the first in the file.
+fn symbol_span(
+    db: &Path,
+    path: &str,
+    symbol: &str,
+    near: Option<usize>,
+) -> rusqlite::Result<Option<(usize, usize)>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    let mut stmt = conn.prepare(
+        "SELECT signature, line, COALESCE(end_line, line) FROM nodes
+         WHERE path = ?1 AND line > 0 AND kind NOT IN ('file', 'import', 'module')
+         ORDER BY line LIMIT 5000",
+    )?;
+    let rows = stmt
+        .query_map([path], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|(sig, l, e)| {
+            let l = usize::try_from(l).ok()?;
+            Some((sig, l, usize::try_from(e).ok()?.max(l)))
+        })
+        .collect::<Vec<_>>();
+    Ok(pick_symbol(&rows, symbol, near))
+}
+
+/// Last name segment of a signature, without a kind prefix or parameters:
+/// `fn:a::b::run`, `Store.run` and `method:Foo.run(int)` are all `run`.
+fn last_segment(sig: &str) -> &str {
+    // A kind prefix is one word and a single colon (`fn:`); `a::b` has none.
+    let body = match sig.split_once(':') {
+        Some((kind, rest))
+            if !rest.starts_with(':')
+                && !kind.is_empty()
+                && kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+        {
+            rest
+        }
+        _ => sig,
+    };
+    let body = body.split('(').next().unwrap_or(body);
+    body.rsplit([':', '.', '#']).next().unwrap_or(body)
+}
+
+fn pick_symbol(
+    rows: &[(String, usize, usize)],
+    symbol: &str,
+    near: Option<usize>,
+) -> Option<(usize, usize)> {
+    let exact: Vec<_> = rows.iter().filter(|(s, _, _)| s == symbol).collect();
+    let pool = if exact.is_empty() {
+        let want = last_segment(symbol);
+        rows.iter()
+            .filter(|(s, _, _)| last_segment(s) == want)
+            .collect()
+    } else {
+        exact
+    };
+    let span = |r: &&(String, usize, usize)| (r.1, r.2);
+    match near {
+        Some(n) => pool
+            .iter()
+            .find(|r| r.1 >= n)
+            .or_else(|| pool.last())
+            .map(span),
+        None => pool.first().map(span),
+    }
 }
 
 /// The 0-based, inclusive line range the peek shows around 1-based `line`: 8
@@ -664,6 +790,32 @@ mod tests {
     }
 
     #[test]
+    fn a_symbol_resolves_to_its_definition_span() {
+        let rows = vec![
+            ("impl:Store".to_string(), 10, 80),
+            ("fn:Store.open".to_string(), 12, 30),
+            ("fn:Store.run".to_string(), 32, 50),
+            ("fn:run".to_string(), 90, 95),
+            ("fn:a::b::helper".to_string(), 100, 101),
+        ];
+        // Exact signature.
+        assert_eq!(pick_symbol(&rows, "fn:run", None), Some((90, 95)));
+        // A bare or differently qualified name matches by its last segment.
+        assert_eq!(pick_symbol(&rows, "open", None), Some((12, 30)));
+        assert_eq!(pick_symbol(&rows, "Store.open", None), Some((12, 30)));
+        assert_eq!(pick_symbol(&rows, "helper", None), Some((100, 101)));
+        // Two `run`s: the first without a hint, the one at or after it with one.
+        assert_eq!(pick_symbol(&rows, "run", None), Some((32, 50)));
+        assert_eq!(pick_symbol(&rows, "run", Some(60)), Some((90, 95)));
+        assert_eq!(pick_symbol(&rows, "run", Some(200)), Some((90, 95)));
+        assert_eq!(pick_symbol(&rows, "missing", None), None);
+        assert_eq!(last_segment("fn:a::b::run"), "run");
+        assert_eq!(last_segment("method:Foo.bar(int)"), "bar");
+        assert_eq!(last_segment("a::b"), "b");
+        assert_eq!(last_segment("run"), "run");
+    }
+
+    #[test]
     fn only_indexed_files_can_be_peeked() {
         // The review's case: `.env` sits in the tree (gitignored) but the
         // index holds only `src/main.rs`.
@@ -737,6 +889,11 @@ mod tests {
                     *a,
                     "init" | "install" | "remove" | "set" | "unset" | "start" | "stop" | "restart"
                 )),
+                "{args:?}"
+            );
+            // `connect` writes the tools' config unless it only prints.
+            assert!(
+                !args.contains(&"connect") || args.contains(&"--print"),
                 "{args:?}"
             );
         }

@@ -189,6 +189,18 @@ fn note_cold_path_cannot_render_docs(repo_root: &std::path::Path) {
     if !enabled {
         return;
     }
+    // A daemon that holds the repository but did not answer in time is not
+    // "not running" (re-review of #1098); say what actually happened.
+    if crate::daemon_client::daemon_was_unresponsive(repo_root) {
+        eprintln!(
+            "note: docs.enabled is on, but the travsr daemon for this repository \
+             is running and did not answer in time, so this query is served by \
+             the read-only cold path, which does not load the doc index, so no \
+             docs section can appear. If it stays unresponsive, restart it with \
+             `travsr daemon restart`."
+        );
+        return;
+    }
     eprintln!(
         "note: docs.enabled is on, but no travsr daemon is running, this query \
          is served by the read-only cold path, which does not load the doc \

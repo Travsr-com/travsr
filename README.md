@@ -11,7 +11,7 @@
   <a href="https://github.com/Travsr-com/travsr/releases/latest"><img src="https://img.shields.io/github/v/release/Travsr-com/travsr?style=flat-square&logo=github&label=release&color=blue" alt="Latest release"/></a>
   <a href="https://www.npmjs.com/package/@travsr.com/travsr"><img src="https://img.shields.io/npm/v/%40travsr.com%2Ftravsr?style=flat-square&logo=npm&logoColor=white&label=npm" alt="npm"/></a>
   <a href="https://marketplace.visualstudio.com/items?itemName=travsr.travsr-vscode"><img src="https://img.shields.io/badge/vs%20code-extension-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white" alt="VS Code extension"/></a>
-  <a href="#build-from-source"><img src="https://img.shields.io/badge/rust-1.88%2B-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.88+"/></a>
+  <a href="#build-from-source"><img src="https://img.shields.io/badge/rust-1.89%2B-B7410E?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.89+"/></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-stdio%20%2B%20SSE-1f6feb?style=flat-square" alt="MCP"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square" alt="Apache 2.0"/></a>
 </p>
@@ -584,16 +584,30 @@ travsr ui --port 0   # pick any free port
 The pages are the VS Code extension's, for the current repository or any other
 registered one:
 
+- **Search (Ctrl+K, or Cmd+K on macOS), on every page:** find a symbol, an
+  indexed file or a page and open it where you want: a symbol in Graph,
+  Callers, References, Context or Path, a file in Graph, Dependencies, Blast
+  radius or your editor. Recent picks come first.
 - **Health:** the extension's Health page: verdict, metric tiles, daemon,
   index freshness, sidecars, storage and integrity, languages, repositories,
-  recent activity and the daemon log with its filters.
+  recent activity and the daemon log with its filters. Until a repository
+  is indexed, watched by the daemon and connected to your AI tools, a
+  "Getting started" checklist at the top runs each step with one click
+  (semantic search is the optional fourth).
 - **Architecture:** how the repository is put together, from the
   `get_architecture_brief` facts agents get: components stacked in layers
   from foundation to entry point, dependency cycles, the dependency edges by
   weight, and what each component owns. Click a component to see what it
   depends on and what depends on it.
+- **Changes:** what your uncommitted work touches. The working tree is
+  compared with the commit the index describes; each edit is mapped to the
+  indexed symbols it overlaps, with their callers, each file's blast radius on
+  demand, and the architecture rules the current state breaks (checked over
+  every edge, uncommitted ones included).
 - **Graph:** the extension's graph view itself (repo map, symbol graph, blast
-  view, definition peek, DOT/JSON/PNG export).
+  view, definition peek, DOT/JSON/PNG export). Right-click a symbol for its
+  callers, references, context or blast radius, or to start or end an
+  execution path there.
 - **Callers**, **Dependencies**, **Blast radius**, **Repos:** the extension's
   panels of the same names. The lookup boxes suggest matching symbols or
   indexed files as you type.
@@ -613,7 +627,9 @@ registered one:
   each with its read-only options as fields. Only these run, as this same
   binary with no shell, and only after a read-only open of the index
   succeeds. `fsck` is not offered: even its report mode opens the index
-  writable.
+  writable. Up and Down in a box step through what you ran from it before;
+  each result has a rerun button; the log survives a reload of the tab; and a
+  filter shows only the output lines containing some text.
 
 Every graph answer is the text the matching MCP tool (`search_symbol`,
 `get_callers`, `get_dependencies`, `get_blast_radius`, `get_graph_json`, ...)
@@ -785,7 +801,7 @@ git clone https://github.com/Travsr-com/travsr
 cd travsr
 
 # Build (SQLite backend)
-cargo build --release   # requires Rust 1.88+
+cargo build --release   # requires Rust 1.89+
 
 # Override the npm-installed binary with a local build
 cp target/release/travsr $(which travsr)
@@ -796,7 +812,7 @@ export TRAVSR_BINARY=/path/to/travsr/target/release/travsr
 **Platform support:** macOS (x86\_64 + arm64), Linux (x86\_64 + aarch64), Windows (x86\_64).
 Pre-built binaries are available on the [Releases](https://github.com/Travsr-com/travsr/releases) page.
 
-**MSRV:** Rust 1.88 (verified in CI on every commit).
+**MSRV:** Rust 1.89 (verified in CI on every commit).
 
 ---
 

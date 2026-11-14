@@ -36,6 +36,22 @@ pub const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 /// the window instead of failing the whole command on the first one.
 pub const READ_DEADLINE: Duration = Duration::from_secs(15);
 
+/// Read ceiling for a [`ControlMessage::Query`] (#1082 B1). A query is real
+/// work (an `ask` ranks, reranks and packs), and on a slow machine it can
+/// outlast [`READ_DEADLINE`]. A client that gave up then answered the same
+/// question again from a direct open while the daemon was still computing
+/// it: twice the work on the same CPUs, so slower than no daemon at all. A
+/// wedged daemon still fails the query, just later.
+pub const QUERY_READ_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How long to wait for the reply to `msg`.
+pub fn read_deadline_for(msg: &ControlMessage) -> Duration {
+    match msg {
+        ControlMessage::Query { .. } => QUERY_READ_DEADLINE,
+        _ => READ_DEADLINE,
+    }
+}
+
 /// Budget for a fire-and-forget send (#407 L2). Sized for the git post-commit
 /// hook, which must never make a commit feel slow: if the daemon cannot accept
 /// one line in this window, the hook gives up and the next commit (or a manual
@@ -93,17 +109,21 @@ pub(crate) fn send_request_line<S: Read + Write>(
     msg: &ControlMessage,
 ) -> anyhow::Result<ControlResponse> {
     let line = encode_line(msg)?;
-    request_on(stream, &line)
+    request_on(stream, &line, read_deadline_for(msg))
 }
 
 /// The wire exchange itself: write `line`, read one line back, parse. Split
 /// from [`send_request_line`] so the bounded-thread path (#407 M2) can run the
 /// same exchange from an owned closure.
-fn request_on<S: Read + Write>(stream: &mut S, line: &str) -> anyhow::Result<ControlResponse> {
+fn request_on<S: Read + Write>(
+    stream: &mut S,
+    line: &str,
+    read_deadline: Duration,
+) -> anyhow::Result<ControlResponse> {
     write_all_before(stream, line.as_bytes(), WRITE_DEADLINE)?;
     flush_tolerant(stream)?;
 
-    let buf = read_line_before(stream, READ_DEADLINE)?;
+    let buf = read_line_before(stream, read_deadline)?;
     let trimmed = buf.trim();
     anyhow::ensure!(
         !trimmed.is_empty(),
@@ -145,8 +165,9 @@ where
     S: Read + Write + Send + 'static,
 {
     let line = encode_line(msg)?;
-    run_with_deadline(WRITE_DEADLINE + READ_DEADLINE, move || {
-        request_on(&mut stream, &line)
+    let read_deadline = read_deadline_for(msg);
+    run_with_deadline(WRITE_DEADLINE + read_deadline, move || {
+        request_on(&mut stream, &line, read_deadline)
     })
 }
 
@@ -358,20 +379,41 @@ mod tests {
         }
     }
 
+    /// #1082 B1: a query gets long enough that a slow `ask` is answered by
+    /// the daemon, not abandoned and recomputed by the client; control
+    /// messages keep the short ceiling so a wedged daemon fails `stop` fast.
+    #[test]
+    fn queries_get_a_longer_read_deadline_than_control_messages() {
+        let query = ControlMessage::Query {
+            protocol: crate::QUERY_PROTOCOL_VERSION,
+            tool: "ask".into(),
+            args: serde_json::json!({ "query": "x" }),
+        };
+        assert_eq!(read_deadline_for(&query), QUERY_READ_DEADLINE);
+        assert!(QUERY_READ_DEADLINE > READ_DEADLINE);
+        for msg in [
+            ControlMessage::Status,
+            ControlMessage::shutdown("test", "0"),
+            ControlMessage::StopEmbed,
+        ] {
+            assert_eq!(read_deadline_for(&msg), READ_DEADLINE, "{msg:?}");
+        }
+    }
+
     #[test]
     fn would_block_on_write_is_retried_not_fatal() {
         // #541: this is the exact failure. Before the fix the first WouldBlock
         // surfaced as "Resource temporarily unavailable (os error 35)" and the
         // Shutdown never reached the daemon.
         let mut s = stream(3, 0, usize::MAX);
-        let resp = send_request_line(&mut s, &ControlMessage::Shutdown).unwrap();
+        let resp = send_request_line(&mut s, &ControlMessage::shutdown("test", "0")).unwrap();
         assert!(resp.ok);
     }
 
     #[test]
     fn would_block_on_read_is_retried_not_fatal() {
         let mut s = stream(0, 5, usize::MAX);
-        let resp = send_request_line(&mut s, &ControlMessage::Shutdown).unwrap();
+        let resp = send_request_line(&mut s, &ControlMessage::shutdown("test", "0")).unwrap();
         assert!(resp.ok);
     }
 
@@ -380,7 +422,7 @@ mod tests {
         // The old `writeln!` path could leave a half-written JSON line in the
         // daemon's buffer when a timeout landed mid-message.
         let mut s = stream(0, 0, 3);
-        send_request_line(&mut s, &ControlMessage::Shutdown).unwrap();
+        send_request_line(&mut s, &ControlMessage::shutdown("test", "0")).unwrap();
         let sent = String::from_utf8(s.written.clone()).unwrap();
         assert!(sent.ends_with('\n'), "message must be newline-terminated");
         serde_json::from_str::<ControlMessage>(sent.trim())

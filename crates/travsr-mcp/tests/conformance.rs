@@ -2,7 +2,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::cargo_bin;
+mod support;
+use support::cargo_bin;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
