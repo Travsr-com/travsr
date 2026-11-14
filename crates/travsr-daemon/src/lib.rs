@@ -2831,13 +2831,6 @@ impl ClassHierarchy {
     }
 }
 
-/// #810: narrow same-named bare-call candidates to the one the caller means:
-/// (1) a definition in the caller's own file, else (2) one in a file the caller
-/// imports (`depends → import → resolves-to → file`). Only ever narrows; an
-/// unbroken tie is returned unchanged for the CO-A1 uniqueness gate to drop.
-/// `resolves-to` exists only for relative imports (TS/JS `./` `../`, Rust
-/// `self::` `super::`, Python specifiers that map to an indexed file), so a
-/// call through an alias, a package specifier or `crate::` stays a tie.
 /// The component a repo-relative path belongs to (#1082 B7): the first two
 /// segments under a conventional container folder (`crates/travsr-cli`,
 /// `packages/travsr-vscode`, `apps/web`, ...), otherwise the first segment
@@ -2915,10 +2908,20 @@ impl PackageImports {
                 json.get("name")?.as_str().map(str::to_string)
             })
             .clone();
-        let folder = component.rsplit('/').next().unwrap_or(component);
-        packages
-            .iter()
-            .any(|p| name.as_deref() == Some(p.as_str()) || p.rsplit('/').next() == Some(folder))
+        // A component with a package.json name matches that name exactly; the
+        // folder-name fallback is only for one without (review of #1098:
+        // otherwise any import of `react` matched any folder named `react`).
+        // Read at resolve time like every other input here, so a renamed
+        // package is picked up when its callers are next re-indexed.
+        match name.as_deref() {
+            Some(name) => packages.iter().any(|p| p == name),
+            None => {
+                let folder = component.rsplit('/').next().unwrap_or(component);
+                packages
+                    .iter()
+                    .any(|p| p.rsplit('/').next() == Some(folder))
+            }
+        }
     }
 }
 
@@ -2938,6 +2941,13 @@ fn package_of_specifier(spec: &str) -> Option<&str> {
     Some(end.map_or(spec, |i| &spec[..i]))
 }
 
+/// #810: narrow same-named bare-call candidates to the one the caller means:
+/// (1) a definition in the caller's own file, else (2) one in a file the caller
+/// imports (`depends → import → resolves-to → file`). Only ever narrows; an
+/// unbroken tie is returned unchanged for the CO-A1 uniqueness gate to drop.
+/// `resolves-to` exists only for relative imports (TS/JS `./` `../`, Rust
+/// `self::` `super::`, Python specifiers that map to an indexed file), so a
+/// call through an alias, a package specifier or `crate::` stays a tie.
 fn scope_bare_call<'a>(
     caller_path: &str,
     imported_files: &std::collections::HashSet<(String, String)>,

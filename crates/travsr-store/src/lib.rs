@@ -12012,12 +12012,6 @@ mod tests {
         );
     }
 
-    /// #509: embed.db deleted and recreated at the same path between two polls
-    /// is a *different file*, and the cached read-only connection is left
-    /// reading the unlinked inode with a permanently frozen `data_version`.
-    /// `path.exists()` is true on both sides of the swap, so existence cannot
-    /// see it. The reported version must move, or every `ask` answer cached
-    /// before the swap keeps hitting until the daemon restarts.
     /// #1082 B1: a read-only open must not change what another connection
     /// reads as the database's version. The daemon keys its query cache on
     /// `data_version`, and `travsr ask` opens the index read-only for a note
@@ -12059,6 +12053,12 @@ mod tests {
         assert_ne!(observer.data_version().unwrap(), before);
     }
 
+    /// #509: embed.db deleted and recreated at the same path between two polls
+    /// is a *different file*, and the cached read-only connection is left
+    /// reading the unlinked inode with a permanently frozen `data_version`.
+    /// `path.exists()` is true on both sides of the swap, so existence cannot
+    /// see it. The reported version must move, or every `ask` answer cached
+    /// before the swap keeps hitting until the daemon restarts.
     /// #509: `file_identity` must change when a path is replaced by a different
     /// file, on every platform.
     ///
