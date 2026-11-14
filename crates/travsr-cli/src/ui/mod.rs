@@ -575,9 +575,18 @@ const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// turn guards no data that panic could have left half-written, so it is taken
 /// anyway.
 fn take_daemon_turn(wait: std::time::Duration) -> Option<std::sync::MutexGuard<'static, ()>> {
+    take_turn(&DAEMON_TURN, wait)
+}
+
+/// [`take_daemon_turn`] on any lock, so a test can use its own instead of
+/// holding the process-wide turn while other tests run.
+fn take_turn<'a>(
+    turn: &'a std::sync::Mutex<()>,
+    wait: std::time::Duration,
+) -> Option<std::sync::MutexGuard<'a, ()>> {
     let until = std::time::Instant::now() + wait;
     loop {
-        match DAEMON_TURN.try_lock() {
+        match turn.try_lock() {
             Ok(g) => return Some(g),
             Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
@@ -1097,21 +1106,23 @@ mod tests {
     /// suggestion is answered from the index instead of queueing.
     #[test]
     fn a_zero_wait_never_queues_for_the_daemon_turn() {
-        let held = DAEMON_TURN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A private lock: holding the process-wide DAEMON_TURN here would make
+        // every ui test running beside this one wait out its turn (review of
+        // #1098). take_daemon_turn is take_turn on DAEMON_TURN.
+        let turn = std::sync::Mutex::new(());
+        let held = turn.lock().unwrap();
         let started = std::time::Instant::now();
-        assert!(take_daemon_turn(std::time::Duration::ZERO).is_none());
+        assert!(take_turn(&turn, std::time::Duration::ZERO).is_none());
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
             "{:?}",
             started.elapsed()
         );
         let started = std::time::Instant::now();
-        assert!(take_daemon_turn(std::time::Duration::from_millis(100)).is_none());
+        assert!(take_turn(&turn, std::time::Duration::from_millis(100)).is_none());
         assert!(started.elapsed() >= std::time::Duration::from_millis(100));
         drop(held);
-        assert!(take_daemon_turn(std::time::Duration::ZERO).is_some());
+        assert!(take_turn(&turn, std::time::Duration::ZERO).is_some());
     }
 
     #[tokio::test]
