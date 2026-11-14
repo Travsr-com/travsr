@@ -99,11 +99,42 @@ pub(super) fn parse_name_status(out: &str) -> Vec<(&'static str, String)> {
     files
 }
 
-/// Old-side line ranges (inclusive, 1-based) per file from a `-U0` diff. A
+/// Old-side line ranges (inclusive, 1-based) per file from a `-U0` diff (tests;
+/// the page picks a side per file with [`ranges_for_index`]). A
 /// pure insertion (`-a,0`) touches the lines around position `a`, so the
 /// symbol it lands in counts as changed.
+#[cfg(test)]
 pub(super) fn parse_hunks(diff: &str) -> BTreeMap<String, Vec<(i64, i64)>> {
-    let mut out: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+    parse_hunk_sides(diff)
+        .into_iter()
+        .map(|(path, sides)| (path, sides.old))
+        .collect()
+}
+
+/// Both sides of every hunk of one file: `old` in the base commit's line
+/// numbers (`-a,b`), `new` in the working tree's (`+c,d`).
+#[derive(Default, Clone, Debug, PartialEq)]
+pub(super) struct HunkSides {
+    pub(super) old: Vec<(i64, i64)>,
+    pub(super) new: Vec<(i64, i64)>,
+}
+
+/// One side's `start,count` as an inclusive line range. A side with no lines
+/// (`a,0`: a pure insertion seen from the old side, a pure deletion from the
+/// new) touches the lines around position `a`.
+fn side_range(token: &str) -> (i64, i64) {
+    let mut it = token.split(',');
+    let start: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let count: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if count == 0 {
+        (start.max(1), start.max(1) + 1)
+    } else {
+        (start, start + count - 1)
+    }
+}
+
+pub(super) fn parse_hunk_sides(diff: &str) -> BTreeMap<String, HunkSides> {
+    let mut out: BTreeMap<String, HunkSides> = BTreeMap::new();
     let mut current: Option<String> = None;
     // `---` / `+++` are headers only between `diff --git` and the first `@@`.
     // In a hunk body they are content: deleting the line `-- note` (an SQL or
@@ -126,16 +157,15 @@ pub(super) fn parse_hunks(diff: &str) -> BTreeMap<String, Vec<(i64, i64)>> {
             let Some(path) = current.clone() else {
                 continue;
             };
-            let old = rest.split_whitespace().next().unwrap_or("");
-            let mut it = old.split(',');
-            let start: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let count: i64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let range = if count == 0 {
-                (start.max(1), start.max(1) + 1)
-            } else {
-                (start, start + count - 1)
-            };
-            out.entry(path).or_default().push(range);
+            let mut tokens = rest.split_whitespace();
+            let old = tokens.next().unwrap_or("");
+            let new = tokens
+                .next()
+                .and_then(|t| t.strip_prefix('+'))
+                .unwrap_or("");
+            let sides = out.entry(path).or_default();
+            sides.old.push(side_range(old));
+            sides.new.push(side_range(new));
         }
     }
     out
@@ -330,7 +360,7 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
         // and say their symbols could not be mapped.
         _ => (String::new(), true),
     };
-    let hunks = parse_hunks(&diff);
+    let hunks = parse_hunk_sides(&diff);
 
     let mut list = parse_name_status(&names);
     list.extend(
@@ -342,11 +372,15 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
     // The index's own files never count as source changes.
     list.retain(|(_, p)| !p.starts_with(".travsr/"));
     let truncated = list.len() > MAX_FILES;
-    let mut indexed_stmt = conn.prepare("SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)")?;
+    let mut hash_stmt = conn.prepare("SELECT sha256 FROM files WHERE path = ?1")?;
     let mut files = Vec::new();
     for (status, path) in list.into_iter().take(MAX_FILES) {
-        let indexed: bool = indexed_stmt.query_row([&path], |r| r.get(0))?;
-        let ranges = hunks.get(&path).cloned().unwrap_or_default();
+        let stored: Option<String> = hash_stmt
+            .query_row([&path], |r| r.get::<_, Option<String>>(0))
+            .unwrap_or(None);
+        let indexed = stored.is_some() || hash_stmt.exists([&path]).unwrap_or(false);
+        let sides = hunks.get(&path).cloned().unwrap_or_default();
+        let ranges = ranges_for_index(&sides, stored.as_deref(), &root.join(&path));
         let symbols = if indexed {
             touched_symbols(&conn, &path, &ranges)?
         } else {
@@ -367,6 +401,39 @@ fn changes_for(root: &Path, db: &Path) -> anyhow::Result<ChangesResponse> {
         truncated,
         diff_incomplete,
     })
+}
+
+/// The side of the diff whose line numbers the index's nodes are in.
+///
+/// The diff is against the commit the index describes, but a running daemon
+/// re-indexes every save, so a saved file's nodes already carry working-tree
+/// line numbers while `last_commit` stays put. Matching old-side ranges
+/// against them attributed every edit below an insertion to the wrong symbol
+/// (review of #1098). When the file's stored hash is the hash of its bytes on
+/// disk (the daemon's own `file_matches_index` test) the index holds the
+/// working tree, so the new side is used; otherwise the base version, the old.
+fn ranges_for_index(
+    sides: &HunkSides,
+    stored_hash: Option<&str>,
+    on_disk: &Path,
+) -> Vec<(i64, i64)> {
+    let current = stored_hash.is_some_and(|h| {
+        std::fs::read(on_disk).is_ok_and(|bytes| {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+            hex.eq_ignore_ascii_case(h)
+        })
+    });
+    if current {
+        sides.new.clone()
+    } else {
+        sides.old.clone()
+    }
 }
 
 /// What a bounded git call gave back.
@@ -439,6 +506,62 @@ mod tests {
         let h = parse_hunks(diff);
         assert_eq!(h["src/a.rs"], vec![(10, 12), (40, 40), (50, 51)]);
         assert_eq!(h["new.rs"], vec![(1, 2)]);
+    }
+
+    /// Review of #1098 (blocker 1): a running daemon re-indexes every save, so
+    /// a saved file's nodes are in working-tree line numbers. Two lines were
+    /// inserted above `b` (base lines 10..12, now 12..14) and `b`'s body edited.
+    /// Matched against the stored lines, the old side (11) misses `b` (now
+    /// 12..14); the new side (13) lands on it.
+    #[test]
+    fn a_daemon_reindexed_file_is_mapped_with_new_side_lines() {
+        let diff = "diff --git a/m.rs b/m.rs\n--- a/m.rs\n+++ b/m.rs\n\
+                    @@ -9,0 +10,2 @@\n+x\n+y\n@@ -11 +13 @@\n-old\n+new\n";
+        let sides = &parse_hunk_sides(diff)["m.rs"];
+        assert_eq!(sides.old, vec![(9, 10), (11, 11)]);
+        assert_eq!(sides.new, vec![(10, 11), (13, 13)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("m.rs");
+        std::fs::write(&file, b"working tree bytes\n").unwrap();
+        let disk_hash = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(b"working tree bytes\n")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        // Index re-read the saved file: new side.
+        assert_eq!(ranges_for_index(sides, Some(&disk_hash), &file), sides.new);
+        // Index still holds the base version: old side.
+        assert_eq!(ranges_for_index(sides, Some("00"), &file), sides.old);
+        assert_eq!(ranges_for_index(sides, None, &file), sides.old);
+
+        // Through the symbol mapping: nodes as the daemon stored them.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY, path TEXT, signature TEXT, kind TEXT, line INTEGER, end_line INTEGER);
+             CREATE TABLE edges (src INTEGER, dst INTEGER, kind TEXT);
+             INSERT INTO nodes VALUES (1, 'm.rs', 'fn:a', 'function', 1, 9),
+                                      (2, 'm.rs', 'fn:b', 'function', 12, 14);",
+        )
+        .unwrap();
+        let sig = |ranges: &[(i64, i64)]| {
+            touched_symbols(&conn, "m.rs", ranges)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.sig)
+                .collect::<Vec<_>>()
+        };
+        // The insertion sits between a and b; the edit is in b.
+        assert_eq!(
+            sig(&ranges_for_index(sides, Some(&disk_hash), &file)),
+            vec!["fn:b"]
+        );
+        assert!(
+            !sig(&sides.old).contains(&"fn:b".to_string()),
+            "old side misses the edit to b"
+        );
     }
 
     /// Review fixes: content lines that look like headers, a path with a space

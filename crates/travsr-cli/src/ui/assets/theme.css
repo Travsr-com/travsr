@@ -551,3 +551,6 @@ body:not(.ui-page) #brand .word {
 /* The guide, hidden by the reader: one line to bring it back. */
 .guide-collapsed { display: flex; align-items: baseline; gap: 10px; margin: 12px 0 14px; font-size: 12px; }
 .guide-collapsed .muted { font-size: 11px; }
+
+/* Changes: the rules card sits in its own slot so it can update alone. */
+.ch-slot { display: contents; }

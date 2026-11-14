@@ -1272,7 +1272,31 @@
       } catch (e) {
         rules = { violated: [], held: 0, noFile: false, error: e.message };
       }
-      render();
+      // Only the rules card and box: re-rendering the whole page here wiped
+      // any code preview or blast radius the reader had opened meanwhile, and
+      // reopened collapsed files (review of #1098).
+      const cardSlot = document.getElementById("ch-rulecard");
+      const boxSlot = document.getElementById("ch-rules");
+      if (cardSlot && boxSlot) {
+        cardSlot.innerHTML = ruleCardHtml();
+        boxSlot.innerHTML = rulesBoxHtml();
+      } else {
+        render();
+      }
+    }
+
+    const card = (k, v, cls, note) => '<div class="card' + (cls ? " " + cls : "") + '"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" + (note ? '<div class="s">' + esc(note) + "</div>" : "") + "</div>";
+    function ruleCardHtml() {
+      return rules === null ? card("Rules broken", "…", "", "checking")
+        : rules.noFile ? card("Rules broken", "–", "", "no architecture-invariants.json")
+        : rules.error ? card("Rules broken", "?", "warn", "could not check")
+        : card("Rules broken", String(rules.violated.length), rules.violated.length ? "bad" : "", rules.held + rules.violated.length + " rules checked");
+    }
+    function rulesBoxHtml() {
+      if (!rules || !rules.violated.length) return "";
+      return '<div class="diag error ch-rules"><div class="diag-t">Architecture rules this state breaks</div>' +
+        rules.violated.map((v) => '<div class="ch-rule"><strong>' + esc(v.rule) + "</strong>" + v.detail.map((d) => '<div class="mono muted">' + esc(d) + "</div>").join("") + "</div>").join("") +
+        '<div class="diag-d">Checked over every edge, uncommitted ones included. A rule that was already broken before your change shows here too; see the Architecture page.</div></div>';
     }
 
     async function load() {
@@ -1296,11 +1320,6 @@
       const syms = files.reduce((n, f) => n + f.symbols.length, 0);
       const callerSet = new Set();
       for (const f of files) for (const s of f.symbols) for (const c of s.callers) callerSet.add(c.sig + "@" + c.path);
-      const card = (k, v, cls, note) => '<div class="card' + (cls ? " " + cls : "") + '"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" + (note ? '<div class="s">' + esc(note) + "</div>" : "") + "</div>";
-      const ruleCard = rules === null ? card("Rules broken", "…", "", "checking")
-        : rules.noFile ? card("Rules broken", "–", "", "no architecture-invariants.json")
-        : rules.error ? card("Rules broken", "?", "warn", "could not check")
-        : card("Rules broken", String(rules.violated.length), rules.violated.length ? "bad" : "", rules.held + rules.violated.length + " rules checked");
       let html = "";
       if (data.base && data.head && data.base !== data.head) {
         html += '<div class="note-box">The index describes <code>' + esc(short(data.base)) + "</code> and HEAD is <code>" + esc(short(data.head)) +
@@ -1313,12 +1332,8 @@
         card("Files changed", String(files.length) + (data.truncated ? "+" : ""), "", "since " + short(data.base)) +
         card("Symbols touched", String(syms)) +
         card("Callers affected", String(callerSet.size), "", "distinct calling symbols") +
-        ruleCard + "</div>";
-      if (rules && rules.violated.length) {
-        html += '<div class="diag error ch-rules"><div class="diag-t">Architecture rules this state breaks</div>' +
-          rules.violated.map((v) => '<div class="ch-rule"><strong>' + esc(v.rule) + "</strong>" + v.detail.map((d) => '<div class="mono muted">' + esc(d) + "</div>").join("") + "</div>").join("") +
-          '<div class="diag-d">Checked over every edge, uncommitted ones included. A rule that was already broken before your change shows here too; see the Architecture page.</div></div>';
-      }
+        '<div id="ch-rulecard" class="ch-slot">' + ruleCardHtml() + "</div></div>";
+      html += '<div id="ch-rules">' + rulesBoxHtml() + "</div>";
       if (!files.length) {
         html += '<div class="note-box">No uncommitted changes since <code>' + esc(short(data.base)) + "</code>.</div>";
         out.innerHTML = html;
