@@ -95,7 +95,48 @@ impl NamedRepo {
     }
 }
 
-/// Start the server and block until Ctrl-C.
+/// Set to `1` by a parent that starts `travsr ui` with a piped stdin and holds
+/// it open for as long as it lives (the VS Code extension, #1060). The server
+/// then also stops when stdin reaches end of file. The operating system closes
+/// the pipe when the parent exits for any reason, a crash or a force-kill
+/// included, so a server is not left running after the editor that started
+/// it is gone. An environment variable rather than a flag so a parent can set
+/// it unconditionally: a binary that predates it ignores it instead of
+/// rejecting an unknown option.
+pub(crate) const EXIT_ON_STDIN_EOF_ENV: &str = "TRAVSR_UI_EXIT_ON_STDIN_EOF";
+
+/// How long a graceful shutdown may take once the parent is gone before the
+/// process exits anyway.
+const PARENT_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A receiver that completes when stdin reaches end of file or can no longer be
+/// read. The read blocks, so it runs on its own thread; the parent never writes
+/// anything, and anything it does write is discarded. `None` when the thread
+/// cannot be started, which leaves Ctrl-C as the only way to stop, as before.
+fn watch_stdin_eof() -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("travsr-ui-stdin".into())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 256];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(());
+        })
+        .ok()?;
+    Some(rx)
+}
+
+/// Start the server and block until Ctrl-C (or, with
+/// [`EXIT_ON_STDIN_EOF_ENV`] set, until stdin closes).
 pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> anyhow::Result<()> {
     let ip = parse_host(&host)?;
     if !ip.is_loopback() && !allow_remote {
@@ -148,12 +189,38 @@ pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> any
         open_browser(&url);
     }
 
+    let parent = if std::env::var_os(EXIT_ON_STDIN_EOF_ENV).is_some_and(|v| v == "1") {
+        watch_stdin_eof()
+    } else {
+        None
+    };
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            let Some(parent_gone) = parent else {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                // Ok or Err: the watcher sent EOF, or it is gone, which only
+                // happens once stdin can no longer be read either way.
+                _ = parent_gone => {
+                    tracing::info!("stdin closed: the process that started travsr ui exited, stopping");
+                    // An in-flight query can hold a graceful shutdown for up
+                    // to its deadline; with nobody left to read the answer,
+                    // that wait is pointless.
+                    std::thread::spawn(|| {
+                        std::thread::sleep(PARENT_GONE_GRACE);
+                        std::process::exit(0);
+                    });
+                }
+            }
         })
         .await?;
-    println!("travsr ui: stopped");
+    // Plain println! panics on a closed stdout, which is exactly the state
+    // after the parent that held the pipe has gone.
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "travsr ui: stopped");
     Ok(())
 }
 
