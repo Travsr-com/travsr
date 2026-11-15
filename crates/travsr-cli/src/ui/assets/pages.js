@@ -1349,7 +1349,7 @@
         html += '<details class="hsec ch-file" open data-path="' + esc(f.path) + '"><summary>' +
           '<span class="ch-status ' + esc(f.status) + '">' + esc(f.status) + "</span>" +
           '<span class="ch-path">' + editorAnchor(f.path, null, f.path) + "</span>" +
-          '<span class="muted ch-meta">' + (f.indexed ? f.symbols.length + " symbol" + (f.symbols.length === 1 ? "" : "s") + " · " + callers + " caller" + (callers === 1 ? "" : "s") : "not in the index yet") + "</span>" +
+          '<span class="muted ch-meta">' + (f.indexed ? f.symbols.length + " symbol" + (f.symbols.length === 1 ? "" : "s") + " · " + callers + " caller" + (callers === 1 ? "" : "s") : f.status === "deleted" ? "not in the index" : "not in the index yet") + "</span>" +
           '<span class="ch-acts">' +
           (f.indexed && f.status !== "deleted" ? '<button class="link-btn" type="button" data-blast="' + esc(f.path) + '">blast radius</button>' : "") +
           (f.indexed ? '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: f.path })) + '">graph</a>' : "") +
@@ -1358,7 +1358,11 @@
           html += '<p class="sub">The index holds an earlier save of this file (the daemon indexed it, then stopped), so these symbols are matched with today\'s line numbers and may be slightly off. Reindex for an exact list.</p>';
         }
         if (!f.indexed) {
-          html += '<p class="sub">' + (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).</p>";
+          // A deleted file the index never held (removed before it was
+          // indexed, or ignored) has no symbols to list; it is not a new file.
+          html += '<p class="sub">' + (f.status === "deleted"
+            ? "This file is deleted and the index has no record of it, so it has no symbols to list."
+            : (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).") + "</p>";
         } else if (!f.symbols.length) {
           html += '<p class="sub">' + (f.hunks ? "The edit touches no indexed symbol (comments, imports or whitespace)." : "No line changes against the indexed commit.") + "</p>";
         }
