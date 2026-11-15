@@ -6,7 +6,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { EventEmitter } from "events";
 import { PassThrough } from "stream";
-import { execFileSync } from "child_process";
+import { ChildProcess, execFileSync } from "child_process";
 import {
   BrowserUiServer,
   SpawnUi,
@@ -17,6 +17,8 @@ import {
   parseServingUrl,
   spawnUiProcess,
   uiArgs,
+  uiEnv,
+  EXIT_ON_STDIN_EOF_ENV,
 } from "../../browserUi";
 
 /** A child process the test drives by hand. */
@@ -99,6 +101,16 @@ suite("#1060 browser UI: output parsing", () => {
     );
     assert.match(explainStartFailure("", 3), /exited with code 3/);
     assert.match(explainStartFailure("", null), /stopped before/);
+  });
+});
+
+suite("#1060 browser UI: stops if the editor crashes", () => {
+  test("the server is told to exit when its stdin closes", () => {
+    assert.strictEqual(EXIT_ON_STDIN_EOF_ENV, "TRAVSR_UI_EXIT_ON_STDIN_EOF");
+    const env = uiEnv({ PATH: "/bin", TRAVSR_UI_EXIT_ON_STDIN_EOF: "0" });
+    assert.strictEqual(env[EXIT_ON_STDIN_EOF_ENV], "1", "always on, overriding the inherited value");
+    assert.strictEqual(env.PATH, "/bin", "the rest of the environment is kept");
+    assert.strictEqual(env.NO_COLOR, "1");
   });
 });
 
@@ -341,6 +353,35 @@ suite("#1060 browser UI: real travsr ui (TRAVSR_UI_E2E_BINARY)", function () {
       await stopped;
       await new Promise((r) => setTimeout(r, 500));
       await assert.rejects(get(url), "the server must be gone after stop");
+    } finally {
+      server.dispose();
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // Needs a binary that knows TRAVSR_UI_EXIT_ON_STDIN_EOF (travsr after 1.4.0).
+  test("exits cleanly when its stdin closes, as when the editor crashes", async function () {
+    if (!binary) this.skip();
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-ui-e2e-"));
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    let child: ChildProcess | undefined;
+    const server = new BrowserUiServer((b, a, c) => {
+      const p = spawnUiProcess(b, a, c) as ChildProcess;
+      child = p;
+      return p;
+    });
+    try {
+      const { url } = await server.start(binary as string, repo, 0);
+      const exited = new Promise<number | null>((r) => server.onUnexpectedExit(r));
+      // What the operating system does to the pipe when the extension host
+      // dies without running deactivate.
+      child!.stdin!.end();
+      const code = await Promise.race([
+        exited,
+        new Promise<string>((r) => setTimeout(() => r("still running after 10 s"), 10_000)),
+      ]);
+      assert.strictEqual(code, 0, "travsr ui must stop cleanly once its stdin closes");
+      await assert.rejects(get(url), "the port must be closed");
     } finally {
       server.dispose();
       fs.rmSync(repo, { recursive: true, force: true });

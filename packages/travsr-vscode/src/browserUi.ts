@@ -17,9 +17,11 @@
  *     the same repo, replaced when the target repo changes, and stopped by
  *     `Travsr: Stop Browser UI` or when the extension deactivates. A detached
  *     server would outlive the window with nothing left to stop it.
- *
- * The CLI needs no change for this; it already prints the URL and takes
- * `--port`.
+ *   - If the editor crashes or is force-killed, `deactivate` never runs. The
+ *     server is started with a piped stdin and `TRAVSR_UI_EXIT_ON_STDIN_EOF=1`,
+ *     so it exits when the operating system closes that pipe. That needs a
+ *     travsr binary that knows the variable; an older one ignores it and only
+ *     the normal stop paths apply.
  */
 
 import * as cp from "child_process";
@@ -91,11 +93,24 @@ export interface UiProcess {
 
 export type SpawnUi = (binary: string, args: string[], cwd: string) => UiProcess;
 
+/** Tells `travsr ui` to stop when its stdin closes. Older binaries ignore it. */
+export const EXIT_ON_STDIN_EOF_ENV = "TRAVSR_UI_EXIT_ON_STDIN_EOF";
+
+/** The environment `travsr ui` runs with. */
+export function uiEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, NO_COLOR: "1", TERM: "dumb", [EXIT_ON_STDIN_EOF_ENV]: "1" };
+}
+
+// stdin is a pipe this process holds open and never writes to or closes. A
+// crash or force-kill of the extension host skips `deactivate`, so `stop` never
+// runs, but the operating system still closes the pipe, and with
+// EXIT_ON_STDIN_EOF_ENV set `travsr ui` exits on that end of file instead of
+// serving on with nobody left to stop it.
 export const spawnUiProcess: SpawnUi = (binary, args, cwd) =>
   cp.spawn(binary, args, {
     cwd,
-    env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
-    stdio: ["ignore", "pipe", "pipe"],
+    env: uiEnv(),
+    stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
 
