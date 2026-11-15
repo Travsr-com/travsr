@@ -14,6 +14,7 @@ Travsr replaces vector RAG with a deterministic graph. Every function call, impo
 - **Code lens and hover**: inline "N callers" counts on definitions, a dependency list on imports, and a high-blast warning before you edit a high-impact file
 - **Languages, inside Health**: which analyzers are installed on this machine, which are turned on for this repository, what each one still needs, and one click to install, enable for this repository, or disable
 - **Stats panel**: index and daemon health, plus a searchable daemon log with severity filters, a per-day file picker, and optional auto-refresh
+- **Browser view**: `Travsr: Open Graph in Browser` runs `travsr ui` for the active repository and opens its pages in your web browser
 - **Multi-repo**: pick the active repository once when several are open; installs and re-indexes go where you meant them to
 - **MCP integration**: registers the local Travsr MCP server with Claude Desktop, Cursor and Continue, so the same graph answers your agent's questions
 - **Always fresh**: the graph updates on every git commit via hooks, and on save through the daemon's watcher; no stale context
@@ -40,6 +41,8 @@ For full cross-file analysis in languages beyond TypeScript, JavaScript, Python 
 | Command | What it does |
 |---|---|
 | `Travsr: Show Graph` | Interactive graph for the active file or a symbol you name |
+| `Travsr: Open Graph in Browser` | Start `travsr ui` for the active repository and open it in your web browser (needs travsr v1.4.0 or later) |
+| `Travsr: Stop Browser UI` | Stop the `travsr ui` server the extension started (shown while one is running) |
 | `Travsr: Show Callers` | Every call site of the symbol under the cursor |
 | `Travsr: Show Blast Radius` | Everything transitively affected if this file or symbol changes |
 | `Travsr: Show Dependencies` | What the active file imports |
@@ -65,6 +68,7 @@ For full cross-file analysis in languages beyond TypeScript, JavaScript, Python 
 | `travsr.contextTokenBudget` | `2000` | Token budget for "Copy Graph Context for Chat" pulls. |
 | `travsr.suggestSynonyms` | `true` | Offer to record a synonym when the symbol you pick differs from what you typed. |
 | `travsr.blastRiskThreshold` | `20` | Dependent-file count at which the blast-radius code lens escalates to a high-risk warning. |
+| `travsr.ui.port` | `0` | Port for `Travsr: Open Graph in Browser`. `0` picks a free port; set one to keep a stable URL. |
 
 ## Using with Claude / AI Agents
 

@@ -102,6 +102,15 @@
         "icon": "$(type-hierarchy)"
       },
       {
+        "command": "travsr.openBrowserUi",
+        "title": "Travsr: Open Graph in Browser",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "travsr.stopBrowserUi",
+        "title": "Travsr: Stop Browser UI"
+      },
+      {
         "command": "travsr.askSymbol",
         "title": "Travsr: Ask Symbol",
         "icon": "$(search)"
@@ -253,6 +262,11 @@
           "command": "travsr.openContextExplorer",
           "when": "view == travsrGraph",
           "group": "navigation"
+        },
+        {
+          "command": "travsr.openBrowserUi",
+          "when": "view == travsrGraph",
+          "group": "2_travsr@3"
         }
       ],
       "editor/context": [
@@ -270,6 +284,12 @@
           "command": "travsr.copyContextForChat",
           "when": "editorFocus",
           "group": "travsr@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "travsr.stopBrowserUi",
+          "when": "travsr.browserUiRunning"
         }
       ]
     },
@@ -347,6 +367,13 @@
           "default": 20,
           "minimum": 1,
           "description": "Dependent-file count at which the blast-radius code lens escalates to a high-risk warning. When a file has this many or more dependents, the lens reads \"⚠️ high blast: N files; review before editing\" so you see risk before touching a high-impact file."
+        },
+        "travsr.ui.port": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Port for Travsr: Open Graph in Browser, which runs `travsr ui --port <port>`. 0 (the default) lets the system pick a free port, so two windows never collide; set a fixed port to keep a stable URL you can bookmark."
         }
       }
     }

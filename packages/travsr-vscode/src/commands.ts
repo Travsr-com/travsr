@@ -2637,7 +2637,8 @@ function spawnManagedInstall(
   );
 }
 
-/** Register all VSCODE-247 commands. */
+/** Register all VSCODE-247 commands. Returns the repository picker they share,
+ *  for the commands registered elsewhere that act on one repository. */
 export function registerParityCommands(
   client: McpClient,
   context: vscode.ExtensionContext,
@@ -2645,7 +2646,7 @@ export function registerParityCommands(
   // Kept for the caller's sake: the Languages panel used it after an in-panel
   // `init`; the Health panel runs `init` in a terminal, so nothing to hook.
   _onAfterInit?: () => void
-): void {
+): ActiveRepo {
   const activeRepo = new ActiveRepo(context);
   context.subscriptions.push(
     vscode.commands.registerCommand("travsr.selectRepository", () => activeRepo.pick()),
@@ -2662,4 +2663,5 @@ export function registerParityCommands(
       vscode.commands.executeCommand("travsr.showGraphStats")
     )
   );
+  return activeRepo;
 }

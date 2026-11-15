@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`Travsr: Open Graph in Browser` opens the `travsr ui` browser view from the extension (#1060).** The browser UI (#1038) had no entry point in VS Code: you had to know the `travsr ui` command and run it in a terminal. The new command starts `travsr ui` in the active repository (the same pick `Travsr: Select Repository` sets), reads the address the CLI prints and opens it in your browser; it is also in the Travsr graph view's overflow menu. The port defaults to a free one, so two windows never collide; `travsr.ui.port` sets a fixed one. The extension owns the server: running the command again reuses it, choosing another repository replaces it, and `Travsr: Stop Browser UI` or closing the window stops it. A repository with no graph yet gets a warning with an **Index in terminal** button, and a failure to start (a port already in use, a binary that predates `travsr ui`, no binary at all) is shown as a notification with the CLI's own reason. Needs travsr v1.4.0 or later.
+
 ## [0.12.1] - 2026-09-20
 
 Offers to download travsr v1.1.1 when no binary resolves.
