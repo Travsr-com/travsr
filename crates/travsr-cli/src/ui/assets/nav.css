@@ -57,3 +57,108 @@ body.vscode-light .tsr-offline { background: #fdecea; color: #b91c1c; border-col
   .tsr-nav .tsr-brand span { display: none; }
   .tsr-nav select { max-width: 40vw; }
 }
+
+/* Search from any page (Ctrl+K). The overlay hangs off <body>, outside the
+   strip, so it carries the strip's tokens itself. */
+.tsr-nav .tsr-search {
+  display: inline-flex; align-items: center; gap: 8px; margin-right: 6px;
+  padding: 3px 6px 3px 10px; border-radius: 5px; cursor: pointer;
+  background: var(--n-input); color: var(--n-muted); border: 1px solid var(--n-border);
+  font: inherit; font-size: 12px;
+}
+.tsr-nav .tsr-search:hover { color: var(--n-fg); }
+.tsr-nav .tsr-search:focus-visible { outline: 2px solid var(--n-green); outline-offset: 1px; }
+.tsr-nav .tsr-search kbd, .tsr-pal-hint kbd {
+  font: 10px 'Cascadia Code', Consolas, monospace; padding: 1px 5px; border-radius: 4px;
+  border: 1px solid var(--n-border); color: var(--n-subtle);
+}
+.tsr-pal-back {
+  --n-bg: #171717; --n-border: #333333; --n-fg: #f6f1ed; --n-muted: #c8b7ab;
+  --n-subtle: #8f7a6c; --n-input: #262626; --n-green: #86df86; --n-green-deep: #17340e;
+  position: fixed; inset: 0; z-index: 100; background: rgba(0, 0, 0, .5);
+  display: flex; justify-content: center; align-items: flex-start; padding: 12vh 16px 16px;
+  font: 12.5px/1.4 'Segoe UI', -apple-system, system-ui, sans-serif;
+}
+.tsr-pal-back[hidden] { display: none; }
+body.vscode-light .tsr-pal-back {
+  --n-bg: #fbfaf9; --n-border: #e2d4ca; --n-fg: #1a1a1a; --n-muted: #705f54;
+  --n-subtle: #8f7a6c; --n-input: #eee5de; --n-green: #429429; --n-green-deep: #dbf6db;
+  background: rgba(60, 40, 20, .25);
+}
+.tsr-pal {
+  width: 680px; max-width: 100%; max-height: 72vh; display: flex; flex-direction: column;
+  background: var(--n-bg); color: var(--n-fg); border: 1px solid var(--n-border);
+  border-radius: 12px; box-shadow: 0 24px 60px rgba(0, 0, 0, .45); overflow: hidden;
+}
+.tsr-pal-input {
+  margin: 0; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--n-border);
+  background: transparent; color: var(--n-fg); font: 15px 'Segoe UI', system-ui, sans-serif; outline: none;
+}
+.tsr-pal-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
+.tsr-pal-list li[data-row] {
+  display: grid; grid-template-columns: minmax(0, auto) auto minmax(0, 1fr); align-items: baseline;
+  column-gap: 8px; row-gap: 4px; padding: 7px 10px; border-radius: 7px; cursor: pointer;
+}
+.tsr-pal-list li.active { background: var(--n-input); }
+.tsr-pal-group {
+  padding: 8px 10px 4px; font-size: 10px; letter-spacing: .6px; text-transform: uppercase; color: var(--n-subtle);
+}
+.tsr-pal-note { padding: 14px 10px; color: var(--n-muted); }
+.tsr-pal-name { font: 600 12.5px 'Cascadia Code', Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tsr-pal-list li.active .tsr-pal-name { color: var(--n-green); }
+.tsr-pal-kind {
+  font-size: 10px; color: var(--n-green); border: 1px solid var(--n-border);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap;
+}
+.tsr-pal-path {
+  color: var(--n-subtle); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: right;
+}
+.tsr-pal-goes { grid-column: 1 / -1; display: none; flex-wrap: wrap; gap: 4px; }
+.tsr-pal-list li.active .tsr-pal-goes { display: flex; }
+.tsr-pal-go {
+  font: inherit; font-size: 11px; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+  background: transparent; color: var(--n-muted); border: 1px solid var(--n-border);
+}
+.tsr-pal-go:hover { color: var(--n-fg); }
+.tsr-pal-go.chosen { color: var(--n-green); background: var(--n-green-deep); border-color: var(--n-green); }
+.tsr-pal-hint { padding: 7px 14px; border-top: 1px solid var(--n-border); font-size: 11px; color: var(--n-subtle); }
+@media (max-width: 720px) {
+  .tsr-nav .tsr-search kbd { display: none; }
+  .tsr-pal-back { padding-top: 8px; }
+}
+
+/* Graph page right-click menu (#1082 A5). Hangs off <body>, so it carries the
+   strip's tokens like the search overlay. */
+.tsr-gm, .tsr-gm-toast {
+  --n-bg: #171717; --n-border: #333333; --n-fg: #f6f1ed; --n-muted: #c8b7ab;
+  --n-subtle: #8f7a6c; --n-input: #262626; --n-green: #86df86; --n-green-deep: #17340e;
+  font: 12.5px/1.4 'Segoe UI', -apple-system, system-ui, sans-serif;
+}
+body.vscode-light .tsr-gm, body.vscode-light .tsr-gm-toast {
+  --n-bg: #fbfaf9; --n-border: #e2d4ca; --n-fg: #1a1a1a; --n-muted: #705f54;
+  --n-subtle: #8f7a6c; --n-input: #eee5de; --n-green: #429429; --n-green-deep: #dbf6db;
+}
+.tsr-gm {
+  position: fixed; z-index: 90; min-width: 210px; max-width: 340px; padding: 4px;
+  background: var(--n-bg); color: var(--n-fg); border: 1px solid var(--n-border);
+  border-radius: 9px; box-shadow: 0 14px 36px rgba(0, 0, 0, .45);
+}
+.tsr-gm-head {
+  padding: 5px 10px 6px; font: 600 11.5px 'Cascadia Code', Consolas, monospace; color: var(--n-green);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tsr-gm-item {
+  display: block; width: 100%; box-sizing: border-box; text-align: left; cursor: pointer;
+  padding: 5px 10px; border-radius: 6px; border: 0; background: transparent;
+  color: var(--n-fg); font: inherit; text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tsr-gm-item:hover, .tsr-gm-item:focus-visible { background: var(--n-input); outline: none; color: var(--n-green); }
+.tsr-gm-sep { height: 1px; margin: 4px 6px; background: var(--n-border); }
+.tsr-gm-toast {
+  position: fixed; z-index: 95; left: 50%; bottom: 24px; transform: translateX(-50%);
+  padding: 8px 14px; border-radius: 8px; max-width: calc(100vw - 32px);
+  background: var(--n-bg); color: var(--n-fg); border: 1px solid var(--n-green);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .4);
+}

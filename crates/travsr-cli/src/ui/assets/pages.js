@@ -48,6 +48,56 @@
     return link ? '<a href="' + esc(link) + '" title="Open in VS Code">' + esc(text) + "</a>" : esc(text);
   }
 
+  // ── Inline code preview (#1082 A4) ─────────────────────────────────────
+  // A "code" toggle next to a location opens the lines around it in place,
+  // from /api/source (the Graph page's peek). `sym` lets the server find the
+  // line when the page has only a name, as on the Path page.
+  function peekBtn(path, line, sym) {
+    if (!path) return "";
+    return '<button class="peek-btn" type="button" data-peek="' + esc(path) + '"' +
+      (line ? ' data-line="' + Number(line) + '"' : "") +
+      (sym ? ' data-sym="' + esc(sym) + '"' : "") +
+      ' aria-expanded="false" title="Show the code here">code</button>';
+  }
+  async function togglePeek(b) {
+    const open = b.getAttribute("aria-expanded") === "true";
+    if (b._peek) {
+      b._peek.hidden = open;
+      b.setAttribute("aria-expanded", String(!open));
+      return;
+    }
+    const host = b.closest(".p-body, .ctx-item, .ch-sym, li") || b.parentElement;
+    const box = document.createElement("div");
+    box.className = "peek";
+    box.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Loading the code…</p>';
+    host.append(box);
+    b._peek = box;
+    b.setAttribute("aria-expanded", "true");
+    const q = { repo: ui.repo, path: b.dataset.peek };
+    if (b.dataset.line) q.line = b.dataset.line;
+    if (b.dataset.sym) q.symbol = b.dataset.sym;
+    try {
+      const r = await ui.api("/api/source", q);
+      if (!r.lines.length) { box.innerHTML = '<p class="sub">The file is empty.</p>'; return; }
+      const end = r.end_line || r.line;
+      const mark = (no) => no >= r.line && no <= end;
+      const link = ui.editorLink(r.path, r.line);
+      box.innerHTML = '<div class="peek-head"><span>' + esc(r.path) + ":" + r.line + "</span>" +
+        (link ? '<a href="' + esc(link) + '">open in editor</a>' : "") + "</div>" +
+        '<pre class="peek-code">' + r.lines.map((l) =>
+          '<span class="peek-line' + (mark(l.no) ? " def" : "") + '"><span class="peek-no">' + l.no + "</span>" + esc(l.text) + "</span>").join("") + "</pre>";
+    } catch (err) {
+      box.innerHTML = '<p class="sub err">Cannot show the code: ' + esc(err.message) + "</p>";
+    }
+  }
+  page.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-peek]");
+    if (!b) return;
+    e.preventDefault();
+    e.stopPropagation();
+    togglePeek(b);
+  });
+
   function callerLine(l) {
     const m = ROW.exec(l);
     if (!m) return "<li>" + esc(l) + "</li>";
@@ -55,6 +105,9 @@
     return "<li>" + (edge ? '<span class="muted">[' + esc(edge) + "]</span> " : "") +
       '<a href="' + esc(ui.withRepo("/graph", { q: label })) + '" title="Show in the graph">' + esc(label) + "</a>" +
       ' <span class="muted">(' + esc(kind) + ") —</span> " + editorAnchor(path, line ? Number(line) : null, path + (line ? ":" + line : "")) +
+      // A file-level caller has no line to show; anything else can find its
+      // own definition by name when the row carries no line.
+      (line || kind !== "file" ? " " + peekBtn(path, line, kind === "file" ? null : label) : "") +
       (heuristic ? ' <span class="muted" title="matched by name, not resolved by type">~</span>' : "") + "</li>";
   }
 
@@ -492,6 +545,7 @@
             '<span class="s-kind">' + esc(e.kind) + "</span>" +
             '<a class="ctx-name" href="' + esc(ui.withRepo("/graph", { q: e.sig })) + '" title="Show in the graph">' + esc(name) + "</a>" +
             '<span class="ctx-where">' + editorAnchor(e.path, e.line, where) + "</span>" +
+            (e.snippet ? "" : peekBtn(e.path, e.line, e.sig)) +
             (e.via ? '<span class="ctx-via">' + esc(e.via) + "</span>" : "") + "</div>" +
             (e.snippet ? '<pre class="ctx-code">' + esc(e.snippet) + "</pre>" : "") + "</li>";
         }
@@ -636,6 +690,10 @@
       Object.keys(TCMDS).map((c) => '<button class="pill-btn" type="button" role="tab" data-tab="' + c + '">' + esc(c) + "</button>").join("") + "</div>" +
       '<p class="sub t-help" id="t-help"></p>' +
       Object.entries(TCMDS).map(([c, s]) => terminalForm(c, s)).join("") +
+      '<div class="t-logbar" id="t-logbar" hidden>' +
+      '<span class="lookup-box t-filter-box"><input id="t-filter" type="search" placeholder="Filter output lines" aria-label="Filter output lines" autocomplete="off" spellcheck="false" maxlength="200"></span>' +
+      '<span class="muted t-filter-count" id="t-filter-count"></span>' +
+      '<button class="link-btn t-clear" type="button" data-clear-log="1" title="Remove every entry from this tab\'s log">clear log</button></div>' +
       '<div id="t-log" class="t-log"></div>';
 
     const forms = Object.fromEntries(Object.keys(TCMDS).map((c) => [c, document.getElementById("t-" + c)]));
@@ -671,10 +729,71 @@
       return Object.assign(out, extra);
     }
 
-    async function run(cmd, extra) {
-      const args = fields(cmd, extra);
+    // ── The log (#1082 A6): kept in sessionStorage for this tab and repo, so
+    // a reload or a trip to another page brings it back. Newest first.
+    const LOG_KEY = "travsr.ui.tlog." + (ui.repo || "");
+    const LOG_MAX = 20;
+    const STORED_OUT_MAX = 200 * 1024; // per stream, per entry
+    let saved = [];
+    try { saved = JSON.parse(sessionStorage.getItem(LOG_KEY) || "[]"); } catch (_) { saved = []; }
+    if (!Array.isArray(saved)) saved = [];
+    let nextId = saved.reduce((m, s) => Math.max(m, s.id || 0), 0) + 1;
+    function persist() {
+      const keep = saved.slice(0, LOG_MAX);
+      for (let n = keep.length; n >= 0; n--) {
+        try { sessionStorage.setItem(LOG_KEY, JSON.stringify(keep.slice(0, n))); saved = keep.slice(0, n); return; } catch (_) { /* full: drop the oldest */ }
+      }
+    }
+    const cut = (s) => (s.length > STORED_OUT_MAX ? s.slice(0, STORED_OUT_MAX) : s);
+
+    // Each output line its own block, so the filter can hide lines.
+    const lines = (text) => text.split("\n").map((l) => '<span class="t-line">' + linkify(l) + "</span>").join("");
+
+    function render(entry, rec) {
+      entry.dataset.id = String(rec.id);
+      // What rerun needs lives on the entry itself: the stored log keeps only
+      // the last LOG_MAX results (fewer when storage is full), but the page
+      // keeps showing older ones, whose rerun must still work.
+      entry.dataset.args = JSON.stringify(rec.args || {});
+      entry.dataset.cmd = rec.cmd;
+      if (rec.error) {
+        entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(rec.cmd) + '</span><span class="t-meta bad">not run</span>' +
+          '<span class="t-acts"><button class="link-btn" type="button" data-rerun="1">rerun</button>' +
+          '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
+          '<div class="diag error"><div class="diag-t">' + esc(rec.error) + "</div></div>";
+        return;
+      }
+      const ok = rec.code === 0;
+      const secs = rec.millis / 1000;
+      const out = rec.stdout.replace(/\s+$/, "");
+      const notes = rec.stderr.replace(/\s+$/, "");
+      entry.innerHTML =
+        '<div class="t-head"><span class="t-cmd">$ ' + esc(rec.command) + "</span>" +
+        '<span class="t-meta ' + (ok ? "" : "bad") + '">' + (rec.code == null ? "timed out" : "exit " + rec.code) + " · " + (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + " s" +
+        (rec.at ? " · " + new Date(rec.at).toLocaleTimeString() : "") + "</span>" +
+        '<span class="t-acts"><button class="link-btn" type="button" data-rerun="1" title="Run the same command again">rerun</button>' +
+        '<button class="link-btn" type="button" data-copy-cmd="1">copy command</button>' +
+        '<button class="link-btn" type="button" data-copy-out="1">copy output</button>' +
+        '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
+        (notes ? '<pre class="t-out t-err">' + lines(notes) + "</pre>" : "") +
+        '<pre class="t-out">' + (out ? lines(out) : '<span class="muted">(no output)</span>') + "</pre>" +
+        '<div class="t-hidden-note" hidden></div>' +
+        (rec.truncated ? '<div class="note-box">Output cut at 2 MB. Run the command in a shell for all of it.</div>' : "") +
+        (rec.storedCut ? '<div class="note-box">Restored from this tab\'s log, which keeps the first 200 KB of each output. Rerun for all of it.</div>' : "");
+      entry.dataset.command = rec.command;
+      entry.dataset.output = (notes ? notes + "\n" : "") + out;
+    }
+
+    function newEntry() {
       const entry = document.createElement("section");
       entry.className = "t-entry";
+      return entry;
+    }
+
+    async function run(cmd, extra, exactArgs) {
+      const args = exactArgs || fields(cmd, extra);
+      if (!exactArgs) remember(cmd);
+      const entry = newEntry();
       entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(cmd) + ' <span class="spinner">⟳</span></span>' +
         '<span class="t-meta">running <span class="t-time">0 s</span></span></div>';
       log.prepend(entry);
@@ -683,43 +802,141 @@
         const t = entry.querySelector(".t-time");
         if (t) t.textContent = Math.round((Date.now() - started) / 1000) + " s";
       }, 1000);
+      const rec = { id: nextId++, cmd, args, at: Date.now() };
       try {
         const r = await ui.api("/api/run/" + cmd, Object.assign({ repo: ui.repo }, args));
-        const ok = r.code === 0;
-        const secs = r.millis / 1000;
-        const out = r.stdout.replace(/\s+$/, "");
-        const notes = r.stderr.replace(/\s+$/, "");
-        entry.innerHTML =
-          '<div class="t-head"><span class="t-cmd">$ ' + esc(r.command) + "</span>" +
-          '<span class="t-meta ' + (ok ? "" : "bad") + '">' + (r.code == null ? "timed out" : "exit " + r.code) + " · " + (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + " s</span>" +
-          '<span class="t-acts"><button class="link-btn" type="button" data-copy-cmd="1">copy command</button>' +
-          '<button class="link-btn" type="button" data-copy-out="1">copy output</button>' +
-          '<button class="link-btn" type="button" data-close="1" title="Remove from the log">✕</button></span></div>' +
-          (notes ? '<pre class="t-out t-err">' + notes.split("\n").map(linkify).join("\n") + "</pre>" : "") +
-          '<pre class="t-out">' + (out ? out.split("\n").map(linkify).join("\n") : '<span class="muted">(no output)</span>') + "</pre>" +
-          (r.truncated ? '<div class="note-box">Output cut at 2 MB. Run the command in a shell for all of it.</div>' : "");
-        entry.dataset.command = r.command;
-        entry.dataset.output = (notes ? notes + "\n" : "") + out;
+        Object.assign(rec, { command: r.command, code: r.code, millis: r.millis, stdout: r.stdout, stderr: r.stderr, truncated: !!r.truncated });
       } catch (e) {
-        entry.innerHTML = '<div class="t-head"><span class="t-cmd">$ travsr ' + esc(cmd) + '</span><span class="t-meta bad">not run</span>' +
-          '<span class="t-acts"><button class="link-btn" type="button" data-close="1">✕</button></span></div>' +
-          '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+        rec.error = e.message;
       } finally {
         clearInterval(tick);
       }
+      render(entry, rec);
+      applyFilter();
+      const stored = Object.assign({}, rec);
+      if (!rec.error) {
+        stored.stdout = cut(rec.stdout);
+        stored.stderr = cut(rec.stderr);
+        stored.storedCut = stored.stdout.length < rec.stdout.length || stored.stderr.length < rec.stderr.length;
+      }
+      saved.unshift(stored);
+      persist();
+      updateLogBar();
     }
 
     for (const f of Object.values(forms)) {
       f.addEventListener("submit", (e) => { e.preventDefault(); run(f.dataset.cmd); });
     }
 
+    // ── Per-field history: Up and Down in a text box step through what was
+    // run from it before, as in a shell. Only while its suggestions are shut.
+    const HIST_MAX = 30;
+    const histKey = (cmd, k) => "thist." + cmd + "." + k;
+    function history(cmd, k) {
+      try { const h = JSON.parse(ui.pref(histKey(cmd, k)) || "[]"); return Array.isArray(h) ? h : []; } catch (_) { return []; }
+    }
+    function remember(cmd) {
+      for (const f of TCMDS[cmd].fields) {
+        if (f.check || f.opts) continue;
+        const input = el(cmd, f.k);
+        const v = input.disabled ? "" : input.value.trim();
+        if (!v) continue;
+        const h = history(cmd, f.k).filter((x) => x !== v);
+        h.push(v);
+        ui.pref(histKey(cmd, f.k), JSON.stringify(h.slice(-HIST_MAX)));
+        input._hist = null;
+      }
+    }
+    for (const [cmd, spec] of Object.entries(TCMDS)) {
+      for (const f of spec.fields.filter((x) => !x.check && !x.opts)) {
+        const input = el(cmd, f.k);
+        input.addEventListener("input", () => { input._hist = null; });
+        input.addEventListener("keydown", (e) => {
+          if ((e.key !== "ArrowUp" && e.key !== "ArrowDown") || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+          const list = document.getElementById(input.getAttribute("aria-controls") || "");
+          if (list && !list.hidden) return; // the suggestions own the arrows
+          if (!input._hist) input._hist = { items: history(cmd, f.k), at: -1, draft: input.value };
+          const s = input._hist;
+          if (!s.items.length) return;
+          e.preventDefault();
+          if (e.key === "ArrowUp") s.at = s.at < 0 ? s.items.length - 1 : Math.max(0, s.at - 1);
+          else if (s.at >= 0) s.at = s.at + 1 >= s.items.length ? -1 : s.at + 1;
+          input.value = s.at < 0 ? s.draft : s.items[s.at];
+          const end = input.value.length;
+          input.setSelectionRange(end, end);
+        });
+      }
+    }
+
+    // ── Output filter: show only the lines containing the text, in every
+    // entry; an entry with no match collapses to its header.
+    const filterBox = document.getElementById("t-filter");
+    const logBar = document.getElementById("t-logbar");
+    function applyFilter() {
+      const q = filterBox.value.trim().toLowerCase();
+      let shown = 0;
+      let total = 0;
+      for (const entry of log.querySelectorAll(".t-entry")) {
+        let hit = 0;
+        let all = 0;
+        for (const line of entry.querySelectorAll(".t-line")) {
+          const keep = !q || line.textContent.toLowerCase().includes(q);
+          line.hidden = !keep;
+          all++;
+          if (keep) hit++;
+        }
+        shown += hit;
+        total += all;
+        entry.classList.toggle("t-nomatch", !!q && all > 0 && hit === 0);
+        const note = entry.querySelector(".t-hidden-note");
+        if (note) {
+          note.hidden = !q || hit === all;
+          note.textContent = hit + " of " + all + " lines match “" + filterBox.value.trim() + "”";
+        }
+      }
+      document.getElementById("t-filter-count").textContent = q ? shown + " of " + total + " lines" : "";
+    }
+    filterBox.addEventListener("input", applyFilter);
+    filterBox.addEventListener("keydown", (e) => { if (e.key === "Escape") { filterBox.value = ""; applyFilter(); } });
+    function updateLogBar() { logBar.hidden = !log.querySelector(".t-entry"); }
+
+    // Bring back this tab's log, oldest first so the newest ends on top.
+    for (const rec of saved.slice().reverse()) {
+      const entry = newEntry();
+      render(entry, rec);
+      log.prepend(entry);
+    }
+    updateLogBar();
+
     page.addEventListener("click", async (e) => {
-      const t = e.target.closest("[data-tab],[data-examples],[data-copy-cmd],[data-copy-out],[data-close]");
+      const t = e.target.closest("[data-tab],[data-examples],[data-copy-cmd],[data-copy-out],[data-close],[data-rerun],[data-clear-log]");
       if (!t) return;
       if (t.dataset.tab) { tab(t.dataset.tab); return; }
       if (t.dataset.examples) { run("ask", { examples: "1" }); return; }
+      if (t.dataset.clearLog) {
+        log.replaceChildren();
+        saved = [];
+        persist();
+        updateLogBar();
+        applyFilter();
+        return;
+      }
       const entry = t.closest(".t-entry");
-      if (t.dataset.close) { entry.remove(); return; }
+      const id = Number(entry.dataset.id);
+      if (t.dataset.rerun) {
+        let args = null;
+        try { args = JSON.parse(entry.dataset.args || "null"); } catch (_) { args = null; }
+        if (entry.dataset.cmd && TCMDS[entry.dataset.cmd] && args) run(entry.dataset.cmd, null, args);
+        return;
+      }
+      if (t.dataset.close) {
+        entry.remove();
+        saved = saved.filter((s) => s.id !== id);
+        persist();
+        updateLogBar();
+        applyFilter();
+        return;
+      }
       const text = t.dataset.copyCmd ? entry.dataset.command : entry.dataset.output;
       const label = t.textContent;
       try { await navigator.clipboard.writeText(text || ""); t.textContent = "copied"; } catch (_) { t.textContent = "copy failed"; }
@@ -770,7 +987,7 @@
         '<span class="p-num">' + (i + 1) + "</span>" +
         '<span class="p-body"><span class="s-kind">' + esc(s.kind) + "</span> " +
         '<a class="p-name" href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '" title="Show in the graph">' + esc(name) + "</a>" +
-        '<span class="p-where">' + editorAnchor(s.path, null, s.path) + "</span></span></li>";
+        '<span class="p-where">' + editorAnchor(s.path, null, s.path) + "</span>" + peekBtn(s.path, null, s.sig) + "</span></li>";
     }
 
     async function run() {
@@ -1020,7 +1237,162 @@
     load();
   }
 
-  const VIEWS = { "/architecture": architectureView, "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
+  // ── Changes ────────────────────────────────────────────────────────────
+  // What the uncommitted work touches (/api/changes, changes.rs): the files
+  // changed since the commit the index describes, the indexed symbols each
+  // edit overlaps, their callers, each file's blast radius on demand, and the
+  // architecture rules the change would break (invariants over every edge,
+  // the live overlay of uncommitted edits included).
+  function changesView() {
+    document.title = "Travsr: Changes";
+    page.innerHTML =
+      '<div class="phead"><div><h2>Changes</h2><p class="sub" style="margin:2px 0 0">What your uncommitted work touches: the symbols it edits, who calls them, what each file reaches, and which architecture rules it would break.</p></div>' +
+      '<div class="phead-a"><button class="btn" id="c-refresh">Refresh</button></div></div><div id="out"></div>';
+    const short = (sha) => (sha || "").slice(0, 8);
+    const nameOf = (sig) => (sig.includes(":") ? sig.slice(sig.indexOf(":") + 1) : sig);
+    let rules = null;
+    let data = null;
+
+    async function loadRules() {
+      // Every edge, so an uncommitted edit's live edges count (RFC-027).
+      try {
+        const r = await ui.api("/api/run/invariants", { repo: ui.repo, provenance: "" });
+        const lines = (r.stdout || "").split("\n");
+        const violated = [];
+        for (let i = 0; i < lines.length; i++) {
+          const m = /^VIOLATED\s+(.+)$/.exec(lines[i]);
+          if (!m) continue;
+          const detail = [];
+          for (let j = i + 1; j < lines.length && /^\s+\S/.test(lines[j]); j++) detail.push(lines[j].trim());
+          violated.push({ rule: m[1].trim(), detail });
+        }
+        const held = lines.filter((l) => /^holds\s/.test(l)).length;
+        const noFile = /no such file|not found|could not read the invariants/i.test(r.stderr + r.stdout) && !held && !violated.length;
+        rules = { violated, held, noFile, error: r.code !== 0 && !violated.length && !held ? (r.stderr || r.stdout).trim().split("\n").pop() : "" };
+      } catch (e) {
+        rules = { violated: [], held: 0, noFile: false, error: e.message };
+      }
+      // Only the rules card and box: re-rendering the whole page here wiped
+      // any code preview or blast radius the reader had opened meanwhile, and
+      // reopened collapsed files (review of #1098).
+      const cardSlot = document.getElementById("ch-rulecard");
+      const boxSlot = document.getElementById("ch-rules");
+      if (cardSlot && boxSlot) {
+        cardSlot.innerHTML = ruleCardHtml();
+        boxSlot.innerHTML = rulesBoxHtml();
+      } else {
+        render();
+      }
+    }
+
+    const card = (k, v, cls, note) => '<div class="card' + (cls ? " " + cls : "") + '"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + "</div>" + (note ? '<div class="s">' + esc(note) + "</div>" : "") + "</div>";
+    function ruleCardHtml() {
+      return rules === null ? card("Rules broken", "…", "", "checking")
+        : rules.noFile ? card("Rules broken", "–", "", "no architecture-invariants.json")
+        : rules.error ? card("Rules broken", "?", "warn", "could not check")
+        : card("Rules broken", String(rules.violated.length), rules.violated.length ? "bad" : "", rules.held + rules.violated.length + " rules checked");
+    }
+    function rulesBoxHtml() {
+      if (!rules || !rules.violated.length) return "";
+      return '<div class="diag error ch-rules"><div class="diag-t">Architecture rules this state breaks</div>' +
+        rules.violated.map((v) => '<div class="ch-rule"><strong>' + esc(v.rule) + "</strong>" + v.detail.map((d) => '<div class="mono muted">' + esc(d) + "</div>").join("") + "</div>").join("") +
+        '<div class="diag-d">Checked over every edge, uncommitted ones included. A rule that was already broken before your change shows here too; see the Architecture page.</div></div>';
+    }
+
+    async function load() {
+      const out = document.getElementById("out");
+      if (!data) out.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Reading the working tree…</p>';
+      try {
+        data = await ui.api("/api/changes", { repo: ui.repo });
+        render();
+      } catch (e) {
+        out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
+      }
+      rules = null;
+      loadRules();
+    }
+    refreshView = load;
+
+    function render() {
+      if (!data) return;
+      const out = document.getElementById("out");
+      const files = data.files;
+      const syms = files.reduce((n, f) => n + f.symbols.length, 0);
+      const callerSet = new Set();
+      for (const f of files) for (const s of f.symbols) for (const c of s.callers) callerSet.add(c.sig + "@" + c.path);
+      let html = "";
+      if (data.base && data.head && data.base !== data.head) {
+        html += '<div class="note-box">The index describes <code>' + esc(short(data.base)) + "</code> and HEAD is <code>" + esc(short(data.head)) +
+          "</code>, so commits made since the last index are included here as well.</div>";
+      }
+      if (data.diff_incomplete) {
+        html += '<div class="note-box">The line-by-line diff was too large to read in time, so the changed files are listed but their edits are not mapped to symbols.</div>';
+      }
+      html += '<div class="cards a-cards">' +
+        card("Files changed", String(files.length) + (data.truncated ? "+" : ""), "", "since " + short(data.base)) +
+        card("Symbols touched", String(syms)) +
+        card("Callers affected", String(callerSet.size), "", "distinct calling symbols") +
+        '<div id="ch-rulecard" class="ch-slot">' + ruleCardHtml() + "</div></div>";
+      html += '<div id="ch-rules">' + rulesBoxHtml() + "</div>";
+      if (!files.length) {
+        html += '<div class="note-box">No uncommitted changes since <code>' + esc(short(data.base)) + "</code>.</div>";
+        out.innerHTML = html;
+        return;
+      }
+      for (const f of files) {
+        const callers = f.symbols.reduce((n, s) => n + s.callers_total, 0);
+        html += '<details class="hsec ch-file" open data-path="' + esc(f.path) + '"><summary>' +
+          '<span class="ch-status ' + esc(f.status) + '">' + esc(f.status) + "</span>" +
+          '<span class="ch-path">' + editorAnchor(f.path, null, f.path) + "</span>" +
+          '<span class="muted ch-meta">' + (f.indexed ? f.symbols.length + " symbol" + (f.symbols.length === 1 ? "" : "s") + " · " + callers + " caller" + (callers === 1 ? "" : "s") : "not in the index yet") + "</span>" +
+          '<span class="ch-acts">' +
+          (f.indexed && f.status !== "deleted" ? '<button class="link-btn" type="button" data-blast="' + esc(f.path) + '">blast radius</button>' : "") +
+          (f.indexed ? '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: f.path })) + '">graph</a>' : "") +
+          "</span></summary><div class=\"ch-body\">";
+        if (f.index_between) {
+          html += '<p class="sub">The index holds an earlier save of this file (the daemon indexed it, then stopped), so these symbols are matched with today\'s line numbers and may be slightly off. Reindex for an exact list.</p>';
+        }
+        if (!f.indexed) {
+          html += '<p class="sub">' + (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).</p>";
+        } else if (!f.symbols.length) {
+          html += '<p class="sub">' + (f.hunks ? "The edit touches no indexed symbol (comments, imports or whitespace)." : "No line changes against the indexed commit.") + "</p>";
+        }
+        for (const s of f.symbols) {
+          html += '<div class="ch-sym"><div class="ch-sym-row"><span class="s-kind">' + esc(s.kind) + "</span>" +
+            '<a class="ch-name" href="' + esc(ui.withRepo("/graph", { q: s.sig })) + '">' + esc(nameOf(s.sig)) + "</a>" +
+            '<span class="muted">lines ' + s.line + (s.end_line !== s.line ? "–" + s.end_line : "") + "</span>" +
+            (f.status !== "deleted" ? peekBtn(f.path, s.line, s.sig) : "") +
+            '<span class="ch-count' + (s.callers_total ? " has" : "") + '">' + s.callers_total + " caller" + (s.callers_total === 1 ? "" : "s") + "</span></div>" +
+            (s.callers.length ? '<ul class="ch-callers">' + s.callers.map((c) => "<li>" + '<a href="' + esc(ui.withRepo("/graph", { q: c.sig })) + '">' + esc(c.sig) + "</a> " +
+              '<span class="muted">' + editorAnchor(c.path, c.line, c.path + ":" + c.line) + "</span> " + peekBtn(c.path, c.line, c.sig) + "</li>").join("") +
+              (s.callers_total > s.callers.length ? '<li class="muted">and ' + (s.callers_total - s.callers.length) + " more</li>" : "") + "</ul>" : "") +
+            "</div>";
+        }
+        html += '<div class="ch-blast" hidden></div></div></details>';
+      }
+      out.innerHTML = html;
+    }
+
+    page.addEventListener("click", async (e) => {
+      if (e.target.id === "c-refresh") { load(); return; }
+      const b = e.target.closest("[data-blast]");
+      if (!b) return;
+      e.preventDefault();
+      const box = b.closest(".ch-file").querySelector(".ch-blast");
+      box.hidden = false;
+      box.innerHTML = '<p class="sub"><span class="spinner">⟳</span> Blast radius…</p>';
+      try {
+        const files = ui.parseEnvelope(await ui.tool("get_blast_radius", { file: b.dataset.blast, analysis: "tree-sitter" }));
+        box.innerHTML = '<div class="ch-blast-h">Blast radius <span class="badge dim">' + files.length + " file" + (files.length === 1 ? "" : "s") + "</span></div>" +
+          (files.length ? '<ul class="results">' + files.map((p) => "<li>" + editorAnchor(p, null, p) + "</li>").join("") + "</ul>" : '<p class="sub">Nothing else reaches this file.</p>');
+      } catch (err) {
+        box.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(err.message) + "</div></div>";
+      }
+    });
+    load();
+  }
+
+  const VIEWS = { "/architecture": architectureView, "/changes": changesView, "/callers": callers, "/dependencies": dependencies, "/blast": blast, "/path": pathView, "/context": contextView, "/terminal": terminalView, "/repos": repos };
 
   (async function main() {
     const path = location.pathname.replace(/\/+$/, "");

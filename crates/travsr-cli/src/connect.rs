@@ -70,12 +70,55 @@ pub struct Connected {
 
 /// `connect --print --json`: each AI tool found for `repo` and whether it
 /// connects by itself (`automatic`) or needs a step of the user's own.
+///
+/// Each entry also carries `connected` (#1082 A7, `travsr ui`'s first-run
+/// guide): for a tool `connect` wires by itself, whether every config file it
+/// would write the server into already has a `travsr` entry under that file's
+/// server key (`mcpServers`, `servers`, `mcp`, ...); `null` for a
+/// tool that needs the user's own step, which nothing on disk records.
 pub fn found_tools_json(repo: &Path) -> Value {
-    tools_json(&found_tools(
-        repo,
-        dirs::home_dir().as_deref(),
-        &McpCommand::resolve(),
-    ))
+    let home = dirs::home_dir();
+    let cmd = McpCommand::resolve();
+    let found = found_tools(repo, home.as_deref(), &cmd);
+    let mut out = tools_json(&found);
+    if let Some(list) = out.as_array_mut() {
+        for (entry, (id, by_itself)) in list.iter_mut().zip(&found) {
+            let connected = if *by_itself {
+                Tool::ALL.iter().find(|t| t.id() == *id).map(|tool| {
+                    let targets: Vec<(PathBuf, &'static str)> = tool
+                        .plan(repo, &cmd, None)
+                        .into_iter()
+                        .filter_map(|p| p.content.server_key().map(|key| (p.path, key)))
+                        .collect();
+                    server_written(&targets)
+                })
+            } else {
+                None
+            };
+            entry["connected"] = json!(connected);
+        }
+    }
+    out
+}
+
+/// Whether each `(file, server key)` already holds a `travsr` server: the
+/// file parses (comments and trailing commas allowed) and `<key>.travsr` is
+/// an object. Matching the text `"travsr"` anywhere read another server whose
+/// command is `travsr` as connected (review of #1098). An empty list is not
+/// connected: there is nothing the tool would read.
+fn server_written(targets: &[(PathBuf, &str)]) -> bool {
+    !targets.is_empty()
+        && targets.iter().all(|(path, key)| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| crate::jsonc::mask(&text))
+                .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+                .is_some_and(|v| {
+                    v.get(*key)
+                        .and_then(|s| s.get("travsr"))
+                        .is_some_and(Value::is_object)
+                })
+        })
 }
 
 fn tools_json(found: &[(&'static str, bool)]) -> Value {
@@ -587,6 +630,15 @@ enum Content {
 }
 
 impl Content {
+    /// The key whose `travsr` entry this writes, for a server definition.
+    fn server_key(&self) -> Option<&'static str> {
+        match self {
+            Content::JsonServer { top_key, .. } => Some(top_key),
+            Content::JsoncServer { .. } => Some("mcp"),
+            _ => None,
+        }
+    }
+
     /// Whether this writes the travsr MCP server definition.
     fn carries_server(&self) -> bool {
         matches!(
@@ -2298,6 +2350,58 @@ mod tests {
                 {"tool": "codex", "name": "Codex", "setup": "one_step"},
             ])
         );
+    }
+
+    #[test]
+    fn a_tool_is_connected_once_every_server_file_has_a_travsr_entry() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.jsonc");
+        let one = |p: &PathBuf| vec![(p.clone(), "mcpServers")];
+        assert!(!server_written(&[]));
+        assert!(!server_written(&one(&a)), "missing file");
+        std::fs::write(&a, r#"{"mcpServers":{"other":{}}}"#).unwrap();
+        assert!(!server_written(&one(&a)), "another server only");
+        // Review of #1098: another server whose command is travsr is not ours.
+        std::fs::write(&a, r#"{"mcpServers":{"mine":{"command":"travsr"}}}"#).unwrap();
+        assert!(!server_written(&one(&a)), "\"travsr\" as a value only");
+        std::fs::write(&a, r#"{"mcpServers":{"travsr":{"command":"travsr"}}}"#).unwrap();
+        assert!(server_written(&one(&a)));
+        let both = vec![(a.clone(), "mcpServers"), (b.clone(), "mcp")];
+        assert!(!server_written(&both), "one of two missing");
+        // JSONC, as OpenCode writes it: comments and a trailing comma.
+        std::fs::write(
+            &b,
+            "{
+  // ours
+  \"mcp\": { \"travsr\": { \"type\": \"local\" }, },
+}",
+        )
+        .unwrap();
+        assert!(server_written(&both));
+        assert!(!server_written(&[(b, "mcpServers")]), "wrong key");
+    }
+
+    /// The real repo-level shape: a Claude Code project before and after
+    /// `connect` writes its `.mcp.json`.
+    #[test]
+    fn found_tools_json_reports_connected_for_claude_code() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+        let cmd = McpCommand::resolve();
+        let targets: Vec<(PathBuf, &'static str)> = Tool::ClaudeCode
+            .plan(repo, &cmd, None)
+            .into_iter()
+            .filter_map(|p| p.content.server_key().map(|k| (p.path, k)))
+            .collect();
+        assert_eq!(targets, vec![(repo.join(".mcp.json"), "mcpServers")]);
+        assert!(!server_written(&targets));
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{"mcpServers":{"travsr":{"command":"travsr","args":["mcp","--stdio"]}}}"#,
+        )
+        .unwrap();
+        assert!(server_written(&targets));
     }
 
     #[test]

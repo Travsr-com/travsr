@@ -2831,6 +2831,116 @@ impl ClassHierarchy {
     }
 }
 
+/// The component a repo-relative path belongs to (#1082 B7): the first two
+/// segments under a conventional container folder (`crates/travsr-cli`,
+/// `packages/travsr-vscode`, `apps/web`, ...), otherwise the first segment
+/// (`src`, `lib`), and "" for a file at the root.
+fn component_of(path: &str) -> &str {
+    const CONTAINERS: &[&str] = &[
+        "crates",
+        "packages",
+        "apps",
+        "libs",
+        "services",
+        "modules",
+        "plugins",
+        "extensions",
+    ];
+    let path = path.trim_start_matches("./");
+    let mut seg = path.match_indices('/').map(|(i, _)| i);
+    let Some(first) = seg.next() else {
+        return "";
+    };
+    if CONTAINERS.contains(&&path[..first]) {
+        if let Some(second) = seg.next() {
+            return &path[..second];
+        }
+    }
+    &path[..first]
+}
+
+/// Which components a JS/TS file imports by package name (#1082 B7), so the
+/// cross-component gate keeps a real monorepo call made through
+/// `import { x } from "@acme/utils"`, which has no file-to-file edge.
+#[derive(Default)]
+struct PackageImports {
+    /// Caller file -> the package names it imports (non-relative specifiers,
+    /// reduced to the package: `@acme/utils/sub` -> `@acme/utils`).
+    by_file: std::collections::HashMap<String, Vec<String>>,
+    /// Component -> its `package.json` `name`, when it has one.
+    names: std::collections::HashMap<String, Option<String>>,
+}
+
+impl PackageImports {
+    fn imports_component(&mut self, store: &SqliteStore, caller: &str, component: &str) -> bool {
+        if component.is_empty() {
+            return false;
+        }
+        let packages = self
+            .by_file
+            .entry(caller.to_string())
+            .or_insert_with(|| {
+                store
+                    .nodes_at_path(caller)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| n.kind == "import")
+                    .filter_map(|n| {
+                        let spec = n.vname.signature.strip_prefix("import:")?;
+                        package_of_specifier(spec).map(str::to_string)
+                    })
+                    .collect()
+            })
+            .clone();
+        if packages.is_empty() {
+            return false;
+        }
+        let name = self
+            .names
+            .entry(component.to_string())
+            .or_insert_with(|| {
+                let file = store
+                    .repo_root_from_db_path()?
+                    .join(component)
+                    .join("package.json");
+                let json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()?;
+                json.get("name")?.as_str().map(str::to_string)
+            })
+            .clone();
+        // A component with a package.json name matches that name exactly; the
+        // folder-name fallback is only for one without (review of #1098:
+        // otherwise any import of `react` matched any folder named `react`).
+        // Read at resolve time like every other input here, so a renamed
+        // package is picked up when its callers are next re-indexed.
+        match name.as_deref() {
+            Some(name) => packages.iter().any(|p| p == name),
+            None => {
+                let folder = component.rsplit('/').next().unwrap_or(component);
+                packages
+                    .iter()
+                    .any(|p| p.rsplit('/').next() == Some(folder))
+            }
+        }
+    }
+}
+
+/// The package a module specifier names, or `None` for a relative or absolute
+/// path: `@acme/utils/sub` -> `@acme/utils`, `lodash/fp` -> `lodash`.
+fn package_of_specifier(spec: &str) -> Option<&str> {
+    let spec = spec.trim_matches(|c| c == '"' || c == '\'');
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') {
+        return None;
+    }
+    let mut ends = spec.match_indices('/').map(|(i, _)| i);
+    let end = if spec.starts_with('@') {
+        ends.nth(1)
+    } else {
+        ends.next()
+    };
+    Some(end.map_or(spec, |i| &spec[..i]))
+}
+
 /// #810: narrow same-named bare-call candidates to the one the caller means:
 /// (1) a definition in the caller's own file, else (2) one in a file the caller
 /// imports (`depends → import → resolves-to → file`). Only ever narrows; an
@@ -3125,6 +3235,9 @@ fn resolve_unresolved_calls(
     // #810: (caller file, imported file) pairs, for scoping duplicated bare
     // names. Loaded on the first such call only.
     let mut imported_files: Option<std::collections::HashSet<(String, String)>> = None;
+    // #1082 B7: package-name imports, read lazily per caller file and per
+    // component, for the cross-component gate below.
+    let mut package_imports = PackageImports::default();
 
     // #836: inherited-method resolution. `self.method()` recovers its receiver
     // as the enclosing class, so a method defined on a base class has no
@@ -3449,6 +3562,34 @@ fn resolve_unresolved_calls(
         // Only emit a RefCall when the match is unambiguous (exactly one candidate).
         if u.hint_crate.is_none() && filtered.len() != 1 {
             continue;
+        }
+        // #1082 B7: unique is not enough for a JS/TS bare call. ES modules have
+        // no implicit cross-file scope and a plain script shares globals only
+        // with the scripts of its own page, so a lone same-named function in
+        // another component the caller does not import is a name collision.
+        // Resolving it once invented a crates/travsr-cli <-> packages/travsr-vscode
+        // dependency cycle; abstain instead.
+        if bare_fn && u.hint_crate.is_none() && caller_lang == "typescript" {
+            let (_, callee_path, _) = filtered[0];
+            let imported_files = imported_files.get_or_insert_with(|| {
+                store
+                    .file_import_pairs("")
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("resolve_unresolved_calls: import pair lookup failed: {e}");
+                        Vec::new()
+                    })
+                    .into_iter()
+                    .collect()
+            });
+            if !caller_path.is_empty()
+                && component_of(callee_path) != component_of(caller_path)
+                && !imported_files.contains(&(caller_path.to_string(), callee_path.to_string()))
+                // A monorepo reaches another package by name
+                // (`import { x } from "@acme/utils"`), which has no file edge.
+                && !package_imports.imports_component(store, caller_path, component_of(callee_path))
+            {
+                continue;
+            }
         }
         for (dst, path, _lang) in filtered {
             // #521 F1/F2: never emit an edge the caller's own crate could not
@@ -9252,6 +9393,110 @@ mod tests {
         store.put_node(&other).unwrap();
         let (edges, _) = resolve_unresolved_calls(&store, &[call(other.id)], &[], &[], &none);
         assert!(edges.is_empty(), "{edges:?}");
+    }
+
+    /// #1082 B7: a JS/TS bare call whose only candidate lives in another
+    /// component it does not import is a name collision, not a call. The
+    /// same unique match inside the caller's own component still resolves,
+    /// and so does a Rust call (crate reachability decides those).
+    #[test]
+    fn lone_cross_component_ts_match_is_abstained_on() {
+        use travsr_core::{Node, VName};
+        assert_eq!(
+            component_of("crates/travsr-cli/src/ui/assets/pages.js"),
+            "crates/travsr-cli"
+        );
+        assert_eq!(
+            component_of("packages/travsr-vscode/src/commands.ts"),
+            "packages/travsr-vscode"
+        );
+        assert_eq!(component_of("src/a/b.ts"), "src");
+        assert_eq!(component_of("main.ts"), "");
+
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ui = Node::new(
+            VName::new(
+                "",
+                "",
+                "crates/travsr-cli/src/ui/assets/pages.js",
+                "typescript",
+                "fn:render",
+            ),
+            "function",
+        );
+        let ext = Node::new(
+            VName::new(
+                "",
+                "",
+                "packages/travsr-vscode/src/webviews.ts",
+                "typescript",
+                "fn:formatBytes",
+            ),
+            "function",
+        );
+        let sibling = Node::new(
+            VName::new(
+                "",
+                "",
+                "packages/travsr-vscode/src/health.ts",
+                "typescript",
+                "fn:draw",
+            ),
+            "function",
+        );
+        for n in [&ui, &ext, &sibling] {
+            store.put_node(n).unwrap();
+        }
+        let call = |src| travsr_core::UnresolvedCall {
+            src,
+            callee_sig: "fn:formatBytes".to_string(),
+            alt_callee_sig: None,
+            hint_crate: None,
+            caller_line: 3,
+            caller_col: None,
+            is_method_call: false,
+            recv_type: None,
+        };
+        let none = std::collections::HashSet::new();
+
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(ui.id)], &[], &[], &none);
+        assert!(
+            edges.is_empty(),
+            "cross-component collision resolved: {edges:?}"
+        );
+
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(sibling.id)], &[], &[], &none);
+        assert_eq!(edges.len(), 1, "same-component call dropped: {edges:?}");
+        assert_eq!(edges[0].dst, ext.id);
+
+        // Review fix: a monorepo call through a package-name import is real.
+        // packages/web imports "@acme/travsr-vscode/util"; the folder name
+        // matches, so the cross-component callee is kept.
+        let web = Node::new(
+            VName::new("", "", "packages/web/src/app.ts", "typescript", "fn:boot"),
+            "function",
+        );
+        let web_import = Node::new(
+            VName::new(
+                "",
+                "",
+                "packages/web/src/app.ts",
+                "typescript",
+                "import:@acme/travsr-vscode/util",
+            ),
+            "import",
+        );
+        store.put_node(&web).unwrap();
+        store.put_node(&web_import).unwrap();
+        let (edges, _) = resolve_unresolved_calls(&store, &[call(web.id)], &[], &[], &none);
+        assert_eq!(edges.len(), 1, "package-import call dropped: {edges:?}");
+        assert_eq!(edges[0].dst, ext.id);
+
+        assert_eq!(package_of_specifier("@acme/utils/sub"), Some("@acme/utils"));
+        assert_eq!(package_of_specifier("lodash/fp"), Some("lodash"));
+        assert_eq!(package_of_specifier("vscode"), Some("vscode"));
+        assert_eq!(package_of_specifier("./local"), None);
+        assert_eq!(package_of_specifier("../up"), None);
     }
 
     #[test]
@@ -16200,7 +16445,12 @@ impl Daemon {
                         break;
                     }
                     _ = pipe_shutdown_wait => {
-                        tracing::info!("travsr daemon shutting down (control pipe)");
+                        let who = shutdown_requested_by()
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone()
+                            .unwrap_or_else(|| "unknown requester".to_string());
+                        tracing::info!("travsr daemon shutting down (control pipe: {who})");
                         break;
                     }
                 }
@@ -16821,6 +17071,13 @@ fn log_query_served(tool: &str, cached: bool, elapsed_ms: u128) {
     }
 }
 
+/// Who sent the last accepted control-pipe Shutdown (#1082 B4), for the
+/// daemon's final "shutting down" log line.
+fn shutdown_requested_by() -> &'static std::sync::Mutex<Option<String>> {
+    static WHO: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    WHO.get_or_init(Default::default)
+}
+
 /// Returns `(response, should_shutdown)`.
 ///
 /// Called from the Unix domain-socket accept loop and the Windows Named Pipe
@@ -17341,7 +17598,15 @@ fn handle_control_message(
             resp.daemon_exe = daemon_exe().map(str::to_string);
             (resp, false)
         }
-        Ok(ControlMessage::Shutdown) => (ControlResponse::ok(None), true),
+        Ok(msg @ ControlMessage::Shutdown { .. }) => {
+            // #1082 B4: name who asked, here and on the final shutdown line.
+            let who = msg.shutdown_requester().unwrap_or_default();
+            tracing::info!(requested_by = %who, "control: shutdown requested by {who}");
+            *shutdown_requested_by()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(who);
+            (ControlResponse::ok(None), true)
+        }
         // WS3 (#420): pause auto-reindex and gracefully cancel any in-flight run.
         Ok(ControlMessage::StopEmbed) => {
             tracing::info!("control: stop-embed, pausing auto-reindex + cancelling in-flight");

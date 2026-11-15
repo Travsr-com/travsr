@@ -1050,7 +1050,7 @@ async fn run(cli: Cli) -> Result<()> {
 
                     // M2/L1: if the daemon is not running, tell the user clearly
                     // and exit 0 — it's not an error to stop something already stopped.
-                    match send_shutdown_waiting_for_startup(&repo_root) {
+                    match send_shutdown_waiting_for_startup(&repo_root, "daemon stop") {
                         Ok(_) => match pid_before {
                             Some(pid) if !wait_for_exit(pid, STOP_EXIT_TIMEOUT) => {
                                 anyhow::bail!(
@@ -1210,7 +1210,7 @@ async fn run(cli: Cli) -> Result<()> {
                     // AlreadyRunning, and the generic success arm still
                     // printed "restarted" with exit 0 while the old daemon
                     // kept running and no new daemon existed.
-                    match send_shutdown_waiting_for_startup(&repo_root) {
+                    match send_shutdown_waiting_for_startup(&repo_root, "daemon restart") {
                         Ok(_) => {}
                         // Not running: restart degrades to a plain start.
                         Err(e) if transport_absent(&e) => {}
@@ -2429,11 +2429,13 @@ fn transport_busy(e: &anyhow::Error) -> bool {
 /// startup window.
 fn send_shutdown_waiting_for_startup(
     repo_root: &std::path::Path,
+    reason: &str,
 ) -> anyhow::Result<travsr_ipc::ControlResponse> {
+    let msg = travsr_ipc::ControlMessage::shutdown(reason, daemon_client::our_build_version());
     let cutoff = std::time::Instant::now() + STOP_DELIVER_TIMEOUT;
     let mut announced = false;
     loop {
-        let err = match send_daemon_command(repo_root, &travsr_ipc::ControlMessage::Shutdown) {
+        let err = match send_daemon_command(repo_root, &msg) {
             Ok(resp) => return Ok(resp),
             Err(e) => e,
         };

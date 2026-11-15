@@ -299,6 +299,69 @@
   // and a rotating glyph in that box orbits instead of spinning.
   const pending = (what) => '<div class="hrow muted">Reading ' + esc(what) + "…</div>";
 
+  // ── First-run guide (#1082 A7) ─────────────────────────────────────────
+  // The steps a new repository needs, in order, each with its button. Shown
+  // until the three required ones are done (or the reader hides it); a step
+  // whose state is still being read shows "checking", not a guess.
+  /** The AI tools `connect --print --json` found, split the one way both the
+   *  guide and the Agent connections section count them: tools `connect`
+   *  wires by itself (`auto`, of which `wired` already name travsr) and tools
+   *  that need a step in their own settings (`manual`). `tools` is null when
+   *  the answer could not be read. */
+  function connectState(d) {
+    const tools = Array.isArray(d.connect) ? d.connect : null;
+    const auto = tools ? tools.filter((t) => t.setup === "automatic") : [];
+    const manual = tools ? tools.filter((t) => t.setup !== "automatic") : [];
+    const wired = auto.filter((t) => t.connected === true).length;
+    return { tools, auto, manual, wired, allWired: auto.length > 0 && wired === auto.length };
+  }
+
+  function renderGuide(d, hasGraph) {
+    const { tools, manual, allWired: connected } = connectState(d);
+    const embed = Array.isArray(d.sidecars) ? d.sidecars[0] : null;
+    const names = (list) => list.map((t) => t.name + (t.setup === "automatic" && t.connected === true ? " (connected)" : "")).join(", ");
+    const steps = [
+      { title: "Index this repository", done: hasGraph, known: !!d.statusLoaded,
+        why: "Builds the code graph that agents and these pages read.", label: "Index now", cmd: "travsr init" },
+      { title: "Start the daemon", done: !!d.daemonRunning, known: d.daemonDetail !== null, after: !!d.statusLoaded && !hasGraph,
+        why: "Keeps the graph fresh as you commit and save.", label: "Start", cmd: "travsr daemon start" },
+      { title: "Connect your AI tools", done: connected, known: d.connect !== undefined, after: !!d.statusLoaded && !hasGraph,
+        why: !tools ? "Could not read which AI tools are installed." : !tools.length
+          ? "No AI coding tool found on this machine yet. Install one, then run connect."
+          : "Found: " + names(tools) + "." + (manual.length ? " " + manual.map((t) => t.name).join(", ") + (manual.length === 1 ? " also needs a step in its own settings" : " also need a step in their own settings") + " (travsr connect --print says which)." : ""),
+        label: "Connect", cmd: "travsr connect" },
+      { title: "Set up semantic search", optional: true, done: !!(embed && embed.ok), known: d.sidecars !== undefined,
+        why: "Optional. Adds meaning-based matches to keyword search; downloads a model, which takes a few minutes.",
+        label: "Set up", cmd: "travsr embed init" },
+    ];
+    const required = steps.filter((s) => !s.optional);
+    if (required.every((s) => s.known && s.done)) return "";
+    const done = required.filter((s) => s.done).length;
+    // Hidden by the reader: keep one line in its place while a required step
+    // is still undone, so the guide can be brought back without clearing
+    // browser storage.
+    if (ui.pref("guide.hidden." + ui.repo) === "1") {
+      return '<div class="guide-collapsed"><button class="link-btn" type="button" data-show-guide="1" title="Show the Getting started steps again">Show getting started</button>' +
+        '<span class="muted">' + done + " of " + required.length + " steps done</span></div>";
+    }
+    const next = steps.find((s) => s.known && !s.done && !s.after);
+    return '<section class="guide" aria-label="Getting started"><div class="guide-head"><strong>Getting started</strong>' +
+      '<span class="muted">' + done + " of " + required.length + " done</span>" +
+      '<button class="link-btn guide-hide" type="button" data-hide-guide="1" title="Hide this guide for this repository">hide</button></div><ol class="guide-steps">' +
+      steps.map((s, i) => {
+        const state = s.known && s.done ? "done" : s.after ? "later" : !s.known ? "checking" : "todo";
+        const mark = state === "done" ? OK_ICON : '<span class="guide-n">' + (i + 1) + "</span>";
+        const tail = state === "checking" ? '<span class="muted">checking…</span>'
+          : state === "done" ? '<span class="muted">done</span>'
+          : state === "later" ? '<span class="muted">after step 1</span>'
+          : act(s.label, s.cmd, s === next ? "primary" : "");
+        return '<li class="guide-step ' + state + (s === next ? " next" : "") + '"><span class="guide-mark">' + mark + "</span>" +
+          '<span class="guide-body"><span class="guide-title">' + esc(s.title) + (s.optional ? ' <span class="muted">(optional)</span>' : "") + "</span>" +
+          '<span class="guide-why">' + esc(s.why) + "</span></span>" +
+          '<span class="guide-act">' + tail + "</span></li>";
+      }).join("") + "</ol></section>";
+  }
+
   function renderTop(d) {
     const s = d.status && d.status.status;
     const nodes = s ? s.nodes.toLocaleString() : "—";
@@ -407,12 +470,39 @@
         : langs === null ? unavailable("Could not read the language list.")
         : renderLanguages(langs));
 
-    // Agent connections: the extension reads editor config files on the
-    // machine it runs on. A browser page has no such view, so it names the
-    // command that reports and writes them.
-    const agentSec = section("Agent connections", statusChip("mute", "see CLI"),
-      act("Register all", "travsr connect", "primary"),
-      row("Status", "travsr connect --print shows which AI tools are wired to Travsr", undefined, act("Copy", "travsr connect --print")));
+    // Agent connections: each AI tool found for this repository and whether
+    // it is wired to Travsr, from `connect --print --json` (the same answer
+    // the Getting started guide reads). A tool `connect` wires by itself is
+    // connected or not; one that needs a step in its own settings is said so.
+    const agentSec = (() => {
+      const tools = d.connect;
+      const details = act("Copy", "travsr connect --print");
+      if (tools === undefined) {
+        return section("Agent connections", statusChip("mute", "checking"),
+          act("Register all", "travsr connect"), pending("AI tools"));
+      }
+      if (!Array.isArray(tools)) {
+        return section("Agent connections", statusChip("mute", "see CLI"),
+          act("Register all", "travsr connect", "primary"),
+          row("Status", "could not read which AI tools are wired; travsr connect --print says", undefined, details));
+      }
+      if (!tools.length) {
+        return section("Agent connections", statusChip("mute", "none found"),
+          act("Register all", "travsr connect"),
+          row("Found", "no AI coding tool on this machine yet; install one, then register", undefined, details));
+      }
+      const { auto, wired } = connectState(d);
+      const chip = !auto.length ? statusChip("warn", "needs a step")
+        : wired === auto.length ? statusChip("ok", wired + " connected")
+        : wired === 0 ? statusChip("bad", "not connected")
+        : statusChip("warn", wired + " of " + auto.length + " connected");
+      const rows = tools.map((t) => t.setup !== "automatic"
+        ? row(t.name, "needs a step in its own settings", "warn", details)
+        : t.connected === true ? row(t.name, "connected", "ok")
+        : row(t.name, "not connected", "bad")).join("");
+      return section("Agent connections", chip,
+        act("Register all", "travsr connect", wired < auto.length ? "primary" : ""), rows);
+    })();
 
     // Repositories
     const repos = d.repos;
@@ -439,7 +529,7 @@
     const dbSize = d.status && d.status.db_bytes != null ? (d.status.db_bytes / 1048576).toFixed(1) + " MB" : "—";
     const lastIndexed = d.status && d.status.last_indexed_ms ? ui.timeAgo(Math.max(0, Date.now() - d.status.last_indexed_ms)) : "—";
 
-    return verdictBanner +
+    return verdictBanner + renderGuide(d, hasGraph) +
       '<div class="cards">' +
       card("Nodes", nodes, undefined, "on disk") +
       card("Edges", s ? s.edges.toLocaleString() : "—") +
@@ -780,6 +870,11 @@
         };
       } catch (_) { d.integrity = null; }
     });
+    // The guide's "connect" step: which AI tools are here and whether each is
+    // wired (`connect --print --json`, answered in-process, writes nothing).
+    const connectP = settle(ui.cli("connect-print"), null).then((r) => {
+      try { d.connect = r && r.stdout.trim() ? JSON.parse(r.stdout) : null; } catch (_) { d.connect = null; }
+    });
     const reposP = settle(ui.tool("repos_list"), "").then((raw) => { d.repos = raw.trim() ? parseReposList(raw) : null; });
     const repoLangsP = settle(ui.tool("repo_languages"), "");
     // Slowest last: `lang list` can take most of a minute on a cold Windows cache.
@@ -790,8 +885,8 @@
       else d.languages = parsed.langs.length > 0 ? buildLanguageRows(parsed.langs, d.diags, parseRepoLanguages(repoLangs)) : null;
     });
 
-    for (const p of [statusP, logP, indexP, diagsP, daemonP, versionP, configP, embedP, healthP, reposP, langsP]) p.then(draw);
-    await Promise.all([statusP, logP, indexP, diagsP, daemonP, versionP, configP, embedP, healthP, reposP, langsP]);
+    for (const p of [statusP, logP, indexP, diagsP, daemonP, versionP, configP, embedP, connectP, healthP, reposP, langsP]) p.then(draw);
+    await Promise.all([statusP, logP, indexP, diagsP, daemonP, versionP, configP, embedP, connectP, healthP, reposP, langsP]);
     if (seq === state.seq) { state.renderedAt = Date.now(); renderLog(); }
   }
 
@@ -799,6 +894,16 @@
   function wire(row) {
     const page = document.getElementById("page");
     page.addEventListener("click", async (ev) => {
+      const toggleGuide = ev.target.closest("[data-hide-guide], [data-show-guide]");
+      if (toggleGuide) {
+        ui.pref("guide.hidden." + ui.repo, toggleGuide.hasAttribute("data-hide-guide") ? "1" : "0");
+        // Redraw from what the page last read: no need to ask again.
+        const top = document.getElementById("top");
+        if (top && state.data) top.innerHTML = renderTop(state.data);
+        const again = document.querySelector(toggleGuide.hasAttribute("data-hide-guide") ? "[data-show-guide]" : "[data-hide-guide]");
+        if (again) again.focus();
+        return;
+      }
       const copy = ev.target.closest("[data-copy]");
       if (copy) {
         // A button in a section header sits inside <summary>; copying must not
@@ -884,7 +989,8 @@
     page.innerHTML = pageShell(row);
     wire(row);
     if (!row.indexed) {
-      document.getElementById("top").innerHTML = renderTop({ status: null, statusLoaded: true, index: parseIndexHealth(""), indexLoaded: true, diags: [], diagsLoaded: true, daemonDetail: "", sidecars: null, embedModels: [], integrity: null, languages: null, repos: null });
+      state.data = { status: null, statusLoaded: true, index: parseIndexHealth(""), indexLoaded: true, diags: [], diagsLoaded: true, daemonDetail: "", sidecars: null, embedModels: [], integrity: null, languages: null, repos: null };
+      document.getElementById("top").innerHTML = renderTop(state.data);
       renderLog();
       return;
     }

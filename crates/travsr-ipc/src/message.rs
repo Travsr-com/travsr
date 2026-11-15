@@ -32,7 +32,21 @@ pub enum ControlMessage {
         paths: Vec<PathBuf>,
     },
     Status,
-    Shutdown,
+    /// Stop the daemon. #1082 B4: the fields say who asked and why, so the
+    /// daemon log names the cause of a shutdown instead of only "control
+    /// pipe". All optional and defaulted, so the old bare `{"op":"shutdown"}`
+    /// still parses here, and an older daemon ignores the extra fields (an
+    /// internally tagged unit variant skips them).
+    Shutdown {
+        /// What asked: `daemon stop`, `daemon restart`, `version skew`, ...
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requester_pid: Option<u32>,
+        /// The requesting binary's version.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requester_version: Option<String>,
+    },
     /// WS3 (#420): pause the daemon's auto-reindex and gracefully cancel any
     /// in-flight embed reindex (writes the cancel sentinel, grace-polls the
     /// sidecar, then force-kills as a fallback). The pause is in-memory for the
@@ -373,9 +387,90 @@ impl ControlResponse {
     }
 }
 
+impl ControlMessage {
+    /// A [`ControlMessage::Shutdown`] from this process: `reason` says what
+    /// asked (`daemon stop`, `version skew`, ...) and `version` is the
+    /// requesting binary's own version.
+    pub fn shutdown(reason: impl Into<String>, version: impl Into<String>) -> Self {
+        ControlMessage::Shutdown {
+            reason: Some(reason.into()),
+            requester_pid: Some(std::process::id()),
+            requester_version: Some(version.into()),
+        }
+    }
+
+    /// One line naming who asked for a shutdown, for the daemon log:
+    /// `daemon stop, from pid 4242 (travsr 1.4.0)`. Missing parts (an older
+    /// client sends none) read as "unknown".
+    pub fn shutdown_requester(&self) -> Option<String> {
+        let ControlMessage::Shutdown {
+            reason,
+            requester_pid,
+            requester_version,
+        } = self
+        else {
+            return None;
+        };
+        let reason = reason.as_deref().unwrap_or("unknown reason (older client)");
+        let pid = requester_pid.map_or_else(|| "unknown pid".to_string(), |p| format!("pid {p}"));
+        let version = requester_version
+            .as_deref()
+            .map_or_else(|| "unknown version".to_string(), |v| format!("travsr {v}"));
+        Some(format!("{reason}, from {pid} ({version})"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1082 B4: the shutdown fields travel both ways across versions.
+    #[test]
+    fn shutdown_names_its_requester_and_stays_wire_compatible() {
+        // An older client's bare message still parses, with nothing known.
+        let old: ControlMessage = serde_json::from_str(r#"{"op":"shutdown"}"#).unwrap();
+        assert_eq!(
+            old.shutdown_requester().as_deref(),
+            Some("unknown reason (older client), from unknown pid (unknown version)")
+        );
+
+        let new = ControlMessage::Shutdown {
+            reason: Some("version skew (daemon 1.3.0)".into()),
+            requester_pid: Some(4242),
+            requester_version: Some("1.4.0".into()),
+        };
+        let wire = serde_json::to_string(&new).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"op":"shutdown","reason":"version skew (daemon 1.3.0)","requester_pid":4242,"requester_version":"1.4.0"}"#
+        );
+        let back: ControlMessage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            back.shutdown_requester().as_deref(),
+            Some("version skew (daemon 1.3.0), from pid 4242 (travsr 1.4.0)")
+        );
+
+        // An older daemon, whose Shutdown is a unit variant, still accepts
+        // the new message: the extra fields are ignored, not an error.
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "op", rename_all = "kebab-case")]
+        enum OldDaemonMessage {
+            Status,
+            Shutdown,
+        }
+        assert!(matches!(
+            serde_json::from_str::<OldDaemonMessage>(&wire).unwrap(),
+            OldDaemonMessage::Shutdown
+        ));
+        let _ = OldDaemonMessage::Status;
+
+        assert_eq!(ControlMessage::Status.shutdown_requester(), None);
+        let mine = ControlMessage::shutdown("daemon stop", "9.9.9");
+        assert!(mine.shutdown_requester().unwrap().starts_with(&format!(
+            "daemon stop, from pid {} (travsr 9.9.9)",
+            std::process::id()
+        )));
+    }
 
     #[test]
     fn query_message_round_trips() {

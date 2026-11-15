@@ -998,6 +998,20 @@ pub fn build_manifests(language: &str) -> &'static [&'static str] {
 /// project: the analyzer finds no symbols in them, so without a build file
 /// there is nothing to download or run.
 pub fn required_build_files(language: &str) -> (&'static [&'static str], &'static str) {
+    required_build_files_for(language, cfg!(windows))
+}
+
+/// [`required_build_files`] for a given platform, so both answers are
+/// testable on any host.
+///
+/// #1082 B6: on Windows the Java driver builds Gradle projects only (see
+/// [`PhaseBEntry::effective_prerequisites`]), so a `pom.xml` alone is no
+/// project there. Counting it sent `init` off to download scip-java (86 MB)
+/// for a Maven repository whose run could only fail.
+pub fn required_build_files_for(
+    language: &str,
+    windows: bool,
+) -> (&'static [&'static str], &'static str) {
     const JVM: &[&str] = &[
         "pom.xml",
         "build.gradle",
@@ -1005,7 +1019,17 @@ pub fn required_build_files(language: &str) -> (&'static [&'static str], &'stati
         "settings.gradle",
         "settings.gradle.kts",
     ];
+    const GRADLE: &[&str] = &[
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ];
     match language {
+        "java" if windows => (
+            GRADLE,
+            "a Gradle build (build.gradle); on Windows Java calls are traced through Gradle only",
+        ),
         "java" | "kotlin" => (JVM, "pom.xml or build.gradle"),
         "scala" => (
             &["build.sbt", "pom.xml", "build.gradle", "build.gradle.kts"],
@@ -1376,14 +1400,16 @@ mod vendored_hash_tests {
 
 #[cfg(test)]
 mod build_file_tests {
-    use super::{listed_build_file, missing_build_file, required_build_files};
+    use super::{
+        listed_build_file, missing_build_file, required_build_files, required_build_files_for,
+    };
 
     /// PR #940 review: three Java test fixtures with no build file cost a
     /// scip-java download and then read "could not trace calls". A listing
     /// with no build file anywhere is what says so first.
     #[test]
     fn a_build_file_anywhere_counts_and_a_lookalike_does_not() {
-        let (java, _) = required_build_files("java");
+        let (java, _) = required_build_files_for("java", false);
         assert!(listed_build_file("svc/pom.xml\0", java));
         assert!(listed_build_file("app/build.gradle.kts\0", java));
         assert!(!listed_build_file("fixtures/Main.java\0notpom.xml\0", java));
@@ -1393,6 +1419,22 @@ mod build_file_tests {
         assert!(!listed_build_file("src/App.cs\0", cs));
         assert!(required_build_files("rust").0.is_empty());
         assert!(required_build_files("ruby").0.is_empty());
+    }
+
+    /// #1082 B6: on Windows a Maven-only Java repo has no project the Java
+    /// driver can build, so it needs no scip-java; Gradle still counts, and
+    /// Kotlin (whose language server reads either) keeps both.
+    #[test]
+    fn windows_java_counts_gradle_only() {
+        let (win, needs) = required_build_files_for("java", true);
+        assert!(!listed_build_file("pom.xml\0", win));
+        assert!(listed_build_file("app/build.gradle\0", win));
+        assert!(listed_build_file("settings.gradle.kts\0", win));
+        assert!(needs.contains("Gradle"));
+        let (unix, _) = required_build_files_for("java", false);
+        assert!(listed_build_file("pom.xml\0", unix));
+        let (kotlin, _) = required_build_files_for("kotlin", true);
+        assert!(listed_build_file("pom.xml\0", kotlin));
     }
 
     /// The one check against real git: a fixture-only repo is missing its
@@ -1414,10 +1456,15 @@ mod build_file_tests {
         std::fs::write(root.join("fixtures/Main.java"), "class Main {}").expect("write");
         assert_eq!(
             missing_build_file("java", root),
-            Some("pom.xml or build.gradle")
+            Some(required_build_files("java").1)
         );
         std::fs::create_dir_all(root.join("svc")).expect("mkdir");
         std::fs::write(root.join("svc/pom.xml"), "<project/>").expect("write");
+        if cfg!(windows) {
+            // #1082 B6: Maven alone is no project for the Windows driver.
+            assert!(missing_build_file("java", root).is_some());
+            std::fs::write(root.join("svc/build.gradle"), "").expect("write");
+        }
         assert_eq!(missing_build_file("java", root), None);
         assert_eq!(missing_build_file("rust", root), None);
 

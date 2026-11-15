@@ -19,7 +19,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use assert_cmd::cargo::cargo_bin;
+mod support;
+use support::cargo_bin;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 

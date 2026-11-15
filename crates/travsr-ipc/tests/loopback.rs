@@ -20,7 +20,7 @@ fn every_message_variant() -> Vec<ControlMessage> {
             paths: vec![std::path::PathBuf::from("src/lib.rs")],
         },
         ControlMessage::Status,
-        ControlMessage::Shutdown,
+        ControlMessage::shutdown("test", "0"),
         ControlMessage::StopEmbed,
         ControlMessage::ResumeEmbed,
         ControlMessage::Query {

@@ -5953,14 +5953,7 @@ pub fn get_lang_status(store: &SqliteStore, file: &str) -> String {
 /// `tool_available` so the two surfaces agree on what "installed" means.
 fn bin_resolvable(name: &str) -> bool {
     fn present(dir: &std::path::Path, name: &str) -> bool {
-        if dir.join(name).is_file() {
-            return true;
-        }
-        #[cfg(windows)]
-        if dir.join(format!("{name}.exe")).is_file() {
-            return true;
-        }
-        false
+        dir.join(name).is_file() || (cfg!(windows) && dir.join(format!("{name}.exe")).is_file())
     }
     if let Some(home) = dirs::home_dir() {
         if present(&home.join(".travsr").join("bin"), name) {

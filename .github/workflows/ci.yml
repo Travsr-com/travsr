@@ -244,7 +244,7 @@ jobs:
           fi
 
   msrv:
-    name: MSRV (rust 1.88)
+    name: MSRV (rust 1.89)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -269,8 +269,8 @@ jobs:
       # RFC-012 addendum: those record what was true at the time. Rationale
       # that cites the MSRV needs rereading, not just renumbering; the 1.75
       # bump left a Cargo.toml note whose reason had expired at the new value.
-      - name: Install Rust toolchain (1.88.0)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install Rust toolchain (1.89.0)
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
@@ -289,7 +289,7 @@ jobs:
       - name: Check workspace compiles on MSRV
         run: cargo check --workspace
         env:
-          RUSTUP_TOOLCHAIN: 1.88.0
+          RUSTUP_TOOLCHAIN: 1.89.0
 
   deny:
     name: cargo-deny

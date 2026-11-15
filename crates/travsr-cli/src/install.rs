@@ -59,24 +59,54 @@ fn download_http_client() -> Result<reqwest::Client> {
 /// length, the total and percentage.
 fn render_download_progress(downloaded: u64, total: Option<u64>) {
     use std::io::Write as _;
-    let mb = |n: u64| n as f64 / (1024.0 * 1024.0);
     let mut err = std::io::stderr();
+    let _ = write!(err, "\r  {}   ", download_progress_text(downloaded, total));
+    let _ = err.flush();
+}
+
+/// `12.3/86.0 MB (14%)`, or `12.3 MB` when the size is unknown.
+fn download_progress_text(downloaded: u64, total: Option<u64>) -> String {
+    let mb = |n: u64| n as f64 / (1024.0 * 1024.0);
     match total {
         Some(t) if t > 0 => {
             let pct = (downloaded as f64 / t as f64 * 100.0).min(100.0);
-            let _ = write!(
-                err,
-                "\r  {:.1}/{:.1} MB ({:.0}%)   ",
-                mb(downloaded),
-                mb(t),
-                pct
-            );
+            format!("{:.1}/{:.1} MB ({:.0}%)", mb(downloaded), mb(t), pct)
         }
-        _ => {
-            let _ = write!(err, "\r  {:.1} MB   ", mb(downloaded));
-        }
+        _ => format!("{:.1} MB", mb(downloaded)),
     }
-    let _ = err.flush();
+}
+
+/// #1082 B6: progress for a stderr that is not a terminal (`travsr ui`'s
+/// action output, an editor's output channel, a CI log). The self-redrawing
+/// line is written only to a terminal, so these readers saw "Downloading
+/// scip-java ..." and then nothing for an 86 MB download. They get a plain
+/// line at every tenth of the way (every 10 MB when the size is unknown).
+struct PlainProgress {
+    step: u64,
+    next: u64,
+}
+
+impl PlainProgress {
+    const UNKNOWN_SIZE_STEP: u64 = 10 * 1024 * 1024;
+
+    fn new(total: Option<u64>) -> Self {
+        let step = match total {
+            Some(t) if t > 0 => (t / 10).max(1),
+            _ => Self::UNKNOWN_SIZE_STEP,
+        };
+        Self { step, next: step }
+    }
+
+    /// The line to print after `downloaded` bytes, if a step was crossed.
+    fn line(&mut self, downloaded: u64, total: Option<u64>) -> Option<String> {
+        if downloaded < self.next {
+            return None;
+        }
+        while self.next <= downloaded {
+            self.next += self.step;
+        }
+        Some(format!("  {}", download_progress_text(downloaded, total)))
+    }
 }
 
 /// Returns the Rust target triple for the current machine.
@@ -550,6 +580,12 @@ async fn fetch_verified(
     // `chunk()` avoids pulling in a `Stream` extension trait — no extra dependency.
     let total = bin_resp.content_length();
     let show_progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let mut plain = (!show_progress).then(|| PlainProgress::new(total));
+    if plain.is_some() {
+        if let Some(t) = total {
+            eprintln!("  {:.1} MB to download", t as f64 / (1024.0 * 1024.0));
+        }
+    }
     let mut bin_bytes: Vec<u8> = Vec::with_capacity(total.unwrap_or(0).min(size_limit) as usize);
     while let Some(chunk) = bin_resp.chunk().await.context("reading binary body")? {
         bin_bytes.extend_from_slice(&chunk);
@@ -562,6 +598,8 @@ async fn fetch_verified(
         }
         if show_progress {
             render_download_progress(got, total);
+        } else if let Some(line) = plain.as_mut().and_then(|p| p.line(got, total)) {
+            eprintln!("{line}");
         }
     }
     if show_progress {
@@ -1025,6 +1063,39 @@ fn parse_sha256_line(line: &str) -> Result<String> {
 mod tests {
     use super::*;
     use travsr_plugin_host::phase_b::platform::WRAPPER_RELEASE_TARGETS;
+
+    /// #1082 B6: off a terminal, a download reports at each tenth, once per
+    /// step however the chunks fall, and at 10 MB steps when the size is
+    /// unknown.
+    #[test]
+    fn plain_progress_reports_each_tenth_once() {
+        const MB: u64 = 1024 * 1024;
+        let total = Some(100 * MB);
+        let mut p = PlainProgress::new(total);
+        let mut lines = Vec::new();
+        // 1 MB chunks, plus one large chunk that crosses three steps at once.
+        let mut got = 0;
+        for chunk in std::iter::repeat_n(MB, 35)
+            .chain([40 * MB])
+            .chain(std::iter::repeat_n(MB, 25))
+        {
+            got += chunk;
+            if let Some(l) = p.line(got, total) {
+                lines.push(l);
+            }
+        }
+        assert_eq!(got, 100 * MB);
+        assert_eq!(lines.first().unwrap(), "  10.0/100.0 MB (10%)");
+        assert_eq!(lines.last().unwrap(), "  100.0/100.0 MB (100%)");
+        // 10..=30 by 1 MB chunks (3 lines), one line for the jump to 75,
+        // then 80, 90, 100: seven lines, never one per chunk.
+        assert_eq!(lines.len(), 7, "{lines:?}");
+
+        let mut unknown = PlainProgress::new(None);
+        assert_eq!(unknown.line(5 * MB, None), None);
+        assert_eq!(unknown.line(10 * MB, None).as_deref(), Some("  10.0 MB"));
+        assert_eq!(unknown.line(15 * MB, None), None);
+    }
 
     /// A second repo's `init` found the tool installed and still asked GitHub
     /// for its latest release, although the answer from minutes before was

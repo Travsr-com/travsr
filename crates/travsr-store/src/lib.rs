@@ -1321,6 +1321,17 @@ impl Drop for SqliteStore {
         // to zero bytes so the next open starts with no WAL replay overhead.
         // TRUNCATE mode requires an exclusive lock; it silently skips if any
         // reader holds a shared lock, which is always a safe WAL state.
+        //
+        // #1082 B1: never from a read-only open, which has nothing of its own
+        // to checkpoint. While a daemon holds the database, the TRUNCATE
+        // checkpoint waited out the busy timeout (up to 5 s) on every drop,
+        // and `travsr ask` drops one per run (its Phase B note), so asks were
+        // slower with a daemon than without. With that drop in place the
+        // daemon's `PRAGMA data_version` also moved on every ask, which keys
+        // its query cache, so a repeated question was never a cache hit.
+        if self.conn.is_readonly(rusqlite::MAIN_DB).unwrap_or(false) {
+            return;
+        }
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
     }
 }
@@ -11999,6 +12010,47 @@ mod tests {
             Some(v2),
             "stable when unchanged"
         );
+    }
+
+    /// #1082 B1: a read-only open must not change what another connection
+    /// reads as the database's version. The daemon keys its query cache on
+    /// `data_version`, and `travsr ask` opens the index read-only for a note
+    /// on every run; when that open checkpointed the WAL on drop, every ask
+    /// invalidated the daemon's cache and the same question recomputed.
+    #[test]
+    fn dropping_a_read_only_store_leaves_data_version_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.db");
+        // The daemon's shape: a writer that stays open (its indexer) with
+        // frames in the WAL, and a long-lived read-only connection (its query
+        // store) whose data_version keys the cache.
+        let mut writer = SqliteStore::open(&path).unwrap();
+        for i in 0..50 {
+            writer.set_meta(&format!("b1_probe_{i}"), "1").unwrap();
+        }
+        let observer = SqliteStore::open_read_only(&path).unwrap();
+        let before = observer.data_version().unwrap();
+        for _ in 0..3 {
+            let reader = SqliteStore::open_read_only(&path).unwrap();
+            assert!(reader.data_version().is_ok());
+            // While the writer holds the database, a TRUNCATE checkpoint
+            // from here waited out the whole busy timeout (5 s) on drop.
+            let started = std::time::Instant::now();
+            drop(reader);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "dropping a read-only store must not wait on the writer: {:?}",
+                started.elapsed()
+            );
+        }
+        assert_eq!(
+            observer.data_version().unwrap(),
+            before,
+            "a read-only open and drop must not look like a write to others"
+        );
+        // A real write still does.
+        writer.set_meta("b1_probe", "2").unwrap();
+        assert_ne!(observer.data_version().unwrap(), before);
     }
 
     /// #509: embed.db deleted and recreated at the same path between two polls
