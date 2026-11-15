@@ -134,9 +134,13 @@
       try {
         const raw = await ui.tool("get_callers", { symbol: sym });
         const lines = ui.parseEnvelope(raw);
-        const notes = ui.envelopeBody(raw).split("\n").map((l) => l.trim()).filter((l) => /^\[?note:/.test(l));
+        // Notes inside the envelope ("no call to X is recorded") and after it
+        // ("calls are still being traced ... not final"): without the second,
+        // an empty answer during a reindex read as final.
+        const notes = ui.envelopeBody(raw).split("\n").map((l) => l.trim()).filter((l) => /^\[?note:/.test(l))
+          .map((n) => n.replace(/^\[note:\s*/, "").replace(/\]$/, "")).concat(ui.trailingNotes(raw));
         out.innerHTML = '<h3 style="margin:0 0 12px">Callers of <code>' + esc(sym) + "</code></h3>" +
-          notes.map((n) => '<div class="note-box">' + esc(n.replace(/^\[note:\s*/, "").replace(/\]$/, "")) + "</div>").join("") +
+          notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("") +
           '<ul class="results">' + (lines.map(callerLine).join("\n") || "<li><em>none</em></li>") + "</ul>";
       } catch (e) {
         out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
@@ -228,6 +232,7 @@
         const capped = /\[note: showing the \d+ files nearest the change/.test(raw);
         out.innerHTML = '<h3 style="margin:0 0 12px">Blast radius for <code>' + esc(target) + "</code> " +
           '<span class="badge dim">' + files.length + (capped ? "+" : "") + " file" + (files.length === 1 ? "" : "s") + "</span></h3>" + pills() +
+          ui.trailingNotes(raw).map((n) => '<div class="note-box">' + esc(n) + "</div>").join("") +
           '<ul class="results">' + (files.map((f) => "<li>" + editorAnchor(f, null, f) +
             ' <a class="link-btn" href="' + esc(ui.withRepo("/dependencies", { file: f })) + '">deps</a></li>').join("\n") || "<li><em>none</em></li>") + "</ul>";
       } catch (e) {

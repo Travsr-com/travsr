@@ -136,6 +136,18 @@ window.TravsrUi = (function () {
     const end = raw.lastIndexOf("</travsr-data>");
     return stripEnvelope(end < 0 ? raw : raw.slice(0, end + "</travsr-data>".length));
   }
+  // The notes a read tool appends after the envelope, such as "[note: calls
+  // are still being traced for this commit, so ... an empty result is not
+  // final]", without their brackets. envelopeBody stops at the envelope, so a
+  // view that reads only the body showed an empty answer as final. With no
+  // envelope the whole text is the body, which already holds any note.
+  function trailingNotes(raw) {
+    raw = String(raw || "");
+    const end = raw.lastIndexOf("</travsr-data>");
+    if (end < 0) return [];
+    return raw.slice(end + "</travsr-data>".length).split("\n").map((l) => l.trim())
+      .filter((l) => /^\[note:/.test(l)).map((l) => l.replace(/^\[note:\s*/, "").replace(/\]$/, ""));
+  }
   // The server escapes angle brackets for the agent's benefit; the page shows
   // the source text.
   function unescapeTags(s) { return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">"); }
@@ -539,8 +551,7 @@ window.TravsrUi = (function () {
   function parseExecutionPath(raw) {
     const text = String(raw || "");
     const body = envelopeBody(text);
-    const notes = text.slice(text.lastIndexOf("</travsr-data>") + 1).split("\n")
-      .map((l) => l.trim()).filter((l) => /^\[note:/.test(l)).map((l) => l.replace(/^\[note:\s*/, "").replace(/\]$/, ""));
+    const notes = trailingNotes(text);
     const out = { steps: [], nearby: [], candidates: [], ambiguous: null, message: "", header: "", notes };
     let section = "head";
     const step = (line) => {
@@ -908,7 +919,7 @@ window.TravsrUi = (function () {
   return {
     openPalette,
     esc, api, tool, cli, holdCliUntil, init, setConnection, withRepo, editorLink, watch,
-    stripEnvelope, envelopeBody, parseEnvelope, timeAgo, formatLogSize, pref,
+    stripEnvelope, envelopeBody, trailingNotes, parseEnvelope, timeAgo, formatLogSize, pref,
     suggest, suggestSymbols, suggestFiles, parseExecutionPath, canRun, runCommand,
     get repo() { return repo; }, get repoRow() { return repoRow(); }, get repos() { return repos; },
   };
