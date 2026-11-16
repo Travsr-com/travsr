@@ -19,6 +19,9 @@ import {
   uiArgs,
   uiEnv,
   EXIT_ON_STDIN_EOF_ENV,
+  StartCancelled,
+  resolveUiBinary,
+  unwrapNodeShim,
 } from "../../browserUi";
 
 /** A child process the test drives by hand. */
@@ -26,9 +29,11 @@ class FakeProc extends EventEmitter implements UiProcess {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
   killed = false;
+  /** A process that hangs: kill() does not make it exit. */
+  ignoreKill = false;
   kill(): boolean {
     this.killed = true;
-    setImmediate(() => this.emit("exit", null));
+    if (!this.ignoreKill) setImmediate(() => this.emit("exit", null));
     return true;
   }
   /** Write stdout lines the way `travsr ui` prints them. */
@@ -101,6 +106,117 @@ suite("#1060 browser UI: output parsing", () => {
     );
     assert.match(explainStartFailure("", 3), /exited with code 3/);
     assert.match(explainStartFailure("", null), /stopped before/);
+  });
+});
+
+suite("#1060 review: the native binary is spawned, never a launcher", () => {
+  const exists = (set: string[]) => (p: string) => set.includes(p);
+
+  test("unwrapNodeShim swaps npm's Node launcher for the native binary beside it", () => {
+    const link = "/usr/local/bin/travsr";
+    const js = "/usr/local/lib/node_modules/@travsr.com/travsr/bin/travsr.js";
+    // Built the way the code builds it, so the test holds on any host OS.
+    const native = path.join(path.dirname(js), "travsr");
+    const realpath = (p: string) => (p === link ? js : p);
+    assert.strictEqual(unwrapNodeShim(link, "linux", realpath, exists([native])), native);
+    assert.strictEqual(unwrapNodeShim(link, "linux", realpath, exists([])), null, "launcher with no native binary yet");
+    assert.strictEqual(unwrapNodeShim("/opt/travsr", "linux", (p) => p, exists([])), "/opt/travsr", "a native binary is kept");
+    const missing = (): string => { throw new Error("ENOENT"); };
+    assert.strictEqual(unwrapNodeShim("/nope/travsr", "linux", missing, exists([])), "/nope/travsr");
+  });
+
+  test("resolveUiBinary: binaryPath first, else the connect ladder, never a bare name", () => {
+    const keep = (p: string) => p;
+    const none = (): string | null => null;
+    // A valid configured path is used as is.
+    assert.deepStrictEqual(resolveUiBinary("/opt/travsr", "linux", none, keep, none), { binary: "/opt/travsr" });
+    // A Windows .cmd shim in binaryPath is swapped for its packaged travsr.exe.
+    const exe = "C:\npm\node_modules\@travsr.com\travsr\bin\travsr.exe";
+    assert.deepStrictEqual(
+      resolveUiBinary("C:\npm\travsr.cmd", "win32", none, keep, () => exe),
+      { binary: exe }
+    );
+    // An unusable binaryPath with nothing to swap in is an error, not a fallback.
+    const bad = resolveUiBinary("relative/travsr", "linux", () => "/usr/bin/travsr", keep, none);
+    assert.ok("error" in bad && /invalid binaryPath/.test(bad.error), JSON.stringify(bad));
+    // Unset: whatever the ladder finds (install dir, PATH, npm), unwrapped.
+    assert.deepStrictEqual(
+      resolveUiBinary("", "linux", () => "/usr/local/bin/travsr", () => "/pkg/bin/travsr", none),
+      { binary: "/pkg/bin/travsr" }
+    );
+    // Nothing found: an error that names the fix, never spawn("travsr").
+    const missing = resolveUiBinary("", "linux", none, keep, none);
+    assert.ok("error" in missing && /Download Binary/.test(missing.error), JSON.stringify(missing));
+    // A launcher whose native binary is not there yet.
+    const launcher = resolveUiBinary("", "linux", () => "/usr/local/bin/travsr", () => null, none);
+    assert.ok("error" in launcher && /launcher/.test(launcher.error), JSON.stringify(launcher));
+  });
+});
+
+suite("#1060 review: stopping and restarting", () => {
+  test("Stop while starting settles as cancelled, not as a failed start", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const running: boolean[] = [];
+    server.onDidChangeRunning((r) => running.push(r));
+    const started = server.start("travsr", "/r", 0);
+    assert.strictEqual(server.stop(), true);
+    await assert.rejects(started, (e: unknown) => e instanceof StartCancelled);
+    await tick();
+    assert.ok(calls[0].proc.killed);
+    assert.deepStrictEqual(running, [], "it never served, so no running/stopped events");
+    server.dispose();
+  });
+
+  test("an Open for another repo while starting cancels the first start", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const first = server.start("travsr", "/a", 0);
+    const second = server.start("travsr", "/b", 0);
+    await assert.rejects(first, (e: unknown) => e instanceof StartCancelled);
+    calls[1].proc.say("travsr ui: serving http://localhost:9/", "press Ctrl-C to stop");
+    assert.strictEqual((await second).url, "http://localhost:9/");
+    server.dispose();
+  });
+
+  test("a hung start's timeout never kills the server that replaced it", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn, undefined, 40);
+    const first = server.start("travsr", "/a", 0);
+    calls[0].proc.ignoreKill = true;
+    const second = server.start("travsr", "/b", 0);
+    calls[1].proc.say("travsr ui: serving http://localhost:8/", "press Ctrl-C to stop");
+    await second;
+    await assert.rejects(first);
+    // Well past the first start's 40 ms timeout.
+    await new Promise((r) => setTimeout(r, 120));
+    assert.ok(!calls[1].proc.killed, "the newer server must survive the old timer");
+    assert.ok(server.running);
+    assert.strictEqual(server.repoRoot, "/b");
+    server.dispose();
+  });
+
+  test("a changed port or binary restarts the server; the same ones reuse it", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const serve = (i: number): void =>
+      calls[i].proc.say(`travsr ui: serving http://localhost:${20 + i}/`, "press Ctrl-C to stop");
+    const a = server.start("/bin/travsr", "/r", 0);
+    serve(0);
+    await a;
+    await server.start("/bin/travsr", "/r", 0);
+    assert.strictEqual(calls.length, 1, "same binary, port and repo: reused");
+    const b = server.start("/bin/travsr", "/r", 7330);
+    assert.strictEqual(calls.length, 2, "a new travsr.ui.port takes effect");
+    assert.deepStrictEqual(calls[1].args, ["ui", "--port", "7330"]);
+    assert.ok(calls[0].proc.killed);
+    serve(1);
+    await b;
+    const c = server.start("/other/travsr", "/r", 7330);
+    assert.strictEqual(calls.length, 3, "a new binaryPath takes effect");
+    serve(2);
+    await c;
+    server.dispose();
   });
 });
 

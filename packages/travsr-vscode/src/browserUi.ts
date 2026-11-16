@@ -13,10 +13,15 @@
  *     page's own picker still switches to any other indexed repo.
  *   - It reads the address from the `travsr ui: serving <url>` line the CLI
  *     prints, and opens it with `vscode.env.openExternal`.
- *   - The extension owns the server: one per window, reused while it serves
- *     the same repo, replaced when the target repo changes, and stopped by
- *     `Travsr: Stop Browser UI` or when the extension deactivates. A detached
- *     server would outlive the window with nothing left to stop it.
+ *   - The extension owns the server: one per window, reused while the same
+ *     binary, port and repo are asked for, replaced when the command is run
+ *     with a different one (another repo picked with `Travsr: Select
+ *     Repository`, or a changed `travsr.ui.port` or `travsr.binaryPath`), and
+ *     stopped by `Travsr: Stop Browser UI` or when the extension deactivates.
+ *     Picking another repo does not by itself restart a running server. A
+ *     detached server would outlive the window with nothing left to stop it.
+ *   - It spawns the native binary itself, never a bare `travsr` or the npm
+ *     package's Node launcher, so `kill()` reaches the server.
  *   - If the editor crashes or is force-killed, `deactivate` never runs. The
  *     server is started with a piped stdin and `TRAVSR_UI_EXIT_ON_STDIN_EOF=1`,
  *     so it exits when the operating system closes that pipe. That needs a
@@ -25,9 +30,93 @@
  */
 
 import * as cp from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
-import { assertExecutableBinary } from "./installer";
+import { assertExecutableBinary, resolveNpmShimExe } from "./installer";
+import { resolveExportBinaryPath } from "./mcpRegister";
 import { runTravsrCommand } from "./terminal";
+
+/**
+ * The native binary behind an npm install's Node wrapper, or `candidate` when
+ * it is not one; `null` when it is a wrapper with no native binary beside it.
+ *
+ * On macOS and Linux npm puts a symlink to the package's `bin/travsr.js` on
+ * PATH. That wrapper runs the native `bin/travsr` next to it with `spawnSync`,
+ * so the server would be its grandchild: Stop would kill only the wrapper and
+ * leave the server running (review of #1101). On Windows the `.cmd` shim is
+ * already swapped for `travsr.exe` by `resolveExportBinaryPath`.
+ */
+export function unwrapNodeShim(
+  candidate: string,
+  platform: string = process.platform,
+  realpath: (p: string) => string = fs.realpathSync,
+  exists: (p: string) => boolean = fs.existsSync
+): string | null {
+  let real: string;
+  try {
+    real = realpath(candidate);
+  } catch {
+    return candidate;
+  }
+  if (!/\.[cm]?js$/i.test(real)) return candidate;
+  const native = path.join(path.dirname(real), platform === "win32" ? "travsr.exe" : "travsr");
+  return exists(native) ? native : null;
+}
+
+/**
+ * The travsr binary to spawn `travsr ui` from, always the native executable
+ * itself so `kill()` reaches the server: `travsr.binaryPath` when set (an npm
+ * shim there is swapped for its packaged binary), else the same ladder `travsr
+ * connect` exports (the extension's install dir, then PATH, then an npm shim's
+ * packaged binary). A bare `travsr` is never spawned: on Windows it cannot run
+ * a `.cmd` shim, and an install made by Download Binary is not on PATH.
+ */
+export function resolveUiBinary(
+  configured: string,
+  platform: string = process.platform,
+  ladder: (configured: string) => string | null = resolveExportBinaryPath,
+  unwrap: (p: string) => string | null = (p) => unwrapNodeShim(p, platform),
+  shimExe: (p: string) => string | null = (p) => resolveNpmShimExe(p, platform)
+): { binary: string } | { error: string } {
+  let found: string | null;
+  if (configured) {
+    try {
+      assertExecutableBinary(configured, platform);
+      found = configured;
+    } catch (e) {
+      found = shimExe(configured);
+      if (!found) return { error: `invalid binaryPath, ${(e as Error).message}` };
+    }
+  } else {
+    found = ladder("");
+    if (!found) {
+      return {
+        error:
+          "travsr was not found (not installed by the extension and not on PATH). " +
+          "Run Travsr: Download Binary, or set travsr.binaryPath.",
+      };
+    }
+  }
+  const native = unwrap(found);
+  if (!native) {
+    return {
+      error:
+        `${found} is the npm package's launcher, and its native binary is not installed yet. ` +
+        "Run travsr once in a terminal so npm fetches it, or set travsr.binaryPath.",
+    };
+  }
+  return { binary: native };
+}
+
+/** A start that `stop` (or a start for another repo) ended before it served.
+ *  Not a failure: the caller ignores it rather than reporting it. */
+export class StartCancelled extends Error {
+  constructor() {
+    super("travsr ui was stopped before it reported an address.");
+    this.name = "StartCancelled";
+  }
+}
 
 /** How long to wait for the `serving` line before giving up. The server binds
  *  before printing anything, so this only runs out when the binary hangs. */
@@ -144,7 +233,13 @@ function onLines(stream: NodeJS.ReadableStream | null, fn: (line: string) => voi
 export class BrowserUiServer implements vscode.Disposable {
   private proc: UiProcess | undefined;
   private repo: string | undefined;
+  /** Binary, port and repo of the current server: a server is reused only
+   *  when all three match, so a changed setting takes effect on the next
+   *  Open rather than after a reload (review of #1101). */
+  private key: string | undefined;
   private started: Promise<StartResult> | undefined;
+  /** Settles a start that is still waiting for its address as cancelled. */
+  private cancelStart: (() => void) | undefined;
   /** The current process has reported its address. */
   private serving = false;
   private readonly runningEmitter = new vscode.EventEmitter<boolean>();
@@ -170,9 +265,11 @@ export class BrowserUiServer implements vscode.Disposable {
     return this.proc ? this.repo : undefined;
   }
 
-  /** Serve `repo`, reusing the running server when it already serves it. */
+  /** Serve `repo`, reusing the running server when it was started with the
+   *  same binary, port and repo. */
   start(binary: string, repo: string, port: number): Promise<StartResult> {
-    if (this.proc && this.repo === repo && this.started) return this.started;
+    const key = [binary, normalizePort(port), repo].join("\u0000");
+    if (this.proc && this.key === key && this.started) return this.started;
     this.stop();
 
     const args = uiArgs(port);
@@ -185,7 +282,9 @@ export class BrowserUiServer implements vscode.Disposable {
     }
     this.proc = proc;
     this.repo = repo;
+    this.key = key;
 
+    let cancel: (() => void) | undefined;
     const started = new Promise<StartResult>((resolve, reject) => {
       let url: string | undefined;
       let notIndexed = false;
@@ -194,7 +293,10 @@ export class BrowserUiServer implements vscode.Disposable {
       let grace: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
         fail(new Error(`travsr ui did not report its address within ${this.timeoutMs / 1000} s.`));
-        this.stop();
+        // Only ever this start's process: by now `this.proc` may be a newer
+        // server that this timer must not take down (review of #1101).
+        if (this.proc === proc) this.stop();
+        else proc.kill();
       }, this.timeoutMs);
 
       const succeed = (): void => {
@@ -215,6 +317,7 @@ export class BrowserUiServer implements vscode.Disposable {
         if (grace) clearTimeout(grace);
         reject(err);
       };
+      cancel = () => fail(new StartCancelled());
 
       onLines(proc.stdout, (line) => {
         this.log(line);
@@ -228,7 +331,9 @@ export class BrowserUiServer implements vscode.Disposable {
       });
       onLines(proc.stderr, (line) => {
         this.log(line);
-        stderr += line + "\n";
+        // Read only to explain a failed start; a server that logs for hours
+        // must not grow this.
+        if (!settled) stderr += line + "\n";
       });
 
       proc.on("error", (e: Error) => {
@@ -248,18 +353,24 @@ export class BrowserUiServer implements vscode.Disposable {
       });
     });
     this.started = started;
+    this.cancelStart = cancel;
     // A rejected start must not leave an unhandled rejection behind when the
     // caller only awaits a later one.
     started.catch(() => undefined);
     return started;
   }
 
-  /** Stop the server. Returns whether one was running. */
+  /** Stop the server. Returns whether one was running. A start still waiting
+   *  for its address settles with `StartCancelled`, not as a failure. */
   stop(): boolean {
     const proc = this.proc;
     if (!proc) return false;
     const wasServing = this.serving;
+    const cancel = this.cancelStart;
     this.forget(proc);
+    // Settled before the kill, so the exit that follows is not taken for a
+    // failed start (review of #1101).
+    cancel?.();
     proc.kill();
     if (wasServing) this.runningEmitter.fire(false);
     return true;
@@ -276,7 +387,9 @@ export class BrowserUiServer implements vscode.Disposable {
     if (this.proc !== proc) return;
     this.proc = undefined;
     this.repo = undefined;
+    this.key = undefined;
     this.started = undefined;
+    this.cancelStart = undefined;
     this.serving = false;
   }
 }
@@ -332,18 +445,12 @@ export function registerBrowserUi(
         return;
       }
       const cfg = vscode.workspace.getConfiguration("travsr");
-      const configured = cfg.get<string>("binaryPath", "") ?? "";
-      if (configured) {
-        try {
-          assertExecutableBinary(configured);
-        } catch (e) {
-          void vscode.window.showErrorMessage(
-            `Travsr: invalid binaryPath, ${(e as Error).message}`
-          );
-          return;
-        }
+      const resolved = resolveUiBinary(cfg.get<string>("binaryPath", "") ?? "");
+      if ("error" in resolved) {
+        void vscode.window.showErrorMessage(`Travsr: ${resolved.error}`);
+        return;
       }
-      const binary = configured || "travsr";
+      const binary = resolved.binary;
       const port = normalizePort(cfg.get<number>("ui.port", 0));
 
       let result: StartResult;
@@ -356,6 +463,8 @@ export function registerBrowserUi(
           () => server.start(binary, repo, port)
         );
       } catch (e) {
+        // Stop, or an Open for another repo, ended this start on purpose.
+        if (e instanceof StartCancelled) return;
         void showLogs(
           vscode.window.showErrorMessage(
             `Travsr: could not start the browser UI. ${(e as Error).message}`,
