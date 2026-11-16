@@ -330,9 +330,21 @@ pub(super) async fn run(
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .output();
-    let resp = match tokio::time::timeout(Duration::from_secs(plan.secs), child).await {
+        .spawn()
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not start travsr: {e}"),
+            )
+        })?;
+    // Registered for as long as it runs, so a forced exit can stop it.
+    let _tracked = child.id().map(TrackedCommand::new);
+    let resp = match tokio::time::timeout(Duration::from_secs(plan.secs), child.wait_with_output())
+        .await
+    {
         Ok(Ok(out)) => {
             let (stdout, cut_out) = capped(&out.stdout);
             let (stderr, cut_err) = capped(&out.stderr);
@@ -348,7 +360,7 @@ pub(super) async fn run(
         Ok(Err(e)) => {
             return Err(ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not start travsr: {e}"),
+                format!("travsr did not finish: {e}"),
             ))
         }
         Err(_) => RunResponse {
@@ -366,9 +378,83 @@ pub(super) async fn run(
     Ok(Json(resp))
 }
 
+/// Process ids of the terminal-page commands still running.
+///
+/// Each one is spawned with `kill_on_drop`, which is enough for a normal stop:
+/// the request future is dropped and the command with it. A forced exit
+/// ([`kill_running_commands`], when the parent of `travsr ui` is gone and the
+/// graceful shutdown stalls) leaves through `std::process::exit`, which runs no
+/// destructors, so it stops them from this list instead (review of #1101).
+fn running_commands() -> &'static std::sync::Mutex<std::collections::BTreeSet<u32>> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
+        std::sync::OnceLock::new();
+    RUNNING.get_or_init(Default::default)
+}
+
+/// Keeps a pid in [`running_commands`] while its command runs.
+struct TrackedCommand(u32);
+
+impl TrackedCommand {
+    fn new(pid: u32) -> Self {
+        running_commands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for TrackedCommand {
+    fn drop(&mut self) {
+        running_commands()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Stop every terminal-page command still running, before a forced exit.
+/// Commands from the action buttons (`init`, `fsck --fix`) are not here on
+/// purpose: they are left to finish, since stopping one halfway is worse.
+pub(super) fn kill_running_commands() -> usize {
+    let pids: Vec<u32> =
+        std::mem::take(&mut *running_commands().lock().unwrap_or_else(|e| e.into_inner()))
+            .into_iter()
+            .collect();
+    for &pid in &pids {
+        travsr_plugin_host::watchdog::kill_pid(pid);
+    }
+    pids.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tracked_command_is_listed_while_it_runs_and_killed_on_a_forced_exit() {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+            .args(if cfg!(windows) {
+                &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
+            } else {
+                &["30"][..]
+            })
+            .spawn()
+            .unwrap();
+        let tracked = TrackedCommand::new(child.id());
+        assert!(running_commands().lock().unwrap().contains(&child.id()));
+        assert_eq!(kill_running_commands(), 1);
+        // Killed: wait returns at once, and not with success.
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "{status:?}");
+        // The list was emptied; dropping the guard later is harmless.
+        drop(tracked);
+        assert!(running_commands().lock().unwrap().is_empty());
+        // Untracked again once its guard drops.
+        let other = TrackedCommand::new(u32::MAX);
+        drop(other);
+        assert!(!running_commands().lock().unwrap().contains(&u32::MAX));
+    }
 
     fn p(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

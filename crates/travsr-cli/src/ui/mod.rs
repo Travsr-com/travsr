@@ -109,10 +109,39 @@ pub(crate) const EXIT_ON_STDIN_EOF_ENV: &str = "TRAVSR_UI_EXIT_ON_STDIN_EOF";
 /// process exits anyway.
 const PARENT_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// A receiver that completes when stdin reaches end of file or can no longer be
-/// read. The read blocks, so it runs on its own thread; the parent never writes
-/// anything, and anything it does write is discarded. `None` when the thread
-/// cannot be started, which leaves Ctrl-C as the only way to stop, as before.
+/// What one read of stdin says about the parent that holds the pipe.
+#[derive(Debug, PartialEq, Eq)]
+enum StdinRead {
+    /// End of file, or the pipe broke: the parent is gone.
+    Closed,
+    /// Bytes arrived (the parent never writes; they are discarded).
+    Data,
+    /// Nothing to read yet (a non-blocking pipe) or a signal: read again.
+    Again,
+    /// An error that says nothing about the parent. Watching stops; the
+    /// server keeps serving rather than shutting down while the parent may
+    /// well be alive (review of #1101).
+    Unreadable,
+}
+
+fn classify_stdin_read(read: &std::io::Result<usize>) -> StdinRead {
+    use std::io::ErrorKind;
+    match read {
+        Ok(0) => StdinRead::Closed,
+        Ok(_) => StdinRead::Data,
+        Err(e) => match e.kind() {
+            ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof => StdinRead::Closed,
+            ErrorKind::WouldBlock | ErrorKind::Interrupted => StdinRead::Again,
+            _ => StdinRead::Unreadable,
+        },
+    }
+}
+
+/// A receiver that completes with `Ok` when stdin closes. If stdin turns out
+/// to be unreadable the sender is dropped instead, and the receiver completes
+/// with `Err`, which the caller takes as "keep serving". The read blocks, so it
+/// runs on its own thread. `None` when the thread cannot be started, which
+/// leaves Ctrl-C as the only way to stop, as before.
 fn watch_stdin_eof() -> Option<tokio::sync::oneshot::Receiver<()>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -122,18 +151,33 @@ fn watch_stdin_eof() -> Option<tokio::sync::oneshot::Receiver<()>> {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 256];
             loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
+                let read = stdin.read(&mut buf);
+                match classify_stdin_read(&read) {
+                    StdinRead::Closed => {
+                        let _ = tx.send(());
+                        return;
+                    }
+                    StdinRead::Data => {}
+                    // A short pause, so a non-blocking pipe is not spun on.
+                    StdinRead::Again => std::thread::sleep(std::time::Duration::from_millis(200)),
+                    StdinRead::Unreadable => {
+                        tracing::warn!(
+                            error = ?read.err(),
+                            "cannot read stdin; travsr ui will not stop when its parent exits"
+                        );
+                        return;
+                    }
                 }
             }
-            let _ = tx.send(());
         })
         .ok()?;
     Some(rx)
 }
+
+/// Exit code of a forced stop: the parent was gone and the graceful shutdown
+/// did not finish within [`PARENT_GONE_GRACE`]. Not 0, so it does not read as
+/// a clean stop.
+const FORCED_EXIT_CODE: i32 = 2;
 
 /// Start the server and block until Ctrl-C (or, with
 /// [`EXIT_ON_STDIN_EOF_ENV`] set, until stdin closes).
@@ -202,16 +246,25 @@ pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> any
             };
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
-                // Ok or Err: the watcher sent EOF, or it is gone, which only
-                // happens once stdin can no longer be read either way.
-                _ = parent_gone => {
+                closed = parent_gone => {
+                    if closed.is_err() {
+                        // The watcher gave up on an unreadable stdin, which
+                        // says nothing about the parent: keep serving.
+                        let _ = tokio::signal::ctrl_c().await;
+                        return;
+                    }
                     tracing::info!("stdin closed: the process that started travsr ui exited, stopping");
                     // An in-flight query can hold a graceful shutdown for up
                     // to its deadline; with nobody left to read the answer,
                     // that wait is pointless.
                     std::thread::spawn(|| {
                         std::thread::sleep(PARENT_GONE_GRACE);
-                        std::process::exit(0);
+                        // `exit` runs no destructors, so the terminal page's
+                        // commands are stopped here rather than by their
+                        // kill_on_drop. Action commands are left to finish.
+                        let killed = terminal::kill_running_commands();
+                        tracing::warn!(killed, "travsr ui did not stop in time after its parent exited; forcing exit");
+                        std::process::exit(FORCED_EXIT_CODE);
                     });
                 }
             }
@@ -1254,5 +1307,40 @@ mod tests {
         assert_eq!(page_url(v4), "http://localhost:7330/");
         let v6: SocketAddr = "[::1]:7330".parse().unwrap();
         assert_eq!(page_url(v6), "http://[::1]:7330/");
+    }
+
+    /// Review of #1101: only a real end of file (or a broken pipe) means the
+    /// parent is gone. A non-blocking pipe's WouldBlock is retried, and any
+    /// other error stops the watching but keeps the server up.
+    #[test]
+    fn only_a_closed_stdin_means_the_parent_is_gone() {
+        use std::io::{Error, ErrorKind};
+        let err = |k: ErrorKind| -> std::io::Result<usize> { Err(Error::from(k)) };
+        assert_eq!(classify_stdin_read(&Ok(0)), StdinRead::Closed);
+        assert_eq!(
+            classify_stdin_read(&err(ErrorKind::BrokenPipe)),
+            StdinRead::Closed
+        );
+        assert_eq!(
+            classify_stdin_read(&err(ErrorKind::UnexpectedEof)),
+            StdinRead::Closed
+        );
+        assert_eq!(classify_stdin_read(&Ok(12)), StdinRead::Data);
+        assert_eq!(
+            classify_stdin_read(&err(ErrorKind::WouldBlock)),
+            StdinRead::Again
+        );
+        assert_eq!(
+            classify_stdin_read(&err(ErrorKind::Interrupted)),
+            StdinRead::Again
+        );
+        for k in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(classify_stdin_read(&err(k)), StdinRead::Unreadable, "{k:?}");
+        }
+        assert_ne!(FORCED_EXIT_CODE, 0, "a forced stop must not read as clean");
     }
 }
