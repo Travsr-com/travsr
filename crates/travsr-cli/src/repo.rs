@@ -47,6 +47,68 @@ pub fn find_git_root_for_write(start: &Path) -> anyhow::Result<PathBuf> {
     resolve_repo_root(start, WorktreeMode::StayInWorktree)
 }
 
+/// Where `travsr init` indexes, and which freshness path that implies.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InitRoot {
+    pub root: PathBuf,
+    /// No `.git` at `root` (RFC-031 plain mode): kept fresh by the file watcher
+    /// and a tree reconcile, with no git hooks.
+    pub plain: bool,
+}
+
+/// Resolve the root for `travsr init` (RFC-031 D1).
+///
+/// Every other command keeps [`find_git_root_for_write`]'s resolution, which
+/// already finds a plain-mode root through the registry once init has
+/// registered it. Only `init` may fall back to the starting directory, because
+/// only `init` creates an index.
+///
+/// Inside a git repo nothing changes. With no `.git` anywhere above, `start`
+/// becomes a plain-mode root, except where the folder has no natural boundary
+/// and indexing it is never what the user meant: `$HOME` and the filesystem
+/// root. A `.git` found at `$HOME` (a dotfiles repo) is refused the same way
+/// when `init` ran in a folder below it, since resolving there would index the
+/// whole home directory.
+pub fn find_root_for_init(start: &Path) -> anyhow::Result<InitRoot> {
+    resolve_init_root(start, dirs::home_dir().as_deref())
+}
+
+fn resolve_init_root(start: &Path, home: Option<&Path>) -> anyhow::Result<InitRoot> {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    let is_home = |p: &Path| home.is_some_and(|h| same(p, h));
+
+    match find_git_root_for_write(start) {
+        Ok(root) if root.join(".git").exists() => {
+            if is_home(&root) && !is_home(start) {
+                anyhow::bail!(
+                    "the nearest git repository is your home directory ({}), so indexing here \
+                     would index all of it; run `travsr init` in a folder that is not under a \
+                     repository at ~, or move the folder out from under it",
+                    root.display()
+                );
+            }
+            Ok(InitRoot { root, plain: false })
+        }
+        // A plain-mode root found through the registry.
+        Ok(root) => Ok(InitRoot { root, plain: true }),
+        Err(_) => {
+            let root = start.to_path_buf();
+            if is_home(&root) || root.parent().is_none() {
+                anyhow::bail!(
+                    "refusing to index {} in plain mode: it is your home directory or the \
+                     filesystem root, which is never what you meant; run `travsr init` inside \
+                     the folder you want to index",
+                    root.display()
+                );
+            }
+            Ok(InitRoot { root, plain: true })
+        }
+    }
+}
+
 fn resolve_repo_root(start: &Path, mode: WorktreeMode) -> anyhow::Result<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
@@ -74,7 +136,9 @@ fn resolve_repo_root(start: &Path, mode: WorktreeMode) -> anyhow::Result<PathBuf
             if let Some(root) = registered_ancestor(start) {
                 return Ok(root);
             }
-            anyhow::bail!("not inside a git repository; run `git init` first, then `travsr init`");
+            anyhow::bail!(
+                "not inside a git repository or an initialized folder; run `travsr init` here first"
+            );
         }
     }
 }
@@ -320,6 +384,71 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    // RFC-031 D1: `init` may fall back to the starting folder; nothing else does.
+
+    #[test]
+    fn init_root_in_a_git_repo_is_the_repo_and_not_plain() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let sub = tmp.path().join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let r = resolve_init_root(&sub, None).unwrap();
+        assert!(!r.plain);
+        assert_eq!(
+            r.root.canonicalize().unwrap(),
+            tmp.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn init_root_with_no_git_is_the_starting_folder_in_plain_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = resolve_init_root(tmp.path(), None).unwrap();
+        assert!(r.plain);
+        assert_eq!(r.root, tmp.path());
+    }
+
+    #[test]
+    fn init_root_refuses_home_and_the_filesystem_root_in_plain_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let err = resolve_init_root(home.path(), Some(home.path())).unwrap_err();
+        assert!(err.to_string().contains("home directory"), "{err}");
+
+        let root = Path::new(std::path::MAIN_SEPARATOR_STR);
+        let err = resolve_init_root(root, None).unwrap_err();
+        assert!(err.to_string().contains("filesystem root"), "{err}");
+    }
+
+    #[test]
+    fn init_root_refuses_a_folder_below_a_git_repo_at_home() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".git")).unwrap();
+        let ws = home.path().join("code/ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let err = resolve_init_root(&ws, Some(home.path())).unwrap_err();
+        assert!(err.to_string().contains("home directory"), "{err}");
+    }
+
+    /// Only the folder below the repo is refused. Running `init` at `~` itself
+    /// where `~` is a repo is the existing behavior and stays as it was.
+    #[test]
+    fn init_root_at_a_git_repo_that_is_home_is_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".git")).unwrap();
+        let r = resolve_init_root(home.path(), Some(home.path())).unwrap();
+        assert!(!r.plain);
+    }
+
+    /// The error every non-init command still gets must no longer tell the user
+    /// to `git init`, since `travsr init` works without it.
+    #[test]
+    fn the_not_initialized_error_does_not_send_users_to_git_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = find_git_root(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("travsr init"), "{err}");
+        assert!(!err.contains("git init"), "{err}");
     }
 
     #[test]

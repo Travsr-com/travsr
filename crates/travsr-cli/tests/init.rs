@@ -64,33 +64,230 @@ fn init_creates_db_in_git_repo() {
     );
 }
 
-#[test]
-fn init_fails_outside_git_repo() {
-    let tmp = tempfile::tempdir().unwrap();
+fn meta(db_path: &std::path::Path, key: &str) -> Option<String> {
+    SqliteStore::open(db_path).unwrap().get_meta(key).unwrap()
+}
 
-    let output = Command::cargo_bin("travsr")
+fn indexed_paths(db_path: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = SqliteStore::open(db_path)
         .unwrap()
-        .env("TRAVSR_DISABLE_REGISTRY", "1") // UX-017: don't pollute the real registry
-        .current_dir(tmp.path())
+        .get_all_file_hashes()
+        .unwrap()
+        .into_keys()
+        .collect();
+    v.sort();
+    v
+}
+
+/// RFC-031 D1: a folder with no VCS is indexed in plain mode. There is nothing
+/// to hook, so none is installed (and no `.git` is invented), and the index
+/// records how it stays fresh.
+#[test]
+fn init_in_a_plain_folder_indexes_it_and_installs_no_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/ts-small/a.ts"),
+        tmp.path().join("a.ts"),
+    )
+    .unwrap();
+
+    let out = travsr_init(tmp.path()).success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("plain mode"),
+        "init must say it is in plain mode so nobody expects git hooks, got: {stderr}"
+    );
+
+    let db_path = tmp.path().join(".travsr/graph.db");
+    let store = SqliteStore::open(&db_path).unwrap();
+    assert!(
+        store.node_count().unwrap() > 0,
+        "plain folder must be indexed"
+    );
+    assert!(
+        !tmp.path().join(".git").exists(),
+        "plain mode must not create a .git or install hooks"
+    );
+    assert_eq!(meta(&db_path, "vcs").as_deref(), Some("none"));
+    let rev = meta(&db_path, "last_commit").unwrap_or_default();
+    assert!(
+        rev.starts_with("plain-"),
+        "plain mode stamps a revision marker in place of a commit, got {rev:?}"
+    );
+}
+
+/// The revision marker moves when the tree does and holds still when it does
+/// not. If it moved on every run, Phase B would re-run whole-project analysis on
+/// every `travsr init`; if it never moved, an edit would never refresh it.
+#[test]
+fn plain_init_revision_holds_when_nothing_changed_and_moves_when_a_file_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.ts");
+    std::fs::write(&a, "export function a() { return 1; }\n").unwrap();
+    let db_path = tmp.path().join(".travsr/graph.db");
+
+    travsr_init(tmp.path()).success();
+    let first = meta(&db_path, "last_commit").unwrap();
+
+    travsr_init(tmp.path()).success();
+    assert_eq!(
+        meta(&db_path, "last_commit").unwrap(),
+        first,
+        "an unchanged tree must keep its revision"
+    );
+
+    std::fs::write(
+        &a,
+        "export function a() { return 2; }\nexport function b() {}\n",
+    )
+    .unwrap();
+    travsr_init(tmp.path()).success();
+    let third = meta(&db_path, "last_commit").unwrap();
+    assert_ne!(third, first, "an edited file must move the revision");
+    assert!(third.starts_with("plain-"));
+}
+
+/// RFC-031 D2: the folder's own `.gitignore` applies without git, and a
+/// `.gitignore` in a folder above it does not (it would silently drop files the
+/// folder's own rules never mention, and the watcher does not read it either).
+#[test]
+fn plain_init_uses_the_folders_own_gitignore_but_not_a_parents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("outer/ws");
+    std::fs::create_dir_all(ws.join("generated")).unwrap();
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(tmp.path().join("outer/.gitignore"), "from_parent.ts\n").unwrap();
+    std::fs::write(ws.join(".gitignore"), "generated/\n").unwrap();
+    let body = "export function f() { return 1; }\n";
+    for rel in ["generated/g.ts", "from_parent.ts", "src/a.ts"] {
+        std::fs::write(ws.join(rel), body).unwrap();
+    }
+
+    travsr_init(&ws).success();
+
+    let paths = indexed_paths(&ws.join(".travsr/graph.db"));
+    assert!(paths.contains(&"src/a.ts".to_string()), "{paths:?}");
+    assert!(
+        paths.contains(&"from_parent.ts".to_string()),
+        "a .gitignore above the folder must not apply: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"generated/g.ts".to_string()),
+        "the folder's own .gitignore must apply without git: {paths:?}"
+    );
+}
+
+/// Inside a git repo nothing changes: hooks are installed and the mode is
+/// recorded as git, which is what lets a later `travsr init` re-classify a
+/// folder that gained or lost its `.git`.
+#[test]
+fn init_in_a_git_repo_records_git_and_installs_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    git_init(tmp.path());
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+
+    travsr_init(tmp.path()).success();
+
+    assert_eq!(
+        meta(&tmp.path().join(".travsr/graph.db"), "vcs").as_deref(),
+        Some("git")
+    );
+    assert!(
+        tmp.path().join(".git/hooks/post-commit").exists(),
+        "git repos keep their hooks"
+    );
+}
+
+/// A folder that was indexed in plain mode and then `git init`ed is a git repo
+/// the next time `travsr init` runs: hooks appear and the mode flips.
+#[test]
+fn re_running_init_after_git_init_switches_a_plain_folder_to_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function a() { return 1; }\n",
+    )
+    .unwrap();
+    let db_path = tmp.path().join(".travsr/graph.db");
+
+    travsr_init(tmp.path()).success();
+    assert_eq!(meta(&db_path, "vcs").as_deref(), Some("none"));
+
+    git_init(tmp.path());
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-q", "-m", "c1"]);
+    travsr_init(tmp.path()).success();
+
+    assert_eq!(meta(&db_path, "vcs").as_deref(), Some("git"));
+    assert!(tmp.path().join(".git/hooks/post-commit").exists());
+    assert!(
+        !meta(&db_path, "last_commit")
+            .unwrap_or_default()
+            .starts_with("plain-"),
+        "a git repo stamps a real commit, not a plain-mode marker"
+    );
+}
+
+fn travsr_init_with_home(dir: &std::path::Path, home: &std::path::Path) -> (bool, String) {
+    let out = Command::cargo_bin("travsr")
+        .unwrap()
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("HOME", home)
         .env("CI", "1")
         .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .current_dir(dir)
         .arg("init")
         .output()
         .unwrap();
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
 
+/// Indexing a home directory is never what the user meant, and a plain-mode root
+/// has no `.git` to bound it. `HOME` is how `dirs` finds it on unix only.
+#[cfg(unix)]
+#[test]
+fn init_refuses_the_home_directory() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("a.ts"), "export const a = 1;\n").unwrap();
+
+    let (ok, out) = travsr_init_with_home(home.path(), home.path());
+
+    assert!(!ok, "init in $HOME must be refused");
+    assert!(out.contains("home directory"), "got: {out}");
     assert!(
-        !output.status.success(),
-        "init must fail outside a git repo"
+        !home.path().join(".travsr").exists(),
+        "a refused init must write nothing"
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("not inside a git repository"),
-        "error message must mention 'not inside a git repository', got: {combined}"
-    );
+}
+
+/// A dotfiles repo at `~` would make `travsr init` in `~/code/ws` resolve to `~`
+/// and index the whole home directory, so a folder below it is refused too.
+#[cfg(unix)]
+#[test]
+fn init_refuses_a_folder_below_a_git_repo_at_home() {
+    let home = tempfile::tempdir().unwrap();
+    git_init(home.path());
+    let ws = home.path().join("code/ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("a.ts"), "export const a = 1;\n").unwrap();
+
+    let (ok, out) = travsr_init_with_home(&ws, home.path());
+
+    assert!(!ok, "init below a git repo at $HOME must be refused");
+    assert!(out.contains("home directory"), "got: {out}");
+    assert!(!home.path().join(".travsr").exists());
+    assert!(!ws.join(".travsr").exists());
 }
 
 #[test]

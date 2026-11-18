@@ -1910,11 +1910,9 @@ pub(crate) fn detect_languages_in(dir: &std::path::Path) -> Vec<String> {
 
     let mut found = std::collections::HashSet::new();
 
-    for entry in ignore::WalkBuilder::new(dir)
-        .hidden(false)
-        .git_ignore(true)
-        .follow_links(false)
-        .add_custom_ignore_filename(".travsrignore")
+    // The shared walker, so detection reads the same ignore rules indexing does
+    // (including plain mode's, RFC-031 D2).
+    for entry in travsr_daemon::source_walker(dir)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             !SKIP_DIRS.iter().any(|d| *d == name.as_ref())

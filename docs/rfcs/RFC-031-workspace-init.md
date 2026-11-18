@@ -108,6 +108,25 @@ rebuild with `phase_b_scheduler.mark_dirty()`. The plain-mode startup trigger
 does the same two steps, or the call edges stay stale after a restart even
 though every file was rehashed.
 
+**A revision marker stands in for the commit.** `last_commit` is more than a
+display value. `run_background_phase_b_inner` returns immediately when it is
+empty, the query cache keys on it, and `travsr status` and the MCP freshness
+fields read it. A plain folder has no commit, so leaving it empty would leave
+the semantic layer permanently stale after every restart. Plain mode stores a
+`plain-<n>` marker there instead (`n` is a strictly increasing time-based
+number). It is minted when a pass changes the tree and reused when it does not,
+so a re-run over an unchanged folder finds Phase B already done instead of
+repeating whole-project analysis. Nothing resolves it with git: every reader
+that asks git about `last_commit` already treats a revision git cannot resolve
+as "unknown", and a git repo's real commit replaces the marker the next time
+`travsr init` runs there.
+
+The startup reconcile also rebuilds when the watcher left the semantic layer
+flagged degraded (`phase_b_dirty`), not only when file hashes differ. A file
+edited while the daemon ran was reindexed by the watcher, so its hash matches
+at the next start, but its call edges were dropped; without this a restart
+would never repair them. An unchanged tree arms nothing.
+
 **Dropped watcher events.** The daemon's event queues are bounded and drop
 events when full (#736). In a git repo that loss is repaired by the periodic
 HEAD reconcile and the next commit. Plain mode has neither, so a dropped event

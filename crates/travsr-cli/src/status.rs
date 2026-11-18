@@ -279,6 +279,14 @@ pub(crate) fn readiness_line(
     Some(format!("  {lang:<11} {text}"))
 }
 
+/// What keeps this index current, when that is not the git hooks. Silent for a
+/// git repo, where the hook is the expected answer and a line would be noise.
+fn freshness_source_line(plain: bool) -> Option<String> {
+    plain.then(|| {
+        "kept fresh by: file watcher (no git repository here, so no commit hook)".to_string()
+    })
+}
+
 pub fn run(verbose: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("getting current directory")?;
     // `head_at` and `find_git_root` are independent, bounded git queries on the
@@ -350,6 +358,11 @@ pub fn run(verbose: bool) -> anyhow::Result<()> {
     // default says per language, in plain words, where calls are not traced as
     // you edit.
     if let Ok(store) = daemon_client::open_read_store(&db_path) {
+        // RFC-031 D2: a plain folder has no commit hook, and a user who expects
+        // one should be told what keeps the index current instead.
+        if let Some(line) = freshness_source_line(travsr_daemon::is_plain_store(&store)) {
+            println!("{line}");
+        }
         if verbose {
             if let Some(line) = live_precision_line(&store) {
                 println!("{line}");
@@ -836,6 +849,16 @@ mod tests {
             language_lines(&states, true)[3],
             "  ruby        could not trace calls (the reason is below)"
         );
+    }
+
+    // RFC-031 D2: a plain folder is told what keeps it fresh, since it has no
+    // commit hook; a git repo gets no extra line.
+    #[test]
+    fn freshness_line_appears_only_in_plain_mode() {
+        let line = freshness_source_line(true).unwrap();
+        assert!(line.contains("file watcher"), "{line}");
+        assert!(!line.contains('\u{2014}'), "no em-dash: {line}");
+        assert_eq!(freshness_source_line(false), None);
     }
 
     fn payload(last: &str, phase_b: &str, dirty: bool) -> StatusPayload {
