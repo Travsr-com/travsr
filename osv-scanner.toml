@@ -39,3 +39,13 @@ reason = "paste 1.0.15 is unmaintained (archived by its author), not vulnerable.
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0319"
 reason = "anymap2 0.13.0 is unmaintained, not vulnerable. Build-time transitive dependency (liquid/tract codegen), no runtime exposure. No patched release exists."
+
+# chrono is unmaintained (RUSTSEC-2026-0543), not vulnerable: all versions are
+# affected and no patched release exists. Added alongside deny.toml's matching
+# entry. A direct runtime dependency of travsr-cli only, used for the `--since`
+# window of the log viewer, local-or-UTC formatting of log timestamps, and one
+# date stamp on a consent record; it parses no untrusted network input. The
+# advisory recommends jiff or time, so revisit as a migration.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono 0.4.45 is unmaintained, not vulnerable. Runtime use in travsr-cli is log-time formatting and the --since window only, with no untrusted network input. No patched release exists. Revisit as a jiff/time migration."
