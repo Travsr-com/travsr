@@ -134,9 +134,13 @@
       try {
         const raw = await ui.tool("get_callers", { symbol: sym });
         const lines = ui.parseEnvelope(raw);
-        const notes = ui.envelopeBody(raw).split("\n").map((l) => l.trim()).filter((l) => /^\[?note:/.test(l));
+        // Notes inside the envelope ("no call to X is recorded") and after it
+        // ("calls are still being traced ... not final"): without the second,
+        // an empty answer during a reindex read as final.
+        const notes = ui.envelopeBody(raw).split("\n").map((l) => l.trim()).filter((l) => /^\[?note:/.test(l))
+          .map((n) => n.replace(/^\[note:\s*/, "").replace(/\]$/, "")).concat(ui.trailingNotes(raw));
         out.innerHTML = '<h3 style="margin:0 0 12px">Callers of <code>' + esc(sym) + "</code></h3>" +
-          notes.map((n) => '<div class="note-box">' + esc(n.replace(/^\[note:\s*/, "").replace(/\]$/, "")) + "</div>").join("") +
+          notes.map((n) => '<div class="note-box">' + esc(n) + "</div>").join("") +
           '<ul class="results">' + (lines.map(callerLine).join("\n") || "<li><em>none</em></li>") + "</ul>";
       } catch (e) {
         out.innerHTML = '<div class="diag error"><div class="diag-t">' + esc(e.message) + "</div></div>";
@@ -228,6 +232,7 @@
         const capped = /\[note: showing the \d+ files nearest the change/.test(raw);
         out.innerHTML = '<h3 style="margin:0 0 12px">Blast radius for <code>' + esc(target) + "</code> " +
           '<span class="badge dim">' + files.length + (capped ? "+" : "") + " file" + (files.length === 1 ? "" : "s") + "</span></h3>" + pills() +
+          ui.trailingNotes(raw).map((n) => '<div class="note-box">' + esc(n) + "</div>").join("") +
           '<ul class="results">' + (files.map((f) => "<li>" + editorAnchor(f, null, f) +
             ' <a class="link-btn" href="' + esc(ui.withRepo("/dependencies", { file: f })) + '">deps</a></li>').join("\n") || "<li><em>none</em></li>") + "</ul>";
       } catch (e) {
@@ -1344,7 +1349,7 @@
         html += '<details class="hsec ch-file" open data-path="' + esc(f.path) + '"><summary>' +
           '<span class="ch-status ' + esc(f.status) + '">' + esc(f.status) + "</span>" +
           '<span class="ch-path">' + editorAnchor(f.path, null, f.path) + "</span>" +
-          '<span class="muted ch-meta">' + (f.indexed ? f.symbols.length + " symbol" + (f.symbols.length === 1 ? "" : "s") + " · " + callers + " caller" + (callers === 1 ? "" : "s") : "not in the index yet") + "</span>" +
+          '<span class="muted ch-meta">' + (f.indexed ? f.symbols.length + " symbol" + (f.symbols.length === 1 ? "" : "s") + " · " + callers + " caller" + (callers === 1 ? "" : "s") : f.status === "deleted" ? "not in the index" : "not in the index yet") + "</span>" +
           '<span class="ch-acts">' +
           (f.indexed && f.status !== "deleted" ? '<button class="link-btn" type="button" data-blast="' + esc(f.path) + '">blast radius</button>' : "") +
           (f.indexed ? '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: f.path })) + '">graph</a>' : "") +
@@ -1353,7 +1358,11 @@
           html += '<p class="sub">The index holds an earlier save of this file (the daemon indexed it, then stopped), so these symbols are matched with today\'s line numbers and may be slightly off. Reindex for an exact list.</p>';
         }
         if (!f.indexed) {
-          html += '<p class="sub">' + (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).</p>";
+          // A deleted file the index never held (removed before it was
+          // indexed, or ignored) has no symbols to list; it is not a new file.
+          html += '<p class="sub">' + (f.status === "deleted"
+            ? "This file is deleted and the index has no record of it, so it has no symbols to list."
+            : (f.status === "untracked" ? "A new file git is not tracking yet." : "A new file.") + " Its symbols appear once it is indexed (commit it, or run Reindex).") + "</p>";
         } else if (!f.symbols.length) {
           html += '<p class="sub">' + (f.hunks ? "The edit touches no indexed symbol (comments, imports or whitespace)." : "No line changes against the indexed commit.") + "</p>";
         }
