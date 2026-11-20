@@ -6941,6 +6941,34 @@ fn reconcile_head_drift(
     true
 }
 
+/// Plain mode's stand-in for "the next commit" (RFC-031 D2): when live edits
+/// left the semantic layer flagged degraded, mint a new revision so Phase B runs.
+///
+/// Phase B is gated on `last_commit != phase_b_commit`, and a plain folder has
+/// no commit to move `last_commit`, so without this the degraded flag would only
+/// clear on a daemon restart or a manual `travsr init`. Called from the gc tick,
+/// not per edit, so whole-project analysis does not run continuously while
+/// someone is typing (#583). Returns whether a run was armed.
+fn plain_heal_semantic(
+    store: &std::sync::Mutex<SqliteStore>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+) -> bool {
+    {
+        let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+        if !is_plain_store(&s) {
+            return false;
+        }
+        let meta = |k: &str| s.get_meta(k).ok().flatten().unwrap_or_default();
+        let last = meta("last_commit");
+        if meta("phase_b_dirty") != "1" || last.is_empty() || last != meta("phase_b_commit") {
+            return false;
+        }
+        let _ = s.set_meta("last_commit", &next_plain_revision(&last));
+    }
+    phase_b_scheduler.mark_dirty();
+    true
+}
+
 /// Whether a gc tick should run the whole-tree reconcile (RFC-031 D2).
 ///
 /// A git repo always reconciles: `reconcile_head_drift` is a cheap marker
@@ -14666,6 +14694,57 @@ mod tests {
         assert!(u64::from_str_radix(&next[PLAIN_REV_PREFIX.len()..], 16).unwrap() > u64::MAX / 2);
     }
 
+    /// Live edits in a plain folder flag the semantic layer degraded with the two
+    /// markers equal; there is no commit to move them, so the gc tick must mint a
+    /// new revision or the flag would never clear.
+    #[test]
+    fn plain_heal_mints_a_revision_only_when_dirty_and_caught_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        let (store, sched, index_tx) = plain_fixture(tmp.path());
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        let meta = |k: &str| {
+            store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_meta(k)
+                .unwrap()
+                .unwrap_or_default()
+        };
+        let before = meta("last_commit");
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+
+        // Clean: nothing to heal.
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_commit", &before)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_dirty", "0")
+            .unwrap();
+        assert!(!plain_heal_semantic(&store, &sched));
+        assert!(!sched.is_pending());
+
+        // Dirty with the markers equal: a new revision, and Phase B armed.
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_dirty", "1")
+            .unwrap();
+        assert!(plain_heal_semantic(&store, &sched));
+        assert!(sched.is_pending());
+        let after = meta("last_commit");
+        assert_ne!(after, before);
+        assert!(after.starts_with(PLAIN_REV_PREFIX));
+
+        // Already behind (a run is owed): leave it alone.
+        assert!(!plain_heal_semantic(&store, &sched));
+        assert_eq!(meta("last_commit"), after);
+    }
+
     /// A git repo reconciles every tick (a cheap marker compare). Plain mode runs
     /// at startup, then only when events were dropped since the last pass.
     #[test]
@@ -16614,6 +16693,12 @@ impl Daemon {
                         // re-checks the whole tree instead: at startup (this first
                         // tick) and whenever events were dropped since the last
                         // pass. A git repo is unchanged: every tick, as before.
+                        if plain_mode && plain_heal_semantic(&store, &phase_b_scheduler) {
+                            tracing::info!(
+                                event = "plain.semantic_heal",
+                                "edits left the semantic layer degraded, rerunning it"
+                            );
+                        }
                         let drops_now = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
                             + _watcher_handle.raw_dropped();
                         if plain_reconcile_due(plain_mode, plain_seen_drops, drops_now)
@@ -16813,6 +16898,12 @@ impl Daemon {
                         // re-checks the whole tree instead: at startup (this first
                         // tick) and whenever events were dropped since the last
                         // pass. A git repo is unchanged: every tick, as before.
+                        if plain_mode && plain_heal_semantic(&store, &phase_b_scheduler) {
+                            tracing::info!(
+                                event = "plain.semantic_heal",
+                                "edits left the semantic layer degraded, rerunning it"
+                            );
+                        }
                         let drops_now = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
                             + _watcher_handle.raw_dropped();
                         if plain_reconcile_due(plain_mode, plain_seen_drops, drops_now)

@@ -134,6 +134,23 @@ would stay unrepaired until the next daemon restart. When the watcher has
 dropped events since the last reconcile, plain mode runs the same full-tree
 reconcile on the next GC tick.
 
+**Semantic layer after live edits.** Phase B is gated on `last_commit` differing
+from `phase_b_commit`, and a plain folder has no commit to move it. A live edit
+sets `phase_b_dirty` with the two markers equal, so nothing would rerun Phase B
+until a restart. On each GC tick (every five minutes, not per edit, to keep the
+#583 rule that typing does not trigger whole-project analysis) a plain index with
+`phase_b_dirty=1` and equal markers mints a new `plain-<n>` revision and arms
+the debounced Phase B run.
+
+**Text search.** `find_pattern` runs `git grep --no-index --exclude-standard`
+over the working tree in plain mode, with the hard skip directories excluded by
+pathspec. It honours the folder's `.gitignore` but not `.travsrignore`.
+
+**Index status fields.** `get_index_status` reports `staleness.is_stale` and
+`head_commit` as null in plain mode, since there is no HEAD to compare. After a
+later `git init` with no commit yet, `last_commit` keeps its `plain-<n>` marker
+until the first commit.
+
 No git hooks are installed in plain mode, and `status` reports the freshness
 source as `watcher` rather than `post-commit hook`.
 

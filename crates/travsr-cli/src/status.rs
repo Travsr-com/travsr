@@ -933,7 +933,7 @@ mod tests {
         p.live_refs_pending = 0;
         assert_eq!(
             phase_b_state(&p),
-            "edits not yet committed were traced where found; commit for a full refresh"
+            "recent edits were traced where found; a full refresh is still pending"
         );
     }
 
@@ -946,7 +946,7 @@ mod tests {
         p.live_refs_pending = 3;
         assert_eq!(
             phase_b_state(&p),
-            "3 reference(s) in edits not yet committed are not traced yet"
+            "3 reference(s) in recent edits are not traced yet"
         );
     }
 
@@ -959,7 +959,7 @@ mod tests {
         p.live_refs_pending = 4;
         assert_eq!(
             phase_b_state(&p),
-            "4 reference(s) in edits not yet committed are not traced yet"
+            "4 reference(s) in recent edits are not traced yet"
         );
     }
 
