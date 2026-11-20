@@ -51,6 +51,7 @@ import {
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
 import { registerContextCodeAction } from "./contextCodeAction";
+import { registerBrowserUi } from "./browserUi";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -505,11 +506,15 @@ export function activate(context: vscode.ExtensionContext): void {
   // CLI↔UI parity commands (VSCODE-247): askSymbol, manageSynonyms,
   // showDependencies, showExecutionPath, showRepos, showGraphStats (Health,
   // which also carries the languages table).
-  registerParityCommands(proxy, context, binary, () => {
+  const activeRepo = registerParityCommands(proxy, context, binary, () => {
     codeLensProvider.clearCache();
     hoverProvider.clearCache();
     treeProvider.refresh();
   });
+
+  // #1060: open the `travsr ui` browser view for the targeted repository. The
+  // server it starts is stopped with the extension (it is a subscription).
+  registerBrowserUi(context, activeRepo, channel);
 
   // ITEM 1: Context Explorer — first-class surface for get_context.
   context.subscriptions.push(
