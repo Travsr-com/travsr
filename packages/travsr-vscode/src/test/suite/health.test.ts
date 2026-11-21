@@ -13,6 +13,12 @@ import {
   activeLogLevel,
   readIndexHealth,
   INDEX_STATUS_TIMEOUT_MS,
+  callToolTimed,
+  readDiagnostics,
+  DIAGNOSTICS_TIMEOUT_MS,
+  DIAGNOSTICS_UNREAD,
+  daemonLockSaysRunning,
+  CLI_TIMEOUTS_MS,
 } from "../../commands";
 import type { LogEntry } from "../../webviews";
 import {
@@ -424,6 +430,14 @@ suite("health panel rendering", () => {
     assert.ok(slow.includes("took too long to arrive"), "timeout reason");
     assert.ok(slow.includes("Refresh"), "and the remedy");
     assert.ok(!slow.includes("not reported by this binary"), "not the binary's age");
+  });
+
+  test("an integrity report that ran out of time says so (#1129)", () => {
+    const slow = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, { ...RUNNING, integrity: null, integrityTimedOut: true });
+    assert.ok(slow.includes("integrity report took too long to arrive"), "timeout reason");
+    assert.ok(!slow.includes("Could not read the integrity report"), "not a failure");
+    const failed = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, { ...RUNNING, integrity: null });
+    assert.ok(failed.includes("Could not read the integrity report"), "a real failure keeps its message");
   });
 
   test("the header carries a timestamp the document can count from", () => {
@@ -1200,5 +1214,116 @@ suite("Health: reading get_index_status", () => {
     const h = await readIndexHealth(f.client, undefined, f.now);
     assert.strictEqual(h.available, false);
     assert.ok(!h.timedOut, "an unknown tool answers immediately: not a timeout");
+  });
+});
+
+suite("Health: telling a slow tool from a missing one (#1129)", () => {
+  const client = (reply: string, elapsed: number, clock: { t: number }) => ({
+    callTool: async () => {
+      clock.t += elapsed;
+      return reply;
+    },
+  });
+
+  test("an empty reply that took the whole wait timed out", async () => {
+    const clock = { t: 0 };
+    const r = await callToolTimed(client("", 30_000, clock), "get_graph_health", 30_000, () => clock.t);
+    assert.deepStrictEqual(r, { raw: "", timedOut: true });
+  });
+
+  test("an empty reply that came back at once did not", async () => {
+    const clock = { t: 0 };
+    const r = await callToolTimed(client("", 20, clock), "get_graph_health", 30_000, () => clock.t);
+    assert.strictEqual(r.timedOut, false);
+  });
+
+  test("a real reply is never a timeout, however slow", async () => {
+    const clock = { t: 0 };
+    const r = await callToolTimed(client("<travsr-data>{}</travsr-data>", 30_000, clock), "x", 30_000, () => clock.t);
+    assert.strictEqual(r.timedOut, false);
+  });
+});
+
+suite("Health: analyzer diagnostics (#1131)", () => {
+  // Trimmed from a real `travsr status --verbose` on this repository.
+  const STATUS_OUT = [
+    "nodes: 18345 | edges: 44499 | schema: v23 | last_commit: 5199273e | semantic: pending",
+    "  typescript  could not trace calls: part of travsr is missing.",
+    "warning: full 'typescript' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started. Set TRAVSR_LSIF_TS, then re-run `travsr init --force`",
+    "warning: 'typescript' analysis: could not run travsr-lsif-ts (emitter not found) [emitter_missing]",
+    "",
+  ].join("\n");
+  const runner = (replies: Array<{ out: string; code: number | null }>) => {
+    const calls: Array<{ args: string[]; timeoutMs: number }> = [];
+    return {
+      calls,
+      run: async (_b: string, args: string[], _c: string, timeoutMs: number) => {
+        calls.push({ args, timeoutMs });
+        return replies.shift() ?? { out: "", code: 0 };
+      },
+    };
+  };
+
+  test("reads the warnings, waiting 45 s for them (the old 4 s killed it first)", async () => {
+    const r = runner([{ out: STATUS_OUT, code: 0 }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.strictEqual(diags.length, 2, "both warning lines");
+    assert.deepStrictEqual(r.calls, [{ args: ["status", "--verbose"], timeoutMs: DIAGNOSTICS_TIMEOUT_MS }]);
+    assert.strictEqual(DIAGNOSTICS_TIMEOUT_MS, 45_000);
+  });
+
+  test("a status that did not finish is unknown, never 'no problems'", async () => {
+    const r = runner([{ out: "nodes: 18345 | edges: 44499\n", code: null }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.deepStrictEqual(diags, [DIAGNOSTICS_UNREAD]);
+    // The panel then shows a warning card, not "Healthy, no problems reported".
+    const html = buildStatsHtml(STATS, [], diags, 500, undefined, 0, FRESH, RUNNING);
+    assert.ok(html.includes("Analyzer diagnostics could not be read"));
+    assert.ok(!html.includes("no analyzer or index problems reported"));
+  });
+
+  test("a binary that will not start is said so, not called a timeout (review of #1132)", async () => {
+    const r = runner([{ out: "error: spawn travsr ENOENT", code: null }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.strictEqual(diags.length, 1);
+    assert.ok(diags[0].hint.includes("could not be run (spawn travsr ENOENT)"), diags[0].hint);
+    assert.ok(!diags[0].hint.includes("did not finish in time"), "not a timeout");
+  });
+
+  test("an older binary without --verbose falls back to plain status", async () => {
+    const r = runner([
+      { out: "error: unexpected argument '--verbose' found", code: 2 },
+      { out: STATUS_OUT, code: 0 },
+    ]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.strictEqual(diags.length, 2);
+    assert.deepStrictEqual(r.calls.map((c) => c.args), [["status", "--verbose"], ["status"]]);
+  });
+});
+
+suite("Health: a daemon status that gave no answer (#1131)", () => {
+  const err = (code: string) => () => {
+    const e = new Error(code) as NodeJS.ErrnoException;
+    e.code = code;
+    throw e;
+  };
+
+  test("the lock file decides, as the server's daemon_running does", () => {
+    // Windows: a running daemon holds the lock exclusively.
+    assert.strictEqual(daemonLockSaysRunning("/r", err("EBUSY")), true);
+    assert.strictEqual(daemonLockSaysRunning("/r", err("EPERM")), true);
+    // Elsewhere: the pid in it, checked for life.
+    assert.strictEqual(daemonLockSaysRunning("/r", () => "4242", (pid) => pid === 4242), true);
+    assert.strictEqual(daemonLockSaysRunning("/r", () => "4242", () => false), false, "a dead pid");
+    assert.strictEqual(daemonLockSaysRunning("/r", () => "garbage", () => true), false);
+    // No lock file: no daemon.
+    assert.strictEqual(daemonLockSaysRunning("/r", err("ENOENT")), false);
+  });
+
+  test("the CLI limits match travsr ui's, not the old 4 s and 8 s", () => {
+    assert.deepStrictEqual(
+      { ...CLI_TIMEOUTS_MS },
+      { version: 8_000, daemonStatus: 30_000, embedList: 15_000, configList: 8_000 }
+    );
   });
 });

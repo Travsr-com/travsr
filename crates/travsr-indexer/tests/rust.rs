@@ -210,6 +210,197 @@ fn link_imports_rust_double_super_traverses_two_levels() {
     );
 }
 
+// ── #1130: module directories, item paths, crate:: ───────────────────────────
+
+/// The files a parsed snippet's imports resolve to, as repo-relative paths.
+fn resolved_targets(source: &str, vname_path: &str, candidates: &[&str]) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snippet.rs");
+    std::fs::write(&path, source).unwrap();
+    let out = Indexer::new()
+        .parse_file_with_vname(&path, vname_path)
+        .unwrap();
+    let edges = link_imports_rust(&out.nodes, vname_path, "c");
+    candidates
+        .iter()
+        .filter(|c| {
+            let id = travsr_core::VName::new("c", "", **c, "rust", "file").id();
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::ResolvesTo && e.dst == id)
+        })
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+#[test]
+fn super_from_an_ordinary_file_resolves_beside_it() {
+    // In ui/terminal.rs (module ui::terminal), `super` is `ui`, whose items
+    // live in ui/. This used to resolve from src/, so no Rust `use` reached a
+    // file and the file-level graph had no edges.
+    let got = resolved_targets(
+        "use super::files::CLI_SLOT_WAIT;
+use super::ApiError;
+",
+        "crates/cli/src/ui/terminal.rs",
+        &[
+            "crates/cli/src/ui/files.rs",
+            "crates/cli/src/files.rs",
+            "crates/cli/src/ui/files/CLI_SLOT_WAIT.rs",
+        ],
+    );
+    assert!(
+        got.contains(&"crates/cli/src/ui/files.rs".to_string()),
+        "{got:?}"
+    );
+    assert!(
+        !got.contains(&"crates/cli/src/files.rs".to_string()),
+        "not one level too high: {got:?}"
+    );
+}
+
+#[test]
+fn an_item_path_resolves_to_its_module_file() {
+    // The last segment may be an item; the module before it is emitted too.
+    let got = resolved_targets(
+        "use self::engine::Core;
+",
+        "src/lib.rs",
+        &["src/engine.rs", "src/engine/mod.rs", "src/engine/Core.rs"],
+    );
+    assert!(got.contains(&"src/engine.rs".to_string()), "{got:?}");
+    assert!(got.contains(&"src/engine/mod.rs".to_string()), "{got:?}");
+}
+
+#[test]
+fn crate_paths_resolve_from_the_crate_src_dir() {
+    let got = resolved_targets(
+        "use crate::daemon_client::try_query;
+use crate::ui::terminal::run;
+",
+        "crates/cli/src/ui/terminal.rs",
+        &[
+            "crates/cli/src/daemon_client.rs",
+            "crates/cli/src/ui/terminal.rs",
+            "crates/cli/src/ui/mod.rs",
+        ],
+    );
+    assert!(
+        got.contains(&"crates/cli/src/daemon_client.rs".to_string()),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&"crates/cli/src/ui/terminal.rs".to_string()),
+        "{got:?}"
+    );
+    // Two readings only (module, or item in the module before it): a
+    // three-segment path links ui/terminal.rs, not also the enclosing ui/mod.rs.
+    assert!(
+        !got.contains(&"crates/cli/src/ui/mod.rs".to_string()),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn an_integration_tests_crate_paths_stay_in_tests() {
+    // An integration test is its own crate, rooted in tests/: `crate::` there
+    // is not the library's src/.
+    let got = resolved_targets(
+        "use crate::helpers::setup;\n",
+        "crates/cli/tests/it.rs",
+        &["crates/cli/tests/helpers.rs", "crates/cli/src/helpers.rs"],
+    );
+    assert_eq!(got, vec!["crates/cli/tests/helpers.rs".to_string()]);
+}
+
+#[test]
+fn a_crate_path_in_no_crate_layout_is_skipped() {
+    let got = resolved_targets(
+        "use crate::helpers::setup;\n",
+        "scripts/tool.rs",
+        &["scripts/helpers.rs", "helpers.rs"],
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+/// Review of #1132: every crate root owns its directory, not only lib.rs and
+/// main.rs. This repo's crates/travsr-mcp/tests/conformance.rs declares
+/// `mod support;`, which lives in tests/support/mod.rs.
+#[test]
+fn mod_in_any_crate_root_lives_beside_it() {
+    for (root, child) in [
+        (
+            "crates/mcp/tests/conformance.rs",
+            "crates/mcp/tests/support/mod.rs",
+        ),
+        (
+            "crates/mcp/examples/demo.rs",
+            "crates/mcp/examples/support/mod.rs",
+        ),
+        (
+            "crates/mcp/benches/speed.rs",
+            "crates/mcp/benches/support/mod.rs",
+        ),
+        (
+            "crates/mcp/src/bin/tool.rs",
+            "crates/mcp/src/bin/support/mod.rs",
+        ),
+        ("crates/mcp/build.rs", "crates/mcp/support/mod.rs"),
+    ] {
+        let got = resolved_targets(
+            "mod support;\n",
+            root,
+            &[child, "crates/mcp/tests/conformance/support/mod.rs"],
+        );
+        assert_eq!(got, vec![child.to_string()], "{root}");
+    }
+}
+
+#[test]
+fn a_binarys_crate_paths_resolve_in_src_bin() {
+    let got = resolved_targets(
+        "use crate::cli::Args;\n",
+        "crates/mcp/src/bin/tool.rs",
+        &["crates/mcp/src/bin/cli.rs", "crates/mcp/src/cli.rs"],
+    );
+    assert_eq!(got, vec!["crates/mcp/src/bin/cli.rs".to_string()]);
+}
+
+#[test]
+fn a_tests_module_inside_src_is_an_ordinary_module() {
+    // src/tests/ is a module of the library, not an integration-test folder.
+    let got = resolved_targets(
+        "mod extra;\nuse crate::util;\n",
+        "crates/mcp/src/tests/foo.rs",
+        &[
+            "crates/mcp/src/tests/foo/extra.rs",
+            "crates/mcp/src/tests/extra.rs",
+            "crates/mcp/src/util.rs",
+            "crates/mcp/src/tests/util.rs",
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            "crates/mcp/src/tests/foo/extra.rs".to_string(),
+            "crates/mcp/src/util.rs".to_string()
+        ]
+    );
+}
+
+#[test]
+fn a_mod_declared_in_an_ordinary_file_lives_in_its_directory() {
+    // Rust 2018: bar.rs keeps `mod foo;` in bar/foo.rs.
+    let got = resolved_targets(
+        "mod foo;
+",
+        "src/bar.rs",
+        &["src/bar/foo.rs", "src/bar/foo/mod.rs", "src/foo.rs"],
+    );
+    assert!(got.contains(&"src/bar/foo.rs".to_string()), "{got:?}");
+    assert!(!got.contains(&"src/foo.rs".to_string()), "{got:?}");
+}
+
 // ── use_as_clause — alias stripped ────────────────────────────────────────────
 
 #[test]

@@ -389,7 +389,41 @@ fn plain_detail(lang: &str, r: &travsr_plugin_host::phase_b::status::Readiness) 
 /// Read-only: `LangToml::from_disk` reads `lang.toml` (honouring
 /// `TRAVSR_LANG_TOML`) and `CatalogResolver::new` reads it plus probes `PATH`.
 /// Nothing is written, nothing is downloaded.
+///
+/// #1128: this took 2.6 to 4.0 s per call on a Windows machine, mostly in
+/// `missing_build_file`, which runs `git ls-files` once or twice per language
+/// that needs a build file, plus the `PATH` probes for each tool. It ran on
+/// every `get_index_status`, and once per partial language in the note on every
+/// callers, blast radius and execution path answer. The answer is kept for
+/// [`AVAILABILITY_TTL`] under a key of everything it reads that can change
+/// ([`AvailabilityKey`]): a new Phase B run, `lang.toml`, `PATH`, a file added
+/// at the repository root (`compile_commands.json`, a build file), or a tracked
+/// file added anywhere (the git index) reads fresh at once.
 pub(crate) fn phase_b_availability(
+    root: Option<&Path>,
+    corpus: &str,
+    warnings: &str,
+) -> HashMap<&'static str, Option<String>> {
+    static CACHE: std::sync::OnceLock<AvailabilityCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = AvailabilityKey::now(root, corpus, warnings);
+    // One slot per repository (review of #1132): a global-mode server answers
+    // for several, and a single slot made them evict each other every call.
+    ttl_cached(
+        cache,
+        root.map(Path::to_path_buf),
+        key,
+        AVAILABILITY_TTL,
+        std::time::Instant::now(),
+        || compute_phase_b_availability(root, corpus, warnings),
+    )
+}
+
+/// The most repositories [`phase_b_availability`] keeps an answer for.
+const AVAILABILITY_SLOTS: usize = 32;
+
+/// The uncached readiness of every catalog language.
+fn compute_phase_b_availability(
     root: Option<&Path>,
     corpus: &str,
     warnings: &str,
@@ -425,6 +459,136 @@ pub(crate) fn phase_b_availability(
         out.insert(entry.language, detail);
     }
     out
+}
+
+/// How long a [`phase_b_availability`] answer is reused when nothing in its
+/// key changed. A tool put on `PATH` without touching `lang.toml`, or an
+/// untracked build file below the root, shows up within this.
+const AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Everything [`phase_b_availability`] reads that can change, so a change to
+/// any of it is a miss (#1128): the repository root, its top-level file names,
+/// the git index's size and modified time, the corpus, the stored Phase B
+/// warnings, `PATH`, `TRAVSR_BIN_DIR`, the session's unsandboxed opt-in, and
+/// `lang.toml` (its `TRAVSR_LANG_TOML` override, size and modified time).
+#[derive(Clone, PartialEq, Eq)]
+struct AvailabilityKey {
+    root: Option<std::path::PathBuf>,
+    root_listing: u64,
+    git_index: Option<(u64, std::time::SystemTime)>,
+    corpus: String,
+    warnings: String,
+    path: Option<std::ffi::OsString>,
+    bin_dir: Option<std::ffi::OsString>,
+    lang_toml_override: Option<std::ffi::OsString>,
+    lang_toml: Option<(u64, std::time::SystemTime)>,
+    unsandboxed: bool,
+}
+
+/// Size and modified time of a file, or `None` when it cannot be read.
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+impl AvailabilityKey {
+    fn now(root: Option<&Path>, corpus: &str, warnings: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let root_listing = root
+            .and_then(|r| std::fs::read_dir(r).ok())
+            .map(|entries| {
+                let mut names: Vec<std::ffi::OsString> =
+                    entries.flatten().map(|e| e.file_name()).collect();
+                names.sort();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                names.hash(&mut h);
+                h.finish()
+            })
+            .unwrap_or(0);
+        let lang_toml_override = std::env::var_os("TRAVSR_LANG_TOML");
+        let lang_toml = lang_toml_override
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".travsr").join("lang.toml")));
+        Self {
+            root: root.map(Path::to_path_buf),
+            root_listing,
+            git_index: root.and_then(git_index_path).and_then(|p| file_stamp(&p)),
+            corpus: corpus.to_string(),
+            warnings: warnings.to_string(),
+            path: std::env::var_os("PATH"),
+            bin_dir: std::env::var_os("TRAVSR_BIN_DIR"),
+            lang_toml_override,
+            lang_toml: lang_toml.and_then(|p| file_stamp(&p)),
+            unsandboxed: travsr_plugin_host::resolver::session_unsandboxed_opt_in(),
+        }
+    }
+}
+
+type AvailabilityCache = std::sync::Mutex<
+    HashMap<
+        Option<std::path::PathBuf>,
+        (
+            AvailabilityKey,
+            std::time::Instant,
+            HashMap<&'static str, Option<String>>,
+        ),
+    >,
+>;
+
+/// The index file of the git repository at `root`: `.git/index`, or for a
+/// linked worktree (where `.git` is a file reading `gitdir: <path>`) the
+/// index in that git directory (review of #1132: a worktree's tracked-file
+/// changes were only seen when the TTL ran out).
+fn git_index_path(root: &Path) -> Option<std::path::PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("index"));
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir = Path::new(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir.to_path_buf()
+    } else {
+        root.join(gitdir)
+    };
+    Some(gitdir.join("index"))
+}
+
+/// The value cached for `key` when it is younger than `ttl` at `now`, else
+/// `compute()`, stored. Computed outside the lock: two callers that miss at
+/// once both compute, which is cheaper than one waiting seconds on the other.
+fn ttl_cached<S: std::hash::Hash + Eq + Clone, K: PartialEq, V: Clone>(
+    cache: &std::sync::Mutex<HashMap<S, (K, std::time::Instant, V)>>,
+    slot: S,
+    key: K,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    compute: impl FnOnce() -> V,
+) -> V {
+    if let Some((k, at, v)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&slot) {
+        if *k == key && now.saturating_duration_since(*at) < ttl {
+            return v.clone();
+        }
+    }
+    let v = compute();
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // Bounded: drop expired slots first, then the oldest.
+    if map.len() >= AVAILABILITY_SLOTS && !map.contains_key(&slot) {
+        map.retain(|_, (_, at, _)| now.saturating_duration_since(*at) < ttl);
+        if map.len() >= AVAILABILITY_SLOTS {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, (_, at, _))| *at)
+                .map(|(s, _)| s.clone());
+            if let Some(oldest) = oldest {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(slot, (key, now, v.clone()));
+    v
 }
 
 // ── get_index_status ────────────────────────────────────────────────────────
@@ -1390,6 +1554,135 @@ pub fn get_graph_health_global(repos: &HashMap<String, PathBuf>, repo_arg: Optio
 
 #[cfg(test)]
 mod tests {
+    /// #1128: a cached value is reused within the TTL for the same key, and
+    /// recomputed after it, or as soon as the key changes (for readiness: the
+    /// repository root's files, the git index, lang.toml, PATH, the warnings;
+    /// see also the compile_commands.json test below).
+    #[test]
+    fn readiness_key_changes_with_what_the_ladder_reads() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap();
+        let key = |w: &str| super::AvailabilityKey::now(Some(root.path()), "c", w);
+        let before = key("");
+        assert!(
+            before == key(""),
+            "nothing changed: same key, so the answer is reused"
+        );
+        // A build file or compile_commands.json added at the root.
+        std::fs::write(root.path().join("compile_commands.json"), "[]").unwrap();
+        assert!(before != key(""), "a new root file must miss");
+        // A new Phase B run (new stored warnings).
+        let now = key("");
+        assert!(now != key("failed:c"), "new warnings must miss");
+        // A different lang.toml.
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("TRAVSR_LANG_TOML", other.path().join("lang.toml"));
+        let moved = key("");
+        std::env::remove_var("TRAVSR_LANG_TOML");
+        assert!(now != moved, "another lang.toml must miss");
+    }
+
+    #[test]
+    fn ttl_cache_reuses_within_the_ttl_and_misses_on_a_new_key() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let cache: std::sync::Mutex<HashMap<&str, (&str, Instant, u32)>> = Default::default();
+        let built = Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            built.get()
+        };
+        let ttl = Duration::from_secs(30);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=a", ttl, t0, build),
+            1
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=a", ttl, at(29), build),
+            1
+        );
+        assert_eq!(built.get(), 1, "reused within the TTL");
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=a", ttl, at(31), build),
+            2
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=b", ttl, at(32), build),
+            3
+        );
+        assert_eq!(
+            built.get(),
+            3,
+            "recomputed after the TTL, and at once on a new key"
+        );
+        // Review of #1132: repositories that take turns keep their own slots.
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-b", "PATH=b", ttl, at(33), build),
+            4
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=b", ttl, at(34), build),
+            3
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-b", "PATH=b", ttl, at(35), build),
+            4
+        );
+        assert_eq!(built.get(), 4, "alternating repos do not evict each other");
+    }
+
+    #[test]
+    fn ttl_cache_is_bounded() {
+        use std::time::{Duration, Instant};
+        let cache: std::sync::Mutex<HashMap<usize, ((), Instant, usize)>> = Default::default();
+        let t0 = Instant::now();
+        for i in 0..super::AVAILABILITY_SLOTS + 5 {
+            super::ttl_cached(
+                &cache,
+                i,
+                (),
+                Duration::from_secs(30),
+                t0 + Duration::from_millis(i as u64),
+                || i,
+            );
+        }
+        let map = cache.lock().unwrap();
+        assert_eq!(map.len(), super::AVAILABILITY_SLOTS);
+        assert!(!map.contains_key(&0), "the oldest slot went first");
+    }
+
+    /// Review of #1132: in a linked worktree `.git` is a file naming the git
+    /// directory, and the index lives there.
+    #[test]
+    fn git_index_path_follows_a_worktrees_gitdir() {
+        let root = tempfile::tempdir().unwrap();
+        let gitdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".git"),
+            format!(
+                "gitdir: {}
+",
+                gitdir.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::git_index_path(root.path()),
+            Some(gitdir.path().join("index"))
+        );
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::create_dir(plain.path().join(".git")).unwrap();
+        assert_eq!(
+            super::git_index_path(plain.path()),
+            Some(plain.path().join(".git").join("index"))
+        );
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(super::git_index_path(none.path()), None);
+    }
     use super::*;
 
     /// Serializes tests that mutate process-global env vars; the default test
