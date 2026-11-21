@@ -93,3 +93,22 @@ fn closing_stdin_does_nothing_without_the_variable() {
         "travsr ui exited on its own after stdin closed: {status:?}"
     );
 }
+
+/// #1119: on macOS and Linux the extension's fallback kill, `kill <pid>` and
+/// service managers send SIGTERM. `travsr ui` now takes the graceful path on
+/// it (stopping the page's commands first) instead of dying at once, so the
+/// process exits cleanly rather than by the signal.
+#[cfg(unix)]
+#[test]
+fn sigterm_is_a_clean_stop() {
+    let (child, _dir) = start(false);
+    let pid = child.id().to_string();
+    let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(sent.success());
+    let status =
+        exits_within(child, Duration::from_secs(15)).expect("travsr ui must stop on SIGTERM");
+    assert!(
+        status.success(),
+        "a clean stop, not death by signal: {status:?}"
+    );
+}

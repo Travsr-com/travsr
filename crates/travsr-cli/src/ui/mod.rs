@@ -174,6 +174,71 @@ fn watch_stdin_eof() -> Option<tokio::sync::oneshot::Receiver<()>> {
     Some(rx)
 }
 
+/// Why `travsr ui` is stopping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// Ctrl-C (SIGINT) from the terminal it runs in.
+    Interrupt,
+    /// stdin closed: the process that started it has gone (only with
+    /// [`EXIT_ON_STDIN_EOF_ENV`]).
+    ParentGone,
+    /// SIGTERM (macOS, Linux): what the VS Code extension's fallback kill,
+    /// `kill <pid>` and service managers send (#1119).
+    Terminate,
+}
+
+/// Wait until something asks the server to stop. `parent` is the stdin
+/// watcher; when it gives up on an unreadable stdin it never fires, since that
+/// says nothing about the parent.
+async fn stop_requested(parent: Option<tokio::sync::oneshot::Receiver<()>>) -> StopReason {
+    let parent_gone = async {
+        let closed = match parent {
+            Some(rx) => rx.await.is_ok(),
+            None => false,
+        };
+        if !closed {
+            std::future::pending::<()>().await;
+        }
+    };
+    let terminate = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => StopReason::Interrupt,
+        _ = parent_gone => StopReason::ParentGone,
+        _ = terminate => StopReason::Terminate,
+    }
+}
+
+/// Stop the page's running commands for every reason but Ctrl-C, and return
+/// how many were stopped.
+///
+/// On a closed stdin or SIGTERM nobody is left to read their answers (#1119:
+/// the extension's Stop ends stdin, and on macOS and Linux its fallback kill is
+/// SIGTERM). Stopping them now means their request futures end as soon as the
+/// child does, so the graceful shutdown finishes instead of waiting out a
+/// minute-long `lang list`, and none is left running after the server. A
+/// terminal user's Ctrl-C needs nothing: the shell signals the whole process
+/// group, children included.
+fn stop_page_commands(reason: StopReason) -> usize {
+    if reason == StopReason::Interrupt {
+        0
+    } else {
+        terminal::kill_running_commands()
+    }
+}
+
 /// Exit code of a forced stop: the parent was gone and the graceful shutdown
 /// did not finish within [`PARENT_GONE_GRACE`]. Not 0, so it does not read as
 /// a clean stop.
@@ -240,34 +305,24 @@ pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> any
     };
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
-            let Some(parent_gone) = parent else {
-                let _ = tokio::signal::ctrl_c().await;
+            let reason = stop_requested(parent).await;
+            let killed = stop_page_commands(reason);
+            if reason == StopReason::Interrupt {
                 return;
-            };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                closed = parent_gone => {
-                    if closed.is_err() {
-                        // The watcher gave up on an unreadable stdin, which
-                        // says nothing about the parent: keep serving.
-                        let _ = tokio::signal::ctrl_c().await;
-                        return;
-                    }
-                    tracing::info!("stdin closed: the process that started travsr ui exited, stopping");
-                    // An in-flight query can hold a graceful shutdown for up
-                    // to its deadline; with nobody left to read the answer,
-                    // that wait is pointless.
-                    std::thread::spawn(|| {
-                        std::thread::sleep(PARENT_GONE_GRACE);
-                        // `exit` runs no destructors, so the terminal page's
-                        // commands are stopped here rather than by their
-                        // kill_on_drop. Action commands are left to finish.
-                        let killed = terminal::kill_running_commands();
-                        tracing::warn!(killed, "travsr ui did not stop in time after its parent exited; forcing exit");
-                        std::process::exit(FORCED_EXIT_CODE);
-                    });
-                }
             }
+            tracing::info!(?reason, killed, "travsr ui stopping");
+            // An in-flight query can still hold the graceful shutdown for up
+            // to its deadline; with nobody left to read it, that wait is
+            // pointless.
+            std::thread::spawn(|| {
+                std::thread::sleep(PARENT_GONE_GRACE);
+                // `exit` runs no destructors, so anything started since is
+                // stopped here rather than by kill_on_drop. Action commands
+                // (init, fsck --fix) are left to finish on purpose.
+                let killed = terminal::kill_running_commands();
+                tracing::warn!(killed, "travsr ui did not stop in time; forcing exit");
+                std::process::exit(FORCED_EXIT_CODE);
+            });
         })
         .await?;
     // Plain println! panics on a closed stdout, which is exactly the state
@@ -1342,5 +1397,39 @@ mod tests {
             assert_eq!(classify_stdin_read(&err(k)), StdinRead::Unreadable, "{k:?}");
         }
         assert_ne!(FORCED_EXIT_CODE, 0, "a forced stop must not read as clean");
+    }
+
+    /// #1119: stopping because the parent closed stdin or because of SIGTERM
+    /// stops the page's running commands; Ctrl-C leaves that to the shell.
+    #[test]
+    fn a_stop_ends_the_page_commands_except_on_ctrl_c() {
+        let _serial = terminal::tracked_test_lock();
+        let sleeper = || {
+            std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+                .args(if cfg!(windows) {
+                    &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
+                } else {
+                    &["30"][..]
+                })
+                .spawn()
+                .unwrap()
+        };
+        for reason in [StopReason::ParentGone, StopReason::Terminate] {
+            let mut child = sleeper();
+            let _tracked = terminal::TrackedCommand::new(child.id());
+            assert_eq!(stop_page_commands(reason), 1, "{reason:?}");
+            let status = child.wait().unwrap();
+            assert!(!status.success(), "{reason:?}: the command was not stopped");
+        }
+        let mut child = sleeper();
+        let tracked = terminal::TrackedCommand::new(child.id());
+        assert_eq!(stop_page_commands(StopReason::Interrupt), 0);
+        assert_eq!(
+            terminal::kill_running_commands(),
+            1,
+            "Ctrl-C left it tracked"
+        );
+        let _ = child.wait();
+        drop(tracked);
     }
 }

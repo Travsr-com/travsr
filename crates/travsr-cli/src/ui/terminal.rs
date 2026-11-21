@@ -378,13 +378,15 @@ pub(super) async fn run(
     Ok(Json(resp))
 }
 
-/// Process ids of the terminal-page commands still running.
+/// Process ids of the page's commands still running: the Terminal page's
+/// (`/api/run`) and the allowlisted ones the Health page runs (`/api/cli`,
+/// such as a minutes-long `lang list`).
 ///
-/// Each one is spawned with `kill_on_drop`, which is enough for a normal stop:
-/// the request future is dropped and the command with it. A forced exit
-/// ([`kill_running_commands`], when the parent of `travsr ui` is gone and the
-/// graceful shutdown stalls) leaves through `std::process::exit`, which runs no
-/// destructors, so it stops them from this list instead (review of #1101).
+/// Each is spawned with `kill_on_drop`, but that only fires when its request
+/// future is dropped, which a stop does not do: on a closed stdin or SIGTERM
+/// the graceful shutdown would wait for the command, and a forced exit runs no
+/// destructors. So a stop kills them from this list ([`kill_running_commands`],
+/// review of #1101, #1119).
 fn running_commands() -> &'static std::sync::Mutex<std::collections::BTreeSet<u32>> {
     static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
         std::sync::OnceLock::new();
@@ -392,10 +394,10 @@ fn running_commands() -> &'static std::sync::Mutex<std::collections::BTreeSet<u3
 }
 
 /// Keeps a pid in [`running_commands`] while its command runs.
-struct TrackedCommand(u32);
+pub(super) struct TrackedCommand(u32);
 
 impl TrackedCommand {
-    fn new(pid: u32) -> Self {
+    pub(super) fn new(pid: u32) -> Self {
         running_commands()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -413,7 +415,14 @@ impl Drop for TrackedCommand {
     }
 }
 
-/// Stop every terminal-page command still running, before a forced exit.
+/// Serializes the tests that use the process-wide [`running_commands`] list.
+#[cfg(test)]
+pub(super) fn tracked_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Stop every tracked command still running, when the server is stopping.
 /// Commands from the action buttons (`init`, `fsck --fix`) are not here on
 /// purpose: they are left to finish, since stopping one halfway is worse.
 pub(super) fn kill_running_commands() -> usize {
@@ -433,6 +442,7 @@ mod tests {
 
     #[test]
     fn a_tracked_command_is_listed_while_it_runs_and_killed_on_a_forced_exit() {
+        let _serial = tracked_test_lock();
         let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
             .args(if cfg!(windows) {
                 &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
