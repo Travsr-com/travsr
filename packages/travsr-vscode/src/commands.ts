@@ -2539,13 +2539,32 @@ export function registerShowExecutionPath(
  * which is why they are cards here rather than entries in the Problems panel,
  * which wants a file to attach to.
  */
-export async function readDiagnostics(binary: string, cwd: string): Promise<Diagnostic[]> {
+/** How long `travsr status --verbose` may take for the Health page. The same
+ *  45 s `travsr ui` gives it: it took 5 to 6.5 s on a large Windows
+ *  repository, and the old 4 s default killed it before it printed a single
+ *  `warning:` line, so the page reported "no problems" (#1131). */
+export const DIAGNOSTICS_TIMEOUT_MS = 45_000;
+
+/** The card shown when the diagnostics could not be read: never "no problems". */
+export const DIAGNOSTICS_UNREAD: Diagnostic = {
+  severity: "warn",
+  title: "Analyzer diagnostics could not be read",
+  hint: "travsr status --verbose did not finish in time, so analyzer problems are unknown rather than absent. Press Refresh to read them again.",
+};
+
+export async function readDiagnostics(
+  binary: string,
+  cwd: string,
+  run: (binary: string, args: string[], cwd: string, timeoutMs: number) => Promise<{ out: string; code: number | null }> =
+    spawnLangCommandResult
+): Promise<Diagnostic[]> {
   // `warning:` lines print only with --verbose; plain status is plain words.
   // A binary older than --verbose printed them by default.
-  let out = await spawnLangCommand(binary, ["status", "--verbose"], cwd);
-  if (out.includes("unexpected argument '--verbose'")) {
-    out = await spawnLangCommand(binary, ["status"], cwd);
+  let r = await run(binary, ["status", "--verbose"], cwd, DIAGNOSTICS_TIMEOUT_MS);
+  if (r.out.includes("unexpected argument '--verbose'")) {
+    r = await run(binary, ["status"], cwd, DIAGNOSTICS_TIMEOUT_MS);
   }
+  const out = r.out;
   const found: Diagnostic[] = [];
   for (const line of out.split("\n")) {
     const m = /^\s*warning:\s*(.+)$/.exec(line);
@@ -2564,6 +2583,9 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       command: cmd ? cmd[1] : undefined,
     });
   }
+  // Killed on the timeout (or failed to start): what it printed is partial,
+  // and an empty list would read as a clean bill of health (#1131).
+  if (r.code === null) found.push(DIAGNOSTICS_UNREAD);
   return found;
 }
 

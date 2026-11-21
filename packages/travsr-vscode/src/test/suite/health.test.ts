@@ -14,6 +14,9 @@ import {
   readIndexHealth,
   INDEX_STATUS_TIMEOUT_MS,
   callToolTimed,
+  readDiagnostics,
+  DIAGNOSTICS_TIMEOUT_MS,
+  DIAGNOSTICS_UNREAD,
 } from "../../commands";
 import type { LogEntry } from "../../webviews";
 import {
@@ -1236,5 +1239,54 @@ suite("Health: telling a slow tool from a missing one (#1129)", () => {
     const clock = { t: 0 };
     const r = await callToolTimed(client("<travsr-data>{}</travsr-data>", 30_000, clock), "x", 30_000, () => clock.t);
     assert.strictEqual(r.timedOut, false);
+  });
+});
+
+suite("Health: analyzer diagnostics (#1131)", () => {
+  // Trimmed from a real `travsr status --verbose` on this repository.
+  const STATUS_OUT = [
+    "nodes: 18345 | edges: 44499 | schema: v23 | last_commit: 5199273e | semantic: pending",
+    "  typescript  could not trace calls: part of travsr is missing.",
+    "warning: full 'typescript' analysis is incomplete: the TypeScript analyzer (travsr-lsif-ts) could not be started. Set TRAVSR_LSIF_TS, then re-run `travsr init --force`",
+    "warning: 'typescript' analysis: could not run travsr-lsif-ts (emitter not found) [emitter_missing]",
+    "",
+  ].join("\n");
+  const runner = (replies: Array<{ out: string; code: number | null }>) => {
+    const calls: Array<{ args: string[]; timeoutMs: number }> = [];
+    return {
+      calls,
+      run: async (_b: string, args: string[], _c: string, timeoutMs: number) => {
+        calls.push({ args, timeoutMs });
+        return replies.shift() ?? { out: "", code: 0 };
+      },
+    };
+  };
+
+  test("reads the warnings, waiting 45 s for them (the old 4 s killed it first)", async () => {
+    const r = runner([{ out: STATUS_OUT, code: 0 }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.strictEqual(diags.length, 2, "both warning lines");
+    assert.deepStrictEqual(r.calls, [{ args: ["status", "--verbose"], timeoutMs: DIAGNOSTICS_TIMEOUT_MS }]);
+    assert.strictEqual(DIAGNOSTICS_TIMEOUT_MS, 45_000);
+  });
+
+  test("a status that did not finish is unknown, never 'no problems'", async () => {
+    const r = runner([{ out: "nodes: 18345 | edges: 44499\n", code: null }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.deepStrictEqual(diags, [DIAGNOSTICS_UNREAD]);
+    // The panel then shows a warning card, not "Healthy, no problems reported".
+    const html = buildStatsHtml(STATS, [], diags, 500, undefined, 0, FRESH, RUNNING);
+    assert.ok(html.includes("Analyzer diagnostics could not be read"));
+    assert.ok(!html.includes("no analyzer or index problems reported"));
+  });
+
+  test("an older binary without --verbose falls back to plain status", async () => {
+    const r = runner([
+      { out: "error: unexpected argument '--verbose' found", code: 2 },
+      { out: STATUS_OUT, code: 0 },
+    ]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.strictEqual(diags.length, 2);
+    assert.deepStrictEqual(r.calls.map((c) => c.args), [["status", "--verbose"], ["status"]]);
   });
 });
