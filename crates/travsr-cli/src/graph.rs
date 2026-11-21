@@ -414,7 +414,9 @@ fn print_tree(payload: &GraphPayload) {
 }
 
 /// Each node's row text: `label (kind)`, plus `path:line` when another node
-/// in the tree shares its label, so three `fn:run` rows say which `run`.
+/// in the tree shares its label, so three `fn:run` rows say which `run`. An
+/// import always carries it: `import:..globals` names what is imported, and
+/// only the path says which file imports it.
 fn tree_labels(payload: &GraphPayload) -> HashMap<u64, String> {
     let mut count: HashMap<&str, usize> = HashMap::new();
     for n in &payload.nodes {
@@ -425,7 +427,7 @@ fn tree_labels(payload: &GraphPayload) -> HashMap<u64, String> {
         .iter()
         .map(|n| {
             let mut text = format!("{} ({})", n.label, n.kind);
-            if count[n.label.as_str()] > 1 {
+            if count[n.label.as_str()] > 1 || n.kind == "import" {
                 text.push(' ');
                 text.push_str(&n.path);
                 if let Some(line) = n.line {
@@ -813,6 +815,35 @@ mod tests {
         assert_eq!(labels[&1], "fn:run (method) src/init.rs:3");
         assert_eq!(labels[&2], "fn:run (method) src/main.rs:3");
         assert_eq!(labels[&3], "fn:cmd_detect (method)");
+    }
+
+    /// A file's importers: the one `..globals` import is unique by label, but
+    /// without its path the row does not say which file imports it.
+    #[test]
+    fn a_unique_import_still_carries_its_location() {
+        let mut import = node(
+            1,
+            "import:..globals",
+            "import:..globals",
+            "src/flask/json/__init__.py",
+        );
+        import.kind = "import".to_string();
+        import.line = None;
+        let payload = GraphPayload {
+            seed: None,
+            nodes: vec![import],
+            edges: vec![],
+            tree: vec![],
+            coverage: None,
+            last_commit: None,
+            candidates: None,
+            fuzzy: false,
+        };
+        let labels = tree_labels(&payload);
+        assert_eq!(
+            labels[&1],
+            "import:..globals (import) src/flask/json/__init__.py"
+        );
     }
 
     /// Pin the schema_version 1 contract the review regressed and this PR

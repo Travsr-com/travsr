@@ -1625,9 +1625,12 @@ fn resolve_symbol_nodes(store: &SqliteStore, symbol: &str, path: Option<&str>) -
     // tiers above miss. Split at the last `.`, search the member, and keep
     // candidates whose signature carries the container qualifier; fall back to
     // a bare-member match only when it is unique AND genuinely unqualified
-    // (never a match with some OTHER, unrelated container).
+    // (never a match with some OTHER, unrelated container). A Rust or C++ path
+    // (`McpCommand::resolve`) is the same access spelled with `::`, and stored
+    // signatures qualify it with `.` (`method:McpCommand.resolve`).
     if candidates.is_empty() {
-        if let Some((container, member)) = symbol.rsplit_once('.') {
+        let dotted = symbol.replace("::", ".");
+        if let Some((container, member)) = dotted.rsplit_once('.') {
             if !container.is_empty() && !member.is_empty() {
                 let found = store.search_nodes_by_name(member).unwrap_or_else(|e| {
                     tracing::warn!("resolve_symbol_nodes dotted search '{member}': {e}");
@@ -22170,6 +22173,39 @@ mod snippet_tests {
         assert!(
             !out.contains("ClassD.shared"),
             "must not match the other container: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_rust_path_resolves_like_dotted() {
+        // `Type::method` is how a Rust user names a method; the stored signature
+        // spells it `method:Type.method`, so it must resolve via the dotted tier.
+        use travsr_core::{Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let ours = Node::new(
+            VName::new(
+                "",
+                "",
+                "src/connect.rs",
+                "rust",
+                "method:McpCommand.resolve",
+            ),
+            "method",
+        )
+        .with_line(217);
+        let other = Node::new(
+            VName::new("", "", "src/config.rs", "rust", "method:Config.resolve"),
+            "method",
+        )
+        .with_line(9);
+        store.put_node(&ours).unwrap();
+        store.put_node(&other).unwrap();
+
+        let out = find_references_structured(&store, "McpCommand::resolve", None);
+        assert_eq!(out.status, "resolved");
+        assert_eq!(
+            out.resolved_to.map(|r| r.signature),
+            Some("method:McpCommand.resolve".to_string())
         );
     }
 
