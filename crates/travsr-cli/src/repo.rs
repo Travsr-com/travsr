@@ -92,21 +92,34 @@ fn resolve_init_root(start: &Path, home: Option<&Path>) -> anyhow::Result<InitRo
             }
             Ok(InitRoot { root, plain: false })
         }
-        // A plain-mode root found through the registry.
-        Ok(root) => Ok(InitRoot { root, plain: true }),
+        // A plain-mode root found through the registry or an ancestor's own
+        // index. It goes through the same refusal as a fresh root: a stray
+        // index left at `~` (a dotfiles repo whose `.git` was removed) must
+        // not turn `init` in `~/notes` into an index of the whole home.
+        Ok(root) => {
+            refuse_unbounded_root(&root, &is_home)?;
+            Ok(InitRoot { root, plain: true })
+        }
         Err(_) => {
             let root = start.to_path_buf();
-            if is_home(&root) || root.parent().is_none() {
-                anyhow::bail!(
-                    "refusing to index {} in plain mode: it is your home directory or the \
-                     filesystem root, which is never what you meant; run `travsr init` inside \
-                     the folder you want to index",
-                    root.display()
-                );
-            }
+            refuse_unbounded_root(&root, &is_home)?;
             Ok(InitRoot { root, plain: true })
         }
     }
+}
+
+/// Plain mode never indexes `$HOME` or the filesystem root: neither has a
+/// natural boundary, so it is never what the user meant.
+fn refuse_unbounded_root(root: &Path, is_home: &dyn Fn(&Path) -> bool) -> anyhow::Result<()> {
+    if is_home(root) || root.parent().is_none() {
+        anyhow::bail!(
+            "refusing to index {} in plain mode: it is your home directory or the \
+             filesystem root, which is never what you meant; run `travsr init` inside \
+             the folder you want to index",
+            root.display()
+        );
+    }
+    Ok(())
 }
 
 fn resolve_repo_root(start: &Path, mode: WorktreeMode) -> anyhow::Result<PathBuf> {
@@ -410,6 +423,17 @@ mod tests {
             r.root.canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn a_stray_index_at_home_does_not_make_init_below_it_index_home() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".travsr")).unwrap();
+        std::fs::write(home.path().join(".travsr/graph.db"), b"").unwrap();
+        let notes = home.path().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let err = resolve_init_root(&notes, Some(home.path())).unwrap_err();
+        assert!(err.to_string().contains("refusing to index"), "{err}");
     }
 
     #[test]
