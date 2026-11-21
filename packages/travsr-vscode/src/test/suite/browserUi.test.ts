@@ -20,6 +20,7 @@ import {
   uiEnv,
   EXIT_ON_STDIN_EOF_ENV,
   StartCancelled,
+  SHUTDOWN_FALLBACK_MS,
   resolveUiBinary,
   unwrapNodeShim,
 } from "../../browserUi";
@@ -232,6 +233,68 @@ suite("#1060 review: stopping and restarting", () => {
     assert.strictEqual(calls.length, 3, "a new binaryPath takes effect");
     serve(2);
     await c;
+    server.dispose();
+  });
+});
+
+suite("review of #1126: closing the window stops every travsr", () => {
+  const serve = (proc: FakeProc, port: number): void =>
+    proc.say(`travsr ui: serving http://localhost:${port}/`, "press Ctrl-C to stop");
+  const serverOn = (platform: string) => {
+    const { spawn, calls } = fakeSpawner();
+    return { calls, server: new BrowserUiServer(spawn, undefined, 5_000, 1_000, 8_000, platform) };
+  };
+
+  test("macOS/Linux: a travsr that ignores the end of file (v1.4.0) is killed at once", async () => {
+    const { calls, server } = serverOn("linux");
+    const started = server.start("travsr", "/r", 0);
+    calls[0].proc.withStdin(false);
+    serve(calls[0].proc, 41);
+    await started;
+    const done = server.shutdown();
+    assert.ok(calls[0].proc.stdin!.ended, "stdin closed (the graceful path for a current travsr)");
+    assert.ok(calls[0].proc.killed, "and SIGTERM sent at once, not after an 8 s timer the host never runs");
+    await done;
+    assert.ok(!server.running);
+  });
+
+  test("Windows: a current travsr exits on the end of file, no kill", async () => {
+    const { calls, server } = serverOn("win32");
+    const started = server.start("travsr", "/r", 0);
+    calls[0].proc.withStdin(true, 20);
+    serve(calls[0].proc, 42);
+    await started;
+    await server.shutdown();
+    assert.ok(calls[0].proc.stdin!.ended);
+    assert.ok(!calls[0].proc.killed, "TerminateProcess would skip its cleanup");
+  });
+
+  test("Windows: a travsr that ignores the end of file is killed after the short wait", async function () {
+    this.timeout(8_000);
+    const { calls, server } = serverOn("win32");
+    const started = server.start("travsr", "/r", 0);
+    calls[0].proc.withStdin(false);
+    serve(calls[0].proc, 43);
+    await started;
+    const t0 = Date.now();
+    await server.shutdown();
+    assert.ok(calls[0].proc.killed, "killed, so it is not left running after the window closes");
+    assert.ok(Date.now() - t0 < SHUTDOWN_FALLBACK_MS + 1_500, "within the wait deactivate returns");
+  });
+
+  test("a start queued behind the old server's exit counts as running", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const first = server.start("travsr", "/a", 7330);
+    calls[0].proc.withStdin(true, 40);
+    serve(calls[0].proc, 7330);
+    await first;
+    const second = server.start("travsr", "/b", 7330);
+    assert.strictEqual(calls.length, 1, "still waiting for port 7330");
+    assert.ok(server.running, "running while the start is queued");
+    assert.strictEqual(server.stop(), true);
+    await assert.rejects(second, (e: unknown) => e instanceof StartCancelled);
+    assert.ok(!server.running);
     server.dispose();
   });
 });
@@ -606,7 +669,9 @@ suite("#1060 browser UI: real travsr ui (TRAVSR_UI_E2E_BINARY)", function () {
                 { encoding: "utf8" }
               )
             : execFileSync("pgrep", ["-P", String(pid), "-f", "lang list"], { encoding: "utf8" });
-        return out.split(/s+/).filter(Boolean).map(Number);
+        // Whitespace, not the letter s (review of #1126): with two pids the old
+        // split gave NaN and the test checked nothing.
+        return out.split(/\s+/).filter(Boolean).map(Number).filter(Number.isInteger);
       } catch {
         return [];
       }

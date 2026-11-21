@@ -133,6 +133,11 @@ export const STATUS_LINE_GRACE_MS = 1_000;
  *  variable ignores the end of file and is killed instead. */
 export const STOP_FALLBACK_MS = 8_000;
 
+/** How long closing the window waits on Windows for the server to exit after
+ *  its stdin closes before killing it. Short: `deactivate` returns the wait,
+ *  and VS Code gives that only a few seconds (review of #1126). */
+export const SHUTDOWN_FALLBACK_MS = 3_000;
+
 /** The address from a `travsr ui: serving <url>` line, or null for any other
  *  line. */
 export function parseServingUrl(line: string): string | null {
@@ -266,8 +271,12 @@ export class BrowserUiServer implements vscode.Disposable {
     private readonly log: (line: string) => void = () => undefined,
     private readonly timeoutMs: number = START_TIMEOUT_MS,
     private readonly graceMs: number = STATUS_LINE_GRACE_MS,
-    private readonly stopFallbackMs: number = STOP_FALLBACK_MS
+    private readonly stopFallbackMs: number = STOP_FALLBACK_MS,
+    private readonly platform: string = process.platform
   ) {}
+
+  /** A fixed-port start is waiting for the server it replaces to exit. */
+  private waiting = false;
 
   /** Resolves when the last server stopped through its stdin has exited:
    *  a server on a fixed port must be gone before its successor binds it. */
@@ -275,7 +284,9 @@ export class BrowserUiServer implements vscode.Disposable {
 
   /** Whether a server process is alive (starting or serving). */
   get running(): boolean {
-    return this.proc !== undefined;
+    // A start queued behind the old server's exit counts: stop() would cancel
+    // it (review of #1126).
+    return this.proc !== undefined || this.waiting;
   }
 
   /** The repository the current server was started in. */
@@ -295,6 +306,7 @@ export class BrowserUiServer implements vscode.Disposable {
     // A fixed port stays bound until the server being replaced has exited,
     // which a graceful stop no longer makes immediate (#1119). Launch after it.
     let cancelled = false;
+    this.waiting = true;
     const pending = previous.then(() => {
       if (cancelled) throw new StartCancelled();
       return this.launch(binary, repo, port, key);
@@ -311,6 +323,7 @@ export class BrowserUiServer implements vscode.Disposable {
 
   /** Spawn `travsr ui` and wait for its address. */
   private launch(binary: string, repo: string, port: number, key: string): Promise<StartResult> {
+    this.waiting = false;
     const args = uiArgs(port);
     this.log(`$ ${binary} ${args.join(" ")}   (in ${repo})`);
     let proc: UiProcess;
@@ -432,12 +445,16 @@ export class BrowserUiServer implements vscode.Disposable {
    * the variable). Resolves once it has exited; `undefined` when it had no
    * stdin to close and was killed outright.
    */
-  private end(proc: UiProcess): Promise<void> | undefined {
+  private end(
+    proc: UiProcess,
+    opts: { killNow?: boolean; fallbackMs?: number; keepAlive?: boolean } = {}
+  ): Promise<void> | undefined {
     const stdin = proc.stdin;
     if (!stdin) {
       proc.kill();
       return undefined;
     }
+    const fallbackMs = opts.fallbackMs ?? this.stopFallbackMs;
     return new Promise<void>((resolve) => {
       let fallback: ReturnType<typeof setTimeout> | undefined;
       let giveUp: ReturnType<typeof setTimeout> | undefined;
@@ -451,20 +468,51 @@ export class BrowserUiServer implements vscode.Disposable {
         proc.kill();
         // A process that ignores even that must not hold a successor forever.
         giveUp = setTimeout(done, 2_000);
-        giveUp.unref?.();
-      }, this.stopFallbackMs);
-      // Never keeps the extension host alive on its own.
-      fallback.unref?.();
+        if (!opts.keepAlive) giveUp.unref?.();
+      }, fallbackMs);
+      // Never keeps the extension host alive on its own, except while
+      // deactivate is waiting on it.
+      if (!opts.keepAlive) fallback.unref?.();
       try {
         stdin.end();
       } catch {
         proc.kill();
       }
+      if (opts.killNow) proc.kill();
     });
   }
 
+  /**
+   * Stop the server because the extension is going away (window closed or
+   * reloaded, extension disabled), and resolve once it has exited.
+   *
+   * Review of #1126: `stop()`'s 8 s fallback kill never fired here, because the
+   * extension host exits first, so a travsr that predates
+   * TRAVSR_UI_EXIT_ON_STDIN_EOF (v1.4.0 ignores it) was left running, and on a
+   * fixed port the next session's Open failed with "port already in use".
+   * - macOS / Linux: close stdin and send SIGTERM at once. The new CLI takes
+   *   SIGTERM as a graceful stop; an older one dies, as it always did.
+   * - Windows: close stdin and kill after SHUTDOWN_FALLBACK_MS. `deactivate`
+   *   returns this, so VS Code waits for it, and the timer keeps the host
+   *   alive meanwhile.
+   */
+  shutdown(): Promise<void> {
+    const proc = this.proc;
+    const cancel = this.cancelStart;
+    const wasServing = this.serving;
+    this.clear();
+    cancel?.();
+    if (wasServing) this.runningEmitter.fire(false);
+    if (!proc) return Promise.resolve();
+    const windows = this.platform === "win32";
+    return (
+      this.end(proc, { killNow: !windows, fallbackMs: SHUTDOWN_FALLBACK_MS, keepAlive: windows }) ??
+      Promise.resolve()
+    );
+  }
+
   dispose(): void {
-    this.stop();
+    void this.shutdown();
     this.runningEmitter.dispose();
     this.exitEmitter.dispose();
   }
@@ -482,6 +530,7 @@ export class BrowserUiServer implements vscode.Disposable {
     this.started = undefined;
     this.cancelStart = undefined;
     this.serving = false;
+    this.waiting = false;
   }
 }
 

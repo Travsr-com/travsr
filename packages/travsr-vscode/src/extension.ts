@@ -51,7 +51,7 @@ import {
 import { ContextExplorerPanel, getSymbolAtCursor } from "./contextExplorer";
 import { registerMcpServerCommand } from "./mcpRegister";
 import { registerContextCodeAction } from "./contextCodeAction";
-import { registerBrowserUi } from "./browserUi";
+import { BrowserUiServer, registerBrowserUi } from "./browserUi";
 
 export function activate(context: vscode.ExtensionContext): void {
   const channel = vscode.window.createOutputChannel("Travsr");
@@ -514,7 +514,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // #1060: open the `travsr ui` browser view for the targeted repository. The
   // server it starts is stopped with the extension (it is a subscription).
-  registerBrowserUi(context, activeRepo, channel);
+  browserUi = registerBrowserUi(context, activeRepo, channel);
 
   // ITEM 1: Context Explorer — first-class surface for get_context.
   context.subscriptions.push(
@@ -629,8 +629,12 @@ export function activate(context: vscode.ExtensionContext): void {
   void checkBinaryAndPrompt(proxy, context, workspaceRoot, version, channel, configured, onDaemonFailed);
 }
 
-export function deactivate(): void {
-  return;
+/** The window's `travsr ui` server, stopped (and waited for) on deactivate. */
+let browserUi: BrowserUiServer | undefined;
+
+export function deactivate(): Promise<void> | undefined {
+  // Returned so VS Code waits for the server to exit (review of #1126).
+  return browserUi?.shutdown();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
