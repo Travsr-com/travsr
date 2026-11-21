@@ -31,6 +31,22 @@ class FakeProc extends EventEmitter implements UiProcess {
   killed = false;
   /** A process that hangs: kill() does not make it exit. */
   ignoreKill = false;
+  /** Set by withStdin(): what closing stdin does, as the real CLI would. */
+  stdin: { end(): void; ended: boolean } | null = null;
+  /** Give the fake a stdin. `exitOnEof`: a travsr that knows
+   *  TRAVSR_UI_EXIT_ON_STDIN_EOF exits cleanly after `delayMs`; otherwise it
+   *  ignores the end of file, like v1.4.0. */
+  withStdin(exitOnEof: boolean, delayMs = 0): this {
+    const stdin = {
+      ended: false,
+      end: () => {
+        stdin.ended = true;
+        if (exitOnEof) setTimeout(() => this.emit("exit", 0), delayMs);
+      },
+    };
+    this.stdin = stdin;
+    return this;
+  }
   kill(): boolean {
     this.killed = true;
     if (!this.ignoreKill) setImmediate(() => this.emit("exit", null));
@@ -216,6 +232,88 @@ suite("#1060 review: stopping and restarting", () => {
     assert.strictEqual(calls.length, 3, "a new binaryPath takes effect");
     serve(2);
     await c;
+    server.dispose();
+  });
+});
+
+suite("#1119: Stop ends the server through its stdin", () => {
+  const serve = (proc: FakeProc, port: number): void =>
+    proc.say(`travsr ui: serving http://localhost:${port}/`, "press Ctrl-C to stop");
+
+  test("Stop closes stdin instead of killing, so the CLI shuts down gracefully", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const started = server.start("travsr", "/r", 0);
+    calls[0].proc.withStdin(true);
+    serve(calls[0].proc, 31);
+    await started;
+    const exits: Array<number | null> = [];
+    server.onUnexpectedExit((c) => exits.push(c));
+    assert.strictEqual(server.stop(), true);
+    assert.ok(calls[0].proc.stdin!.ended, "stdin was closed");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(!calls[0].proc.killed, "no kill: the CLI exited on the end of file");
+    assert.deepStrictEqual(exits, [], "a requested stop is not an unexpected exit");
+    server.dispose();
+  });
+
+  test("a travsr that ignores the end of file is killed after the fallback", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn, undefined, 5_000, 1_000, 30);
+    const started = server.start("travsr", "/r", 0);
+    calls[0].proc.withStdin(false);
+    serve(calls[0].proc, 32);
+    await started;
+    server.stop();
+    assert.ok(calls[0].proc.stdin!.ended);
+    assert.ok(!calls[0].proc.killed, "not killed straight away");
+    await new Promise((r) => setTimeout(r, 80));
+    assert.ok(calls[0].proc.killed, "killed once the fallback ran out");
+    server.dispose();
+  });
+
+  test("on a fixed port, the next server starts only after the old one exits", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const first = server.start("travsr", "/a", 7330);
+    calls[0].proc.withStdin(true, 40);
+    serve(calls[0].proc, 7330);
+    await first;
+    const second = server.start("travsr", "/b", 7330);
+    assert.ok(calls[0].proc.stdin!.ended);
+    assert.strictEqual(calls.length, 1, "port 7330 is still bound by the old server");
+    await new Promise((r) => setTimeout(r, 80));
+    assert.strictEqual(calls.length, 2, "launched once the old server exited");
+    serve(calls[1].proc, 7330);
+    assert.strictEqual((await second).url, "http://localhost:7330/");
+    assert.strictEqual(server.repoRoot, "/b");
+    server.dispose();
+  });
+
+  test("Stop while waiting for the port cancels the next server before it spawns", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const first = server.start("travsr", "/a", 7330);
+    calls[0].proc.withStdin(true, 40);
+    serve(calls[0].proc, 7330);
+    await first;
+    const second = server.start("travsr", "/b", 7330);
+    assert.strictEqual(server.stop(), true, "the pending start counts as running");
+    await assert.rejects(second, (e: unknown) => e instanceof StartCancelled);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.strictEqual(calls.length, 1, "never spawned");
+    server.dispose();
+  });
+
+  test("port 0 does not wait: the next server gets a free port at once", async () => {
+    const { spawn, calls } = fakeSpawner();
+    const server = new BrowserUiServer(spawn);
+    const first = server.start("travsr", "/a", 0);
+    calls[0].proc.withStdin(true, 40);
+    serve(calls[0].proc, 33);
+    await first;
+    void server.start("travsr", "/b", 0);
+    assert.strictEqual(calls.length, 2);
     server.dispose();
   });
 });
@@ -472,6 +570,87 @@ suite("#1060 browser UI: real travsr ui (TRAVSR_UI_E2E_BINARY)", function () {
     } finally {
       server.dispose();
       fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  // #1119: needs a travsr built with the graceful stop (after 1.4.0).
+  test("Stop also stops a page command that is still running", async function () {
+    if (!binary) this.skip();
+    this.timeout(120_000);
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "travsr-ui-e2e-"));
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    // The page's commands run only in an indexed repo.
+    fs.writeFileSync(path.join(repo, "a.ts"), "export function a() { return 1; }\n");
+    execFileSync("git", ["add", "-A"], { cwd: repo });
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"], { cwd: repo });
+    execFileSync(binary as string, ["init", "--no-connect", "-q"], {
+      cwd: repo,
+      env: { ...process.env, TRAVSR_DISABLE_REGISTRY: "1", TRAVSR_SKIP_DOWNLOAD: "1" },
+      stdio: "ignore",
+    });
+    let server: ChildProcess | undefined;
+    const ui = new BrowserUiServer((b, a, c) => {
+      const p = spawnUiProcess(b, a, c) as ChildProcess;
+      server = p;
+      return p;
+    });
+    // Direct children of `pid` whose command line runs `lang list`.
+    const langListChildren = (pid: number): number[] => {
+      try {
+        const out =
+          process.platform === "win32"
+            ? execFileSync(
+                "powershell",
+                ["-NoProfile", "-Command",
+                  `Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | Where-Object { $_.CommandLine -like '*lang list*' } | ForEach-Object { $_.ProcessId }`],
+                { encoding: "utf8" }
+              )
+            : execFileSync("pgrep", ["-P", String(pid), "-f", "lang list"], { encoding: "utf8" });
+        return out.split(/s+/).filter(Boolean).map(Number);
+      } catch {
+        return [];
+      }
+    };
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      const { url } = await ui.start(binary as string, repo, 0);
+      // Not awaited: it is still running when Stop arrives.
+      const name = path.basename(repo);
+      get(`${url}api/cli/lang-list?repo=${encodeURIComponent(name)}`).catch(() => undefined);
+      let kids: number[] = [];
+      for (let i = 0; i < 30 && kids.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        kids = langListChildren(server!.pid!);
+      }
+      // lang list finished before it could be seen: nothing to check here.
+      if (kids.length === 0) this.skip();
+      const exited = new Promise<void>((r) => server!.once("exit", () => r()));
+      assert.ok(ui.stop());
+      await exited;
+      await new Promise((r) => setTimeout(r, 500));
+      for (const pid of kids) {
+        assert.ok(!alive(pid), `lang list (pid ${pid}) is still running after Stop`);
+      }
+    } finally {
+      ui.dispose();
+      // `init` started a daemon for the repo, which holds its files open.
+      try {
+        execFileSync(binary as string, ["daemon", "stop"], { cwd: repo, stdio: "ignore" });
+      } catch {
+        // already gone
+      }
+      try {
+        fs.rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+      } catch {
+        // a leftover temp folder is not this test's failure
+      }
     }
   });
 
