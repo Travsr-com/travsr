@@ -1282,6 +1282,14 @@ suite("Health: analyzer diagnostics (#1131)", () => {
     assert.ok(!html.includes("no analyzer or index problems reported"));
   });
 
+  test("a binary that will not start is said so, not called a timeout (review of #1132)", async () => {
+    const r = runner([{ out: "error: spawn travsr ENOENT", code: null }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.strictEqual(diags.length, 1);
+    assert.ok(diags[0].hint.includes("could not be run (spawn travsr ENOENT)"), diags[0].hint);
+    assert.ok(!diags[0].hint.includes("did not finish in time"), "not a timeout");
+  });
+
   test("an older binary without --verbose falls back to plain status", async () => {
     const r = runner([
       { out: "error: unexpected argument '--verbose' found", code: 2 },

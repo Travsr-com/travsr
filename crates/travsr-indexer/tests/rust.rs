@@ -302,15 +302,90 @@ use crate::ui::terminal::run;
 }
 
 #[test]
-fn a_crate_path_outside_src_is_skipped() {
-    // An integration test's `crate::` is the test crate itself.
+fn an_integration_tests_crate_paths_stay_in_tests() {
+    // An integration test is its own crate, rooted in tests/: `crate::` there
+    // is not the library's src/.
     let got = resolved_targets(
-        "use crate::helpers::setup;
-",
+        "use crate::helpers::setup;\n",
         "crates/cli/tests/it.rs",
         &["crates/cli/tests/helpers.rs", "crates/cli/src/helpers.rs"],
     );
+    assert_eq!(got, vec!["crates/cli/tests/helpers.rs".to_string()]);
+}
+
+#[test]
+fn a_crate_path_in_no_crate_layout_is_skipped() {
+    let got = resolved_targets(
+        "use crate::helpers::setup;\n",
+        "scripts/tool.rs",
+        &["scripts/helpers.rs", "helpers.rs"],
+    );
     assert!(got.is_empty(), "{got:?}");
+}
+
+/// Review of #1132: every crate root owns its directory, not only lib.rs and
+/// main.rs. This repo's crates/travsr-mcp/tests/conformance.rs declares
+/// `mod support;`, which lives in tests/support/mod.rs.
+#[test]
+fn mod_in_any_crate_root_lives_beside_it() {
+    for (root, child) in [
+        (
+            "crates/mcp/tests/conformance.rs",
+            "crates/mcp/tests/support/mod.rs",
+        ),
+        (
+            "crates/mcp/examples/demo.rs",
+            "crates/mcp/examples/support/mod.rs",
+        ),
+        (
+            "crates/mcp/benches/speed.rs",
+            "crates/mcp/benches/support/mod.rs",
+        ),
+        (
+            "crates/mcp/src/bin/tool.rs",
+            "crates/mcp/src/bin/support/mod.rs",
+        ),
+        ("crates/mcp/build.rs", "crates/mcp/support/mod.rs"),
+    ] {
+        let got = resolved_targets(
+            "mod support;\n",
+            root,
+            &[child, "crates/mcp/tests/conformance/support/mod.rs"],
+        );
+        assert_eq!(got, vec![child.to_string()], "{root}");
+    }
+}
+
+#[test]
+fn a_binarys_crate_paths_resolve_in_src_bin() {
+    let got = resolved_targets(
+        "use crate::cli::Args;\n",
+        "crates/mcp/src/bin/tool.rs",
+        &["crates/mcp/src/bin/cli.rs", "crates/mcp/src/cli.rs"],
+    );
+    assert_eq!(got, vec!["crates/mcp/src/bin/cli.rs".to_string()]);
+}
+
+#[test]
+fn a_tests_module_inside_src_is_an_ordinary_module() {
+    // src/tests/ is a module of the library, not an integration-test folder.
+    let got = resolved_targets(
+        "mod extra;\nuse crate::util;\n",
+        "crates/mcp/src/tests/foo.rs",
+        &[
+            "crates/mcp/src/tests/foo/extra.rs",
+            "crates/mcp/src/tests/extra.rs",
+            "crates/mcp/src/util.rs",
+            "crates/mcp/src/tests/util.rs",
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            "crates/mcp/src/tests/foo/extra.rs".to_string(),
+            "crates/mcp/src/util.rs".to_string()
+        ]
+    );
 }
 
 #[test]

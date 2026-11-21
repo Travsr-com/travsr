@@ -1865,7 +1865,24 @@ export function registerShowGraphStats(
   const render = async (): Promise<string> => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const reuse = logOnly && lastStats !== undefined;
-    const stats = reuse ? (lastStats as StatsView) : buildStatsView(await client.callTool("get_graph_stats"));
+    const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+    // Started together, not one after another (review of #1132): with the
+    // longer waits #1131 gave them, running them in turn pushed a busy
+    // machine's first paint to about two and a half minutes.
+    const statsP = reuse
+      ? Promise.resolve(lastStats as StatsView)
+      : client.callTool("get_graph_stats").then(buildStatsView);
+    // readDiagnostics spawns `travsr status --verbose`.
+    const diagsP: Promise<Diagnostic[]> = reuse
+      ? Promise.resolve(lastDiags)
+      : root
+        ? readDiagnostics(bin, root)
+        : Promise.resolve([]);
+    // Drift, straight from the daemon. An older binary does not serve this tool
+    // and the client answers "" for an unknown tool, which parseIndexHealth
+    // reports as unavailable rather than as fresh; a reply that ran out of time
+    // is told apart from that (readIndexHealth).
+    const indexP = reuse ? Promise.resolve(lastIndex) : readIndexHealth(client);
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening. This is the
     // cheap half, and the only half a log-only refresh needs.
@@ -1880,20 +1897,17 @@ export function registerShowGraphStats(
         ? logFile
         : (logFiles.files[0]?.name ?? "");
     const log = root && selected !== "" ? readDaemonLogFile(root, selected, logLines) : [];
-    const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-    // readDiagnostics spawns `travsr status --verbose`.
-    const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
-    // Drift, straight from the daemon. An older binary does not serve this tool
-    // and the client answers "" for an unknown tool, which parseIndexHealth
-    // reports as unavailable rather than as fresh; a reply that ran out of time
-    // is told apart from that (readIndexHealth).
-    const index = reuse ? lastIndex : await readIndexHealth(client);
+    const [stats, diags] = await Promise.all([statsP, diagsP]);
     // The sections. Skipped on a log-only refresh, which is what changing Lines
     // or File does: those spawns are the expensive half and nothing above the
-    // log has changed.
-    const health = reuse
-      ? lastHealth
-      : await gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""), diags);
+    // log has changed. They need the diagnostics, and run while the index
+    // status is still arriving.
+    const [index, health] = await Promise.all([
+      indexP,
+      reuse
+        ? Promise.resolve(lastHealth)
+        : gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""), diags),
+    ]);
     lastStats = stats;
     lastDiags = diags;
     lastIndex = index;
@@ -2598,6 +2612,16 @@ export const DIAGNOSTICS_UNREAD: Diagnostic = {
   hint: "travsr status --verbose did not finish in time, so analyzer problems are unknown rather than absent. Press Refresh to read them again.",
 };
 
+/** The card for a `travsr status --verbose` that could not be started at all
+ *  (the binary is missing or not executable): not a timeout. */
+export function diagnosticsNotRun(reason: string): Diagnostic {
+  return {
+    severity: "warn",
+    title: "Analyzer diagnostics could not be read",
+    hint: `travsr status --verbose could not be run (${reason}), so analyzer problems are unknown rather than absent. Check travsr.binaryPath, then press Refresh.`,
+  };
+}
+
 export async function readDiagnostics(
   binary: string,
   cwd: string,
@@ -2629,9 +2653,14 @@ export async function readDiagnostics(
       command: cmd ? cmd[1] : undefined,
     });
   }
-  // Killed on the timeout (or failed to start): what it printed is partial,
-  // and an empty list would read as a clean bill of health (#1131).
-  if (r.code === null) found.push(DIAGNOSTICS_UNREAD);
+  // Killed on the timeout, or failed to start: what it printed is partial, and
+  // an empty list would read as a clean bill of health (#1131). The two get
+  // different cards, since a binary that will not start is no timeout (review
+  // of #1132).
+  if (r.code === null) {
+    const startError = /^error: (.+)/.exec(out.trim());
+    found.push(startError ? diagnosticsNotRun(startError[1]) : DIAGNOSTICS_UNREAD);
+  }
   return found;
 }
 

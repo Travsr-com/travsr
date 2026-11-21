@@ -10671,8 +10671,30 @@ fn get_graph_json_raw(
                     // Batch: collect all ResolvesTo target ids across all Depends hops,
                     // then fetch once instead of one get_node per res.dst.
                     let mut res_targets: Vec<NodeId> = Vec::new();
+                    // Intermediaries to look through: every import (Depends),
+                    // and of the nodes the file defines only its `mod foo;`
+                    // declarations. One batched lookup keeps a file with
+                    // hundreds of functions from costing hundreds of edge
+                    // queries per step (review of #1132).
+                    let defined: Vec<NodeId> = dep_edges
+                        .iter()
+                        .filter(|e| matches!(e.kind, EdgeKind::DefinesBinding))
+                        .map(|e| e.dst)
+                        .collect();
+                    let file_modules: HashSet<NodeId> = store
+                        .get_nodes(&defined)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|n| n.kind == "file-module")
+                        .map(|n| n.id)
+                        .collect();
                     for dep in &dep_edges {
-                        if !matches!(dep.kind, EdgeKind::Depends | EdgeKind::DefinesBinding) {
+                        let via = match dep.kind {
+                            EdgeKind::Depends => true,
+                            EdgeKind::DefinesBinding => file_modules.contains(&dep.dst),
+                            _ => false,
+                        };
+                        if !via {
                             continue;
                         }
                         if let Ok(res_edges) = store.iter_edges_from(dep.dst) {

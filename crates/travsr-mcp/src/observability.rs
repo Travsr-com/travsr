@@ -405,16 +405,22 @@ pub(crate) fn phase_b_availability(
     warnings: &str,
 ) -> HashMap<&'static str, Option<String>> {
     static CACHE: std::sync::OnceLock<AvailabilityCache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let cache = CACHE.get_or_init(Default::default);
     let key = AvailabilityKey::now(root, corpus, warnings);
+    // One slot per repository (review of #1132): a global-mode server answers
+    // for several, and a single slot made them evict each other every call.
     ttl_cached(
         cache,
+        root.map(Path::to_path_buf),
         key,
         AVAILABILITY_TTL,
         std::time::Instant::now(),
         || compute_phase_b_availability(root, corpus, warnings),
     )
 }
+
+/// The most repositories [`phase_b_availability`] keeps an answer for.
+const AVAILABILITY_SLOTS: usize = 32;
 
 /// The uncached readiness of every catalog language.
 fn compute_phase_b_availability(
@@ -507,7 +513,7 @@ impl AvailabilityKey {
         Self {
             root: root.map(Path::to_path_buf),
             root_listing,
-            git_index: root.and_then(|r| file_stamp(&r.join(".git").join("index"))),
+            git_index: root.and_then(git_index_path).and_then(|p| file_stamp(&p)),
             corpus: corpus.to_string(),
             warnings: warnings.to_string(),
             path: std::env::var_os("PATH"),
@@ -520,30 +526,68 @@ impl AvailabilityKey {
 }
 
 type AvailabilityCache = std::sync::Mutex<
-    Option<(
-        AvailabilityKey,
-        std::time::Instant,
-        HashMap<&'static str, Option<String>>,
-    )>,
+    HashMap<
+        Option<std::path::PathBuf>,
+        (
+            AvailabilityKey,
+            std::time::Instant,
+            HashMap<&'static str, Option<String>>,
+        ),
+    >,
 >;
+
+/// The index file of the git repository at `root`: `.git/index`, or for a
+/// linked worktree (where `.git` is a file reading `gitdir: <path>`) the
+/// index in that git directory (review of #1132: a worktree's tracked-file
+/// changes were only seen when the TTL ran out).
+fn git_index_path(root: &Path) -> Option<std::path::PathBuf> {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.join("index"));
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir = Path::new(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir.to_path_buf()
+    } else {
+        root.join(gitdir)
+    };
+    Some(gitdir.join("index"))
+}
 
 /// The value cached for `key` when it is younger than `ttl` at `now`, else
 /// `compute()`, stored. Computed outside the lock: two callers that miss at
 /// once both compute, which is cheaper than one waiting seconds on the other.
-fn ttl_cached<K: PartialEq, V: Clone>(
-    cache: &std::sync::Mutex<Option<(K, std::time::Instant, V)>>,
+fn ttl_cached<S: std::hash::Hash + Eq + Clone, K: PartialEq, V: Clone>(
+    cache: &std::sync::Mutex<HashMap<S, (K, std::time::Instant, V)>>,
+    slot: S,
     key: K,
     ttl: std::time::Duration,
     now: std::time::Instant,
     compute: impl FnOnce() -> V,
 ) -> V {
-    if let Some((k, at, v)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+    if let Some((k, at, v)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&slot) {
         if *k == key && now.saturating_duration_since(*at) < ttl {
             return v.clone();
         }
     }
     let v = compute();
-    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, now, v.clone()));
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    // Bounded: drop expired slots first, then the oldest.
+    if map.len() >= AVAILABILITY_SLOTS && !map.contains_key(&slot) {
+        map.retain(|_, (_, at, _)| now.saturating_duration_since(*at) < ttl);
+        if map.len() >= AVAILABILITY_SLOTS {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, (_, at, _))| *at)
+                .map(|(s, _)| s.clone());
+            if let Some(oldest) = oldest {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(slot, (key, now, v.clone()));
     v
 }
 
@@ -1544,7 +1588,7 @@ mod tests {
     fn ttl_cache_reuses_within_the_ttl_and_misses_on_a_new_key() {
         use std::cell::Cell;
         use std::time::{Duration, Instant};
-        let cache: std::sync::Mutex<Option<(&str, Instant, u32)>> = std::sync::Mutex::new(None);
+        let cache: std::sync::Mutex<HashMap<&str, (&str, Instant, u32)>> = Default::default();
         let built = Cell::new(0);
         let build = || {
             built.set(built.get() + 1);
@@ -1552,25 +1596,92 @@ mod tests {
         };
         let ttl = Duration::from_secs(30);
         let t0 = Instant::now();
-        assert_eq!(super::ttl_cached(&cache, "PATH=a", ttl, t0, build), 1);
+        let at = |s: u64| t0 + Duration::from_secs(s);
         assert_eq!(
-            super::ttl_cached(&cache, "PATH=a", ttl, t0 + Duration::from_secs(29), build),
+            super::ttl_cached(&cache, "repo-a", "PATH=a", ttl, t0, build),
+            1
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=a", ttl, at(29), build),
             1
         );
         assert_eq!(built.get(), 1, "reused within the TTL");
         assert_eq!(
-            super::ttl_cached(&cache, "PATH=a", ttl, t0 + Duration::from_secs(31), build),
+            super::ttl_cached(&cache, "repo-a", "PATH=a", ttl, at(31), build),
             2
         );
         assert_eq!(
-            super::ttl_cached(&cache, "PATH=b", ttl, t0 + Duration::from_secs(32), build),
+            super::ttl_cached(&cache, "repo-a", "PATH=b", ttl, at(32), build),
             3
         );
         assert_eq!(
             built.get(),
             3,
-            "rebuilt after the TTL, and at once on a new key"
+            "recomputed after the TTL, and at once on a new key"
         );
+        // Review of #1132: repositories that take turns keep their own slots.
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-b", "PATH=b", ttl, at(33), build),
+            4
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-a", "PATH=b", ttl, at(34), build),
+            3
+        );
+        assert_eq!(
+            super::ttl_cached(&cache, "repo-b", "PATH=b", ttl, at(35), build),
+            4
+        );
+        assert_eq!(built.get(), 4, "alternating repos do not evict each other");
+    }
+
+    #[test]
+    fn ttl_cache_is_bounded() {
+        use std::time::{Duration, Instant};
+        let cache: std::sync::Mutex<HashMap<usize, ((), Instant, usize)>> = Default::default();
+        let t0 = Instant::now();
+        for i in 0..super::AVAILABILITY_SLOTS + 5 {
+            super::ttl_cached(
+                &cache,
+                i,
+                (),
+                Duration::from_secs(30),
+                t0 + Duration::from_millis(i as u64),
+                || i,
+            );
+        }
+        let map = cache.lock().unwrap();
+        assert_eq!(map.len(), super::AVAILABILITY_SLOTS);
+        assert!(!map.contains_key(&0), "the oldest slot went first");
+    }
+
+    /// Review of #1132: in a linked worktree `.git` is a file naming the git
+    /// directory, and the index lives there.
+    #[test]
+    fn git_index_path_follows_a_worktrees_gitdir() {
+        let root = tempfile::tempdir().unwrap();
+        let gitdir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".git"),
+            format!(
+                "gitdir: {}
+",
+                gitdir.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            super::git_index_path(root.path()),
+            Some(gitdir.path().join("index"))
+        );
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::create_dir(plain.path().join(".git")).unwrap();
+        assert_eq!(
+            super::git_index_path(plain.path()),
+            Some(plain.path().join(".git").join("index"))
+        );
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(super::git_index_path(none.path()), None);
     }
     use super::*;
 
