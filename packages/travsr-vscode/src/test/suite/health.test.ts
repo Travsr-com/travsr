@@ -17,6 +17,8 @@ import {
   readDiagnostics,
   DIAGNOSTICS_TIMEOUT_MS,
   DIAGNOSTICS_UNREAD,
+  daemonLockSaysRunning,
+  CLI_TIMEOUTS_MS,
 } from "../../commands";
 import type { LogEntry } from "../../webviews";
 import {
@@ -1288,5 +1290,32 @@ suite("Health: analyzer diagnostics (#1131)", () => {
     const diags = await readDiagnostics("travsr", "/repo", r.run);
     assert.strictEqual(diags.length, 2);
     assert.deepStrictEqual(r.calls.map((c) => c.args), [["status", "--verbose"], ["status"]]);
+  });
+});
+
+suite("Health: a daemon status that gave no answer (#1131)", () => {
+  const err = (code: string) => () => {
+    const e = new Error(code) as NodeJS.ErrnoException;
+    e.code = code;
+    throw e;
+  };
+
+  test("the lock file decides, as the server's daemon_running does", () => {
+    // Windows: a running daemon holds the lock exclusively.
+    assert.strictEqual(daemonLockSaysRunning("/r", err("EBUSY")), true);
+    assert.strictEqual(daemonLockSaysRunning("/r", err("EPERM")), true);
+    // Elsewhere: the pid in it, checked for life.
+    assert.strictEqual(daemonLockSaysRunning("/r", () => "4242", (pid) => pid === 4242), true);
+    assert.strictEqual(daemonLockSaysRunning("/r", () => "4242", () => false), false, "a dead pid");
+    assert.strictEqual(daemonLockSaysRunning("/r", () => "garbage", () => true), false);
+    // No lock file: no daemon.
+    assert.strictEqual(daemonLockSaysRunning("/r", err("ENOENT")), false);
+  });
+
+  test("the CLI limits match travsr ui's, not the old 4 s and 8 s", () => {
+    assert.deepStrictEqual(
+      { ...CLI_TIMEOUTS_MS },
+      { version: 8_000, daemonStatus: 30_000, embedList: 15_000, configList: 8_000 }
+    );
   });
 });

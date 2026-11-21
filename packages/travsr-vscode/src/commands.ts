@@ -1052,9 +1052,12 @@ export async function gatherHealth(
   };
 
   const [versionOut, daemonOut, embedOut, langOut, healthReply, reposRaw, repoLangsRaw, configOut] = await Promise.all([
-    settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
-    settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), 8_000), ""),
-    settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
+    // The same limits travsr ui gives these commands (#1131): on a loaded
+    // machine each one took 2 to 5 s on its own, and run together the old 4 s
+    // and 8 s limits cut them off, so a running daemon read as "not running".
+    settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd(), CLI_TIMEOUTS_MS.version), ""),
+    settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), CLI_TIMEOUTS_MS.daemonStatus), ""),
+    settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd(), CLI_TIMEOUTS_MS.embedList), ""),
     settle(spawnLangCommand(binary, ["lang", "list", "--json"], root ?? process.cwd(), 60_000), ""),
     // The integrity report gets the same longer wait as the index status: it
     // reads the whole graph, and arrives alongside everything else here (#1129).
@@ -1067,7 +1070,7 @@ export async function gatherHealth(
     // binary rather than by parsing `.travsr/config.toml` here, so the env var
     // and the global file are accounted for the same way the daemon accounts
     // for them, and an older binary with no such key simply yields nothing.
-    settle(spawnLangCommand(binary, ["config", "list", "--json"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["config", "list", "--json"], root ?? process.cwd(), CLI_TIMEOUTS_MS.configList), ""),
   ]);
 
   const binaryVersion = (/(\d+\.\d+\.\d+[^\s]*)/.exec(versionOut) ?? [])[1] ?? "";
@@ -1076,7 +1079,10 @@ export async function gatherHealth(
   // gives in a terminal. "starting" counts as up: the control socket is not
   // ready yet but the process is alive and will start watching.
   const daemonLine = (/^daemon:\s*(.+)$/m.exec(daemonOut) ?? [])[1]?.trim() ?? "";
-  const daemonRunning = /^running|^starting/.test(daemonLine);
+  // No answer at all (cut off, or failed to start) is not "not running": fall
+  // back to the daemon's lock file, as the server's own check does (#1131).
+  const daemonRunning =
+    daemonLine === "" && root ? daemonLockSaysRunning(root) : /^running|^starting/.test(daemonLine);
   const daemonDetail = daemonLine;
 
   // Sidecars. `embed list --json` reports every model in the catalog; the panel
@@ -2539,6 +2545,46 @@ export function registerShowExecutionPath(
  * which is why they are cards here rather than entries in the Problems panel,
  * which wants a file to attach to.
  */
+/** Limits for the CLI commands the Health page runs, the same ones travsr ui
+ *  uses for them (#1131). */
+export const CLI_TIMEOUTS_MS = {
+  version: 8_000,
+  daemonStatus: 30_000,
+  embedList: 15_000,
+  configList: 8_000,
+} as const;
+
+/**
+ * Whether the daemon's lock file says it is running, for when `travsr daemon
+ * status` gave no answer. Mirrors the server's `daemon_running`: on Windows a
+ * running daemon holds `.travsr/daemon.lock` exclusively, so reading it fails
+ * with EBUSY or EPERM; elsewhere it holds the daemon's pid, checked for life;
+ * no file means no daemon.
+ */
+export function daemonLockSaysRunning(
+  root: string,
+  read: (p: string) => string = (p) => fs.readFileSync(p, "utf8"),
+  alive: (pid: number) => boolean = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      // EPERM: it exists but belongs to someone else.
+      return (e as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+): boolean {
+  let content: string;
+  try {
+    content = read(path.join(root, ".travsr", "daemon.lock"));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "EBUSY" || code === "EPERM";
+  }
+  const pid = Number.parseInt(content.trim(), 10);
+  return Number.isInteger(pid) && pid > 0 && alive(pid);
+}
+
 /** How long `travsr status --verbose` may take for the Health page. The same
  *  45 s `travsr ui` gives it: it took 5 to 6.5 s on a large Windows
  *  repository, and the old 4 s default killed it before it printed a single
