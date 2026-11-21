@@ -127,6 +127,12 @@ export const START_TIMEOUT_MS = 15_000;
  *  "not indexed yet" up front; this caps the wait if the format ever changes. */
 export const STATUS_LINE_GRACE_MS = 1_000;
 
+/** How long Stop waits after closing the server's stdin before killing it.
+ *  A travsr that knows TRAVSR_UI_EXIT_ON_STDIN_EOF stops well inside this
+ *  (it forces its own exit 5 s after stdin closes); one that predates the
+ *  variable ignores the end of file and is killed instead. */
+export const STOP_FALLBACK_MS = 8_000;
+
 /** The address from a `travsr ui: serving <url>` line, or null for any other
  *  line. */
 export function parseServingUrl(line: string): string | null {
@@ -174,6 +180,8 @@ export function explainStartFailure(stderr: string, code: number | null): string
 
 /** The slice of a child process this module uses, so tests can pass a fake. */
 export interface UiProcess {
+  /** Closed to stop the server gracefully (#1119); absent in some fakes. */
+  readonly stdin?: { end(): void } | null;
   readonly stdout: NodeJS.ReadableStream | null;
   readonly stderr: NodeJS.ReadableStream | null;
   kill(): boolean;
@@ -195,13 +203,18 @@ export function uiEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv 
 // runs, but the operating system still closes the pipe, and with
 // EXIT_ON_STDIN_EOF_ENV set `travsr ui` exits on that end of file instead of
 // serving on with nobody left to stop it.
-export const spawnUiProcess: SpawnUi = (binary, args, cwd) =>
-  cp.spawn(binary, args, {
+export const spawnUiProcess: SpawnUi = (binary, args, cwd) => {
+  const child = cp.spawn(binary, args, {
     cwd,
     env: uiEnv(),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
+  // Ending stdin after the server has already gone reports EPIPE here; that
+  // is expected, and an unhandled 'error' would take the extension host down.
+  child.stdin?.on("error", () => undefined);
+  return child;
+};
 
 export interface StartResult {
   url: string;
@@ -252,8 +265,13 @@ export class BrowserUiServer implements vscode.Disposable {
     private readonly spawn: SpawnUi = spawnUiProcess,
     private readonly log: (line: string) => void = () => undefined,
     private readonly timeoutMs: number = START_TIMEOUT_MS,
-    private readonly graceMs: number = STATUS_LINE_GRACE_MS
+    private readonly graceMs: number = STATUS_LINE_GRACE_MS,
+    private readonly stopFallbackMs: number = STOP_FALLBACK_MS
   ) {}
+
+  /** Resolves when the last server stopped through its stdin has exited:
+   *  a server on a fixed port must be gone before its successor binds it. */
+  private retiring: Promise<void> | undefined;
 
   /** Whether a server process is alive (starting or serving). */
   get running(): boolean {
@@ -271,7 +289,28 @@ export class BrowserUiServer implements vscode.Disposable {
     const key = [binary, normalizePort(port), repo].join("\u0000");
     if (this.proc && this.key === key && this.started) return this.started;
     this.stop();
+    const previous = normalizePort(port) !== 0 ? this.retiring : undefined;
+    if (!previous) return this.launch(binary, repo, port, key);
 
+    // A fixed port stays bound until the server being replaced has exited,
+    // which a graceful stop no longer makes immediate (#1119). Launch after it.
+    let cancelled = false;
+    const pending = previous.then(() => {
+      if (cancelled) throw new StartCancelled();
+      return this.launch(binary, repo, port, key);
+    });
+    this.key = key;
+    this.repo = repo;
+    this.started = pending;
+    this.cancelStart = () => {
+      cancelled = true;
+    };
+    pending.catch(() => undefined);
+    return pending;
+  }
+
+  /** Spawn `travsr ui` and wait for its address. */
+  private launch(binary: string, repo: string, port: number, key: string): Promise<StartResult> {
     const args = uiArgs(port);
     this.log(`$ ${binary} ${args.join(" ")}   (in ${repo})`);
     let proc: UiProcess;
@@ -364,16 +403,64 @@ export class BrowserUiServer implements vscode.Disposable {
    *  for its address settles with `StartCancelled`, not as a failure. */
   stop(): boolean {
     const proc = this.proc;
-    if (!proc) return false;
-    const wasServing = this.serving;
     const cancel = this.cancelStart;
-    this.forget(proc);
-    // Settled before the kill, so the exit that follows is not taken for a
-    // failed start (review of #1101).
+    // A start waiting for the previous server on its port has no process yet.
+    if (!proc && !cancel) return false;
+    const wasServing = this.serving;
+    this.clear();
+    // Settled before the process goes, so its exit is not taken for a failed
+    // start (review of #1101).
     cancel?.();
-    proc.kill();
+    if (proc) {
+      const exited = this.end(proc);
+      this.retiring = exited;
+      void exited?.then(() => {
+        if (this.retiring === exited) this.retiring = undefined;
+      });
+    }
     if (wasServing) this.runningEmitter.fire(false);
     return true;
+  }
+
+  /**
+   * Stop `proc` the graceful way: close its stdin, so `travsr ui` (started
+   * with TRAVSR_UI_EXIT_ON_STDIN_EOF=1) stops the page's running commands and
+   * shuts down. A plain `kill()` is SIGTERM on macOS and Linux and
+   * TerminateProcess on Windows, and either one used to end the server at once
+   * and leave a running Terminal or `lang list` command behind (#1119).
+   * Killed after STOP_FALLBACK_MS if it is still there (a travsr that predates
+   * the variable). Resolves once it has exited; `undefined` when it had no
+   * stdin to close and was killed outright.
+   */
+  private end(proc: UiProcess): Promise<void> | undefined {
+    const stdin = proc.stdin;
+    if (!stdin) {
+      proc.kill();
+      return undefined;
+    }
+    return new Promise<void>((resolve) => {
+      let fallback: ReturnType<typeof setTimeout> | undefined;
+      let giveUp: ReturnType<typeof setTimeout> | undefined;
+      const done = (): void => {
+        if (fallback) clearTimeout(fallback);
+        if (giveUp) clearTimeout(giveUp);
+        resolve();
+      };
+      proc.on("exit", done);
+      fallback = setTimeout(() => {
+        proc.kill();
+        // A process that ignores even that must not hold a successor forever.
+        giveUp = setTimeout(done, 2_000);
+        giveUp.unref?.();
+      }, this.stopFallbackMs);
+      // Never keeps the extension host alive on its own.
+      fallback.unref?.();
+      try {
+        stdin.end();
+      } catch {
+        proc.kill();
+      }
+    });
   }
 
   dispose(): void {
@@ -385,6 +472,10 @@ export class BrowserUiServer implements vscode.Disposable {
   /** Drop the state for `proc` if it is still the current process. */
   private forget(proc: UiProcess): void {
     if (this.proc !== proc) return;
+    this.clear();
+  }
+
+  private clear(): void {
     this.proc = undefined;
     this.repo = undefined;
     this.key = undefined;
