@@ -390,27 +390,25 @@ fn plain_detail(lang: &str, r: &travsr_plugin_host::phase_b::status::Readiness) 
 /// `TRAVSR_LANG_TOML`) and `CatalogResolver::new` reads it plus probes `PATH`.
 /// Nothing is written, nothing is downloaded.
 ///
-/// #1128: that `PATH` probe looks for every catalog language's tools in every
-/// `PATH` directory (with each `PATHEXT` extension on Windows), thousands of
-/// file checks that took 2.5 to 2.8 s per call on a Windows machine. It ran on
-/// every `get_index_status`, and once per partial language in the note on
-/// every callers, blast radius and execution path answer. What is installed
-/// changes rarely, so the result is kept for [`AVAILABILITY_TTL`] per (root,
-/// corpus, stored warnings): a new Phase B run changes the warnings and so
-/// reads fresh at once, and an analyzer installed meanwhile shows up within
-/// the TTL.
+/// #1128: this took 2.6 to 4.0 s per call on a Windows machine, mostly in
+/// `missing_build_file`, which runs `git ls-files` once or twice per language
+/// that needs a build file, plus the `PATH` probes for each tool. It ran on
+/// every `get_index_status`, and once per partial language in the note on every
+/// callers, blast radius and execution path answer. The answer is kept for
+/// [`AVAILABILITY_TTL`] under a key of everything it reads that can change
+/// ([`AvailabilityKey`]): a new Phase B run, `lang.toml`, `PATH`, a file added
+/// at the repository root (`compile_commands.json`, a build file), or a tracked
+/// file added anywhere (the git index) reads fresh at once.
 pub(crate) fn phase_b_availability(
     root: Option<&Path>,
     corpus: &str,
     warnings: &str,
 ) -> HashMap<&'static str, Option<String>> {
-    let key = AvailabilityKey {
-        root: root.map(Path::to_path_buf),
-        corpus: corpus.to_string(),
-        warnings: warnings.to_string(),
-    };
-    cached_availability(
-        availability_cache(),
+    static CACHE: std::sync::OnceLock<AvailabilityCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let key = AvailabilityKey::now(root, corpus, warnings);
+    ttl_cached(
+        cache,
         key,
         AVAILABILITY_TTL,
         std::time::Instant::now(),
@@ -418,54 +416,12 @@ pub(crate) fn phase_b_availability(
     )
 }
 
-/// How long a [`phase_b_availability`] answer is reused.
-const AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-type AvailabilityMap = HashMap<&'static str, Option<String>>;
-
-#[derive(Clone, PartialEq, Eq)]
-struct AvailabilityKey {
-    root: Option<std::path::PathBuf>,
-    corpus: String,
-    warnings: String,
-}
-
-type AvailabilityCache =
-    std::sync::Mutex<Option<(AvailabilityKey, std::time::Instant, AvailabilityMap)>>;
-
-fn availability_cache() -> &'static AvailabilityCache {
-    static CACHE: std::sync::OnceLock<AvailabilityCache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// The cached answer for `key` when it is younger than `ttl` at `now`, else
-/// `compute()`, stored. Computed outside the lock: two callers that miss at
-/// once both compute, which is cheaper than making one wait seconds on the
-/// other's file checks.
-fn cached_availability(
-    cache: &AvailabilityCache,
-    key: AvailabilityKey,
-    ttl: std::time::Duration,
-    now: std::time::Instant,
-    compute: impl FnOnce() -> AvailabilityMap,
-) -> AvailabilityMap {
-    if let Some((k, at, map)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        if *k == key && now.saturating_duration_since(*at) < ttl {
-            return map.clone();
-        }
-    }
-    let map = compute();
-    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, now, map.clone()));
-    map
-}
-
-/// The uncached readiness of every catalog language (see
-/// [`phase_b_availability`]).
+/// The uncached readiness of every catalog language.
 fn compute_phase_b_availability(
     root: Option<&Path>,
     corpus: &str,
     warnings: &str,
-) -> AvailabilityMap {
+) -> HashMap<&'static str, Option<String>> {
     use travsr_plugin_host::phase_b::status::{gather, readiness, Readiness};
 
     let lang_toml = travsr_plugin_host::trust::LangToml::from_disk();
@@ -497,6 +453,98 @@ fn compute_phase_b_availability(
         out.insert(entry.language, detail);
     }
     out
+}
+
+/// How long a [`phase_b_availability`] answer is reused when nothing in its
+/// key changed. A tool put on `PATH` without touching `lang.toml`, or an
+/// untracked build file below the root, shows up within this.
+const AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Everything [`phase_b_availability`] reads that can change, so a change to
+/// any of it is a miss (#1128): the repository root, its top-level file names,
+/// the git index's size and modified time, the corpus, the stored Phase B
+/// warnings, `PATH`, `TRAVSR_BIN_DIR`, the session's unsandboxed opt-in, and
+/// `lang.toml` (its `TRAVSR_LANG_TOML` override, size and modified time).
+#[derive(Clone, PartialEq, Eq)]
+struct AvailabilityKey {
+    root: Option<std::path::PathBuf>,
+    root_listing: u64,
+    git_index: Option<(u64, std::time::SystemTime)>,
+    corpus: String,
+    warnings: String,
+    path: Option<std::ffi::OsString>,
+    bin_dir: Option<std::ffi::OsString>,
+    lang_toml_override: Option<std::ffi::OsString>,
+    lang_toml: Option<(u64, std::time::SystemTime)>,
+    unsandboxed: bool,
+}
+
+/// Size and modified time of a file, or `None` when it cannot be read.
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+impl AvailabilityKey {
+    fn now(root: Option<&Path>, corpus: &str, warnings: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let root_listing = root
+            .and_then(|r| std::fs::read_dir(r).ok())
+            .map(|entries| {
+                let mut names: Vec<std::ffi::OsString> =
+                    entries.flatten().map(|e| e.file_name()).collect();
+                names.sort();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                names.hash(&mut h);
+                h.finish()
+            })
+            .unwrap_or(0);
+        let lang_toml_override = std::env::var_os("TRAVSR_LANG_TOML");
+        let lang_toml = lang_toml_override
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|h| h.join(".travsr").join("lang.toml")));
+        Self {
+            root: root.map(Path::to_path_buf),
+            root_listing,
+            git_index: root.and_then(|r| file_stamp(&r.join(".git").join("index"))),
+            corpus: corpus.to_string(),
+            warnings: warnings.to_string(),
+            path: std::env::var_os("PATH"),
+            bin_dir: std::env::var_os("TRAVSR_BIN_DIR"),
+            lang_toml_override,
+            lang_toml: lang_toml.and_then(|p| file_stamp(&p)),
+            unsandboxed: travsr_plugin_host::resolver::session_unsandboxed_opt_in(),
+        }
+    }
+}
+
+type AvailabilityCache = std::sync::Mutex<
+    Option<(
+        AvailabilityKey,
+        std::time::Instant,
+        HashMap<&'static str, Option<String>>,
+    )>,
+>;
+
+/// The value cached for `key` when it is younger than `ttl` at `now`, else
+/// `compute()`, stored. Computed outside the lock: two callers that miss at
+/// once both compute, which is cheaper than one waiting seconds on the other.
+fn ttl_cached<K: PartialEq, V: Clone>(
+    cache: &std::sync::Mutex<Option<(K, std::time::Instant, V)>>,
+    key: K,
+    ttl: std::time::Duration,
+    now: std::time::Instant,
+    compute: impl FnOnce() -> V,
+) -> V {
+    if let Some((k, at, v)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *k == key && now.saturating_duration_since(*at) < ttl {
+            return v.clone();
+        }
+    }
+    let v = compute();
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, now, v.clone()));
+    v
 }
 
 // ── get_index_status ────────────────────────────────────────────────────────
@@ -1462,54 +1510,67 @@ pub fn get_graph_health_global(repos: &HashMap<String, PathBuf>, repo_arg: Optio
 
 #[cfg(test)]
 mod tests {
-    /// #1128: the readiness sweep is reused within the TTL for the same key,
-    /// and recomputed after it, or as soon as the key (root, corpus, stored
-    /// warnings) changes.
+    /// #1128: a cached value is reused within the TTL for the same key, and
+    /// recomputed after it, or as soon as the key changes (for readiness: the
+    /// repository root's files, the git index, lang.toml, PATH, the warnings;
+    /// see also the compile_commands.json test below).
     #[test]
-    fn phase_b_availability_is_cached_per_key_for_the_ttl() {
+    fn readiness_key_changes_with_what_the_ladder_reads() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap();
+        let key = |w: &str| super::AvailabilityKey::now(Some(root.path()), "c", w);
+        let before = key("");
+        assert!(
+            before == key(""),
+            "nothing changed: same key, so the answer is reused"
+        );
+        // A build file or compile_commands.json added at the root.
+        std::fs::write(root.path().join("compile_commands.json"), "[]").unwrap();
+        assert!(before != key(""), "a new root file must miss");
+        // A new Phase B run (new stored warnings).
+        let now = key("");
+        assert!(now != key("failed:c"), "new warnings must miss");
+        // A different lang.toml.
+        let other = tempfile::tempdir().unwrap();
+        std::env::set_var("TRAVSR_LANG_TOML", other.path().join("lang.toml"));
+        let moved = key("");
+        std::env::remove_var("TRAVSR_LANG_TOML");
+        assert!(now != moved, "another lang.toml must miss");
+    }
+
+    #[test]
+    fn ttl_cache_reuses_within_the_ttl_and_misses_on_a_new_key() {
         use std::cell::Cell;
         use std::time::{Duration, Instant};
-        let cache: super::AvailabilityCache = std::sync::Mutex::new(None);
-        let key = |warnings: &str| super::AvailabilityKey {
-            root: Some(std::path::PathBuf::from("/repo")),
-            corpus: "c".into(),
-            warnings: warnings.into(),
-        };
-        let computed = Cell::new(0);
-        let compute = |v: &'static str| {
-            computed.set(computed.get() + 1);
-            let mut m = super::AvailabilityMap::new();
-            m.insert("go", Some(v.to_string()));
-            m
+        let cache: std::sync::Mutex<Option<(&str, Instant, u32)>> = std::sync::Mutex::new(None);
+        let built = Cell::new(0);
+        let build = || {
+            built.set(built.get() + 1);
+            built.get()
         };
         let ttl = Duration::from_secs(30);
         let t0 = Instant::now();
-        let first = super::cached_availability(&cache, key(""), ttl, t0, || compute("one"));
-        let again =
-            super::cached_availability(&cache, key(""), ttl, t0 + Duration::from_secs(29), || {
-                compute("two")
-            });
-        assert_eq!(computed.get(), 1, "reused within the TTL");
-        assert_eq!(first, again);
-        let stale =
-            super::cached_availability(&cache, key(""), ttl, t0 + Duration::from_secs(31), || {
-                compute("three")
-            });
-        assert_eq!(computed.get(), 2, "recomputed after the TTL");
-        assert_eq!(stale["go"].as_deref(), Some("three"));
-        let other = super::cached_availability(
-            &cache,
-            key("failed:go"),
-            ttl,
-            t0 + Duration::from_secs(32),
-            || compute("four"),
+        assert_eq!(super::ttl_cached(&cache, "PATH=a", ttl, t0, build), 1);
+        assert_eq!(
+            super::ttl_cached(&cache, "PATH=a", ttl, t0 + Duration::from_secs(29), build),
+            1
+        );
+        assert_eq!(built.get(), 1, "reused within the TTL");
+        assert_eq!(
+            super::ttl_cached(&cache, "PATH=a", ttl, t0 + Duration::from_secs(31), build),
+            2
         );
         assert_eq!(
-            computed.get(),
-            3,
-            "a new Phase B run (new warnings) reads fresh at once"
+            super::ttl_cached(&cache, "PATH=b", ttl, t0 + Duration::from_secs(32), build),
+            3
         );
-        assert_eq!(other["go"].as_deref(), Some("four"));
+        assert_eq!(
+            built.get(),
+            3,
+            "rebuilt after the TTL, and at once on a new key"
+        );
     }
     use super::*;
 
