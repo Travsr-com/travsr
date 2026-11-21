@@ -6236,13 +6236,26 @@ fn run_background_phase_b_inner(
 pub fn reconcile_tracked_tree(
     repo_root: &Path,
     store: &mut SqliteStore,
+    paths: Vec<PathBuf>,
+) -> anyhow::Result<(travsr_core::DirtySet, usize)> {
+    reconcile_tracked_tree_subset(repo_root, store, paths, None)
+}
+
+/// [`reconcile_tracked_tree`] where only `reindex_only` (when given) is
+/// reindexed, while the prune still sees every path in `paths`. A caller that
+/// has already hashed the files outside the store lock passes just the ones
+/// that changed, so the lock is not held across a hash of every file.
+fn reconcile_tracked_tree_subset(
+    repo_root: &Path,
+    store: &mut SqliteStore,
     mut paths: Vec<PathBuf>,
+    reindex_only: Option<&[PathBuf]>,
 ) -> anyhow::Result<(travsr_core::DirtySet, usize)> {
     // Same ignore rules as init / the watcher / the hook path (#403).
     let ignore = watcher::build_ignore_matcher(repo_root);
     paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
 
-    let dirty = reindex_files(&paths, repo_root, store)?;
+    let dirty = reindex_files(reindex_only.unwrap_or(&paths), repo_root, store)?;
 
     // `walked` must match the stored VName key format exactly — relative to
     // repo_root, forward slashes — or every tracked file reads as a ghost and
@@ -6969,6 +6982,49 @@ fn plain_heal_semantic(
     true
 }
 
+/// One gc tick's freshness work, run on a blocking thread because it takes the
+/// store mutex and walks the tree.
+///
+/// The mode is read from the index on every tick (RFC-031 D1), not once at
+/// startup, so a `travsr init` that re-classifies the folder (`rm -rf .git`, or
+/// `git init` in a plain folder) is followed without restarting the daemon. A
+/// stored marker rather than a `.git` probe also keeps a folder that gains a
+/// `.git` on the plain path until that next init.
+///
+/// A git repo runs [`reconcile_head_drift`] every tick. A plain folder
+/// reconciles the whole tree at startup and after dropped events, recording the
+/// drop count only once the pass succeeded so a failed catch-up (a busy
+/// database, say) is retried on the next tick. On a tick with no reconcile due
+/// it heals a degraded semantic layer instead, so the two never mint competing
+/// revisions in one tick.
+fn gc_freshness_tick(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    plain_seen_drops: &std::sync::Mutex<Option<u64>>,
+    drops_now: u64,
+) {
+    let plain = is_plain_store(&store.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut seen = plain_seen_drops.lock().unwrap_or_else(|e| e.into_inner());
+    if !plain {
+        *seen = None;
+        drop(seen);
+        reconcile_head_drift(repo_root, store, phase_b_scheduler, index_tx);
+        return;
+    }
+    if plain_reconcile_due(true, *seen, drops_now) {
+        if reconcile_plain_tree(repo_root, store, phase_b_scheduler, index_tx).is_some() {
+            *seen = Some(drops_now);
+        }
+    } else if plain_heal_semantic(store, phase_b_scheduler) {
+        tracing::info!(
+            event = "plain.semantic_heal",
+            "edits left the semantic layer degraded, rerunning it"
+        );
+    }
+}
+
 /// Whether a gc tick should run the whole-tree reconcile (RFC-031 D2).
 ///
 /// A git repo always reconciles: `reconcile_head_drift` is a cheap marker
@@ -7028,26 +7084,56 @@ pub fn plain_tree_files(repo_root: &Path) -> Vec<PathBuf> {
 /// marker and arms Phase B, the same two steps `reconcile_head_drift` takes once
 /// a commit has moved, so the call edges do not stay behind the files.
 ///
-/// Returns whether anything changed.
+/// Returns `None` when the pass failed (the caller retries it), otherwise
+/// whether anything changed.
+///
+/// Every file is hashed with the store unlocked, against one snapshot of the
+/// stored hashes, and only the files that differ are handed to the reindex.
+/// Queries are served from the same mutex, so holding it across a hash of every
+/// file would stall them on each daemon start. The final prune still sees the
+/// whole walk.
 fn reconcile_plain_tree(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
     phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
     index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
-) -> bool {
-    // Walk before taking the store lock: it is the slow, I/O-bound half, and
-    // queries are served from the same mutex.
-    let paths = plain_tree_files(repo_root);
+) -> Option<bool> {
+    let mut paths = plain_tree_files(repo_root);
+    let ignore = watcher::build_ignore_matcher(repo_root);
+    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
+
+    let before = store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_all_file_hashes()
+        .unwrap_or_default();
+    // A file that cannot be read is passed on too: the reindex reports it, or
+    // treats a vanished one as a delete.
+    let changed_paths: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| {
+            let key = p
+                .strip_prefix(repo_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            match std::fs::read(p) {
+                Ok(bytes) => before.get(&key) != Some(&hex_encode(&hash_bytes(&bytes))),
+                Err(_) => true,
+            }
+        })
+        .cloned()
+        .collect();
 
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-    let before = s.get_all_file_hashes().unwrap_or_default();
-    let (dirty, files) = match reconcile_tracked_tree(repo_root, &mut s, paths) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(err = %e, "plain reconcile: reindex failed");
-            return false;
-        }
-    };
+    let (dirty, files) =
+        match reconcile_tracked_tree_subset(repo_root, &mut s, paths, Some(&changed_paths)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(err = %e, "plain reconcile: reindex failed");
+                return None;
+            }
+        };
     let after = s.get_all_file_hashes().unwrap_or_default();
     // A file edited while the daemon ran was already reindexed by the watcher,
     // so the hashes match here, but the semantic layer was left degraded and
@@ -7071,7 +7157,7 @@ fn reconcile_plain_tree(
         changed,
         "plain reconcile complete"
     );
-    changed
+    Some(changed)
 }
 
 #[cfg(test)]
@@ -14574,7 +14660,7 @@ mod tests {
         std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
         let (store, sched, index_tx) = plain_fixture(tmp.path());
 
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
 
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         assert!(s.node_count().unwrap() > 0, "the tree must be indexed");
@@ -14594,7 +14680,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
         let (store, sched, index_tx) = plain_fixture(tmp.path());
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
         let rev = {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             // What a finished Phase B leaves behind; the first pass above set it
@@ -14605,7 +14691,7 @@ mod tests {
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
 
         assert!(
-            !reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx),
+            !reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap(),
             "an unchanged tree reports no change"
         );
 
@@ -14626,7 +14712,7 @@ mod tests {
         std::fs::write(tmp.path().join("kept.ts"), "export class Kept { go() {} }").unwrap();
         std::fs::write(tmp.path().join("gone.ts"), "export class Gone { go() {} }").unwrap();
         let (store, sched, index_tx) = plain_fixture(tmp.path());
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
         let rev = {
             let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
             s.set_meta("phase_b_dirty", "0").unwrap();
@@ -14634,7 +14720,7 @@ mod tests {
         };
 
         std::fs::remove_file(tmp.path().join("gone.ts")).unwrap();
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
 
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         let hashes = s.get_all_file_hashes().unwrap();
@@ -14659,7 +14745,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
         let (store, sched, index_tx) = plain_fixture(tmp.path());
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
         store
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -14667,7 +14753,7 @@ mod tests {
             .unwrap();
         let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
 
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
         assert!(sched.is_pending());
     }
 
@@ -14702,7 +14788,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
         let (store, sched, index_tx) = plain_fixture(tmp.path());
-        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx));
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
         let meta = |k: &str| {
             store
                 .lock()
@@ -16326,13 +16412,11 @@ impl Daemon {
         // first firing is immediate, so the reconcile doubles as the startup
         // check; the flag stops a slow reconcile from overlapping the next tick.
         let head_reconcile_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // RFC-031 D1: read from the index, not probed from the filesystem, so a
-        // folder that gains a `.git` stays on the plain-mode path until the next
-        // `travsr init` re-classifies it.
-        let plain_mode = is_plain_store(&store.lock().unwrap_or_else(|e| e.into_inner()));
-        // Dropped events (watcher queue + indexer queue) as of the last plain
-        // reconcile; `None` means none has run, so the first tick is due.
-        let mut plain_seen_drops: Option<u64> = None;
+        // Dropped events (watcher queue + indexer queue) as of the last
+        // successful plain reconcile; `None` means none has, so the next tick is
+        // due. Shared with the blocking task so it is recorded only on success.
+        let plain_seen_drops: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
         // #318 O3: poll the Phase B scheduler often enough to honour the debounce
         // window without busy-waiting. The tick is cheap (a single mutex peek);
         // it only spawns work when a re-run is actually due.
@@ -16693,40 +16777,26 @@ impl Daemon {
                         // re-checks the whole tree instead: at startup (this first
                         // tick) and whenever events were dropped since the last
                         // pass. A git repo is unchanged: every tick, as before.
-                        if plain_mode && plain_heal_semantic(&store, &phase_b_scheduler) {
-                            tracing::info!(
-                                event = "plain.semantic_heal",
-                                "edits left the semantic layer degraded, rerunning it"
-                            );
-                        }
                         let drops_now = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
                             + _watcher_handle.raw_dropped();
-                        if plain_reconcile_due(plain_mode, plain_seen_drops, drops_now)
-                            && !head_reconcile_running
-                                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        if !head_reconcile_running
+                            .swap(true, std::sync::atomic::Ordering::AcqRel)
                         {
-                            plain_seen_drops = Some(drops_now);
                             let store_rc = Arc::clone(&store);
                             let repo_rc = Arc::clone(&repo_root_arc);
                             let sched_rc = Arc::clone(&phase_b_scheduler);
                             let index_tx_rc = index_tx.clone();
+                            let seen_rc = Arc::clone(&plain_seen_drops);
                             let flag = Arc::clone(&head_reconcile_running);
                             tokio::task::spawn_blocking(move || {
-                                if plain_mode {
-                                    reconcile_plain_tree(
-                                        repo_rc.as_path(),
-                                        &store_rc,
-                                        &sched_rc,
-                                        &index_tx_rc,
-                                    );
-                                } else {
-                                    reconcile_head_drift(
-                                        repo_rc.as_path(),
-                                        &store_rc,
-                                        &sched_rc,
-                                        &index_tx_rc,
-                                    );
-                                }
+                                gc_freshness_tick(
+                                    repo_rc.as_path(),
+                                    &store_rc,
+                                    &sched_rc,
+                                    &index_tx_rc,
+                                    &seen_rc,
+                                    drops_now,
+                                );
                                 flag.store(false, std::sync::atomic::Ordering::Release);
                             });
                         }
@@ -16898,40 +16968,26 @@ impl Daemon {
                         // re-checks the whole tree instead: at startup (this first
                         // tick) and whenever events were dropped since the last
                         // pass. A git repo is unchanged: every tick, as before.
-                        if plain_mode && plain_heal_semantic(&store, &phase_b_scheduler) {
-                            tracing::info!(
-                                event = "plain.semantic_heal",
-                                "edits left the semantic layer degraded, rerunning it"
-                            );
-                        }
                         let drops_now = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
                             + _watcher_handle.raw_dropped();
-                        if plain_reconcile_due(plain_mode, plain_seen_drops, drops_now)
-                            && !head_reconcile_running
-                                .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        if !head_reconcile_running
+                            .swap(true, std::sync::atomic::Ordering::AcqRel)
                         {
-                            plain_seen_drops = Some(drops_now);
                             let store_rc = Arc::clone(&store);
                             let repo_rc = Arc::clone(&repo_root_arc);
                             let sched_rc = Arc::clone(&phase_b_scheduler);
                             let index_tx_rc = index_tx.clone();
+                            let seen_rc = Arc::clone(&plain_seen_drops);
                             let flag = Arc::clone(&head_reconcile_running);
                             tokio::task::spawn_blocking(move || {
-                                if plain_mode {
-                                    reconcile_plain_tree(
-                                        repo_rc.as_path(),
-                                        &store_rc,
-                                        &sched_rc,
-                                        &index_tx_rc,
-                                    );
-                                } else {
-                                    reconcile_head_drift(
-                                        repo_rc.as_path(),
-                                        &store_rc,
-                                        &sched_rc,
-                                        &index_tx_rc,
-                                    );
-                                }
+                                gc_freshness_tick(
+                                    repo_rc.as_path(),
+                                    &store_rc,
+                                    &sched_rc,
+                                    &index_tx_rc,
+                                    &seen_rc,
+                                    drops_now,
+                                );
                                 flag.store(false, std::sync::atomic::Ordering::Release);
                             });
                         }

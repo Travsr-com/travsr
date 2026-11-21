@@ -136,6 +136,16 @@ fn resolve_repo_root(start: &Path, mode: WorktreeMode) -> anyhow::Result<PathBuf
             if let Some(root) = registered_ancestor(start) {
                 return Ok(root);
             }
+            // A plain folder's own index is the other proof it was initialised:
+            // the registry is skipped under `TRAVSR_DISABLE_REGISTRY`, and an
+            // entry can fail to write or be pruned, while `.travsr/graph.db`
+            // lives with the folder.
+            if let Some(root) = start
+                .ancestors()
+                .find(|dir| dir.join(".travsr/graph.db").is_file())
+            {
+                return Ok(root.to_path_buf());
+            }
             anyhow::bail!(
                 "not inside a git repository or an initialized folder; run `travsr init` here first"
             );
@@ -400,6 +410,19 @@ mod tests {
             r.root.canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn a_plain_folder_is_found_by_its_own_index_without_the_registry() {
+        // The registry can be disabled, fail to write, or be pruned; the folder's
+        // own `.travsr/graph.db` must be enough for every later command.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        std::fs::write(tmp.path().join(".travsr/graph.db"), b"").unwrap();
+        let sub = tmp.path().join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        let root = resolve_repo_root(&sub, WorktreeMode::StayInWorktree).unwrap();
+        assert_eq!(root, tmp.path());
     }
 
     #[test]

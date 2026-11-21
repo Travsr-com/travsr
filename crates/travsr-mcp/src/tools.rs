@@ -3413,9 +3413,8 @@ fn run_git_grep(
     // A plain folder (RFC-031, `vcs=none`) has no repository, so `git grep`
     // without `--no-index` refuses to run. `--no-index --exclude-standard`
     // searches the working tree directly and still honours the folder's own
-    // `.gitignore`. The walker's hard `SKIP_DIRS` are excluded by pathspec
-    // because no index is there to keep them out. `.travsrignore` rules are
-    // not applied to plain-mode text search.
+    // `.gitignore`. `SKIP_DIRS`, binary files and `.travsrignore` are filtered
+    // from these lines below exactly as in a git repo.
     let plain = is_plain_store(store);
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo_root).arg("grep");
@@ -3428,11 +3427,6 @@ fn run_git_grep(
     with_common_args(&mut cmd);
     for spec in pathspecs {
         cmd.arg(spec);
-    }
-    if plain {
-        for dir in SKIP_DIRS {
-            cmd.arg(format!(":(exclude,glob)**/{dir}/**"));
-        }
     }
     let mut all: Vec<String> = match grep_pass(cmd, remaining()) {
         Ok(lines) => lines,
@@ -22669,13 +22663,15 @@ mod snippet_tests {
         store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
         store.set_meta("vcs", "none").unwrap();
 
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !git_ok {
+            return; // git is missing in this sandbox: nothing to exercise
+        }
         let out = find_pattern(&store, "charge", None, false, 0);
-        if out.contains("not a git repository") && !out.contains("kept.rs") {
-            panic!("plain folder search must not need a repository: {out}");
-        }
-        if !out.contains("kept.rs") {
-            return; // git unavailable in this sandbox
-        }
+        assert!(out.contains("kept.rs"), "plain folder search failed: {out}");
         for hidden in ["ignored/dep.rs", "node_modules/dep.rs", ".travsr/dep.rs"] {
             assert!(!out.contains(hidden), "{hidden} must stay out: {out}");
         }

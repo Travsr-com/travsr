@@ -134,6 +134,15 @@ would stay unrepaired until the next daemon restart. When the watcher has
 dropped events since the last reconcile, plain mode runs the same full-tree
 reconcile on the next GC tick.
 
+**Mode changes while the daemon runs.** The GC tick reads the `vcs` marker from
+the index each time rather than once at startup, so a `travsr init` that
+re-classifies the folder (`rm -rf .git`, or `git init` in a plain folder) is
+followed without a restart. A plain reconcile counts as done, for dropped-event
+purposes, only once it succeeded; a failed catch-up is retried on the next tick.
+It hashes files with the store unlocked and reindexes only the ones that differ.
+A later command finds a plain root through the registry or, failing that, the
+nearest ancestor holding `.travsr/graph.db`.
+
 **Semantic layer after live edits.** Phase B is gated on `last_commit` differing
 from `phase_b_commit`, and a plain folder has no commit to move it. A live edit
 sets `phase_b_dirty` with the two markers equal, so nothing would rerun Phase B
@@ -143,8 +152,10 @@ until a restart. On each GC tick (every five minutes, not per edit, to keep the
 the debounced Phase B run.
 
 **Text search.** `find_pattern` runs `git grep --no-index --exclude-standard`
-over the working tree in plain mode, with the hard skip directories excluded by
-pathspec. It honours the folder's `.gitignore` but not `.travsrignore`.
+over the working tree in plain mode. It honours the folder's `.gitignore`, and
+the result lines go through the same filters as in a git repo (`SKIP_DIRS`,
+binary files, `.travsrignore`). The pass that re-includes gitignored files
+needs a repository and is skipped.
 
 **Index status fields.** `get_index_status` reports `staleness.is_stale` and
 `head_commit` as null in plain mode, since there is no HEAD to compare. After a
