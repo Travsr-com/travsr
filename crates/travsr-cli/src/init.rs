@@ -1,7 +1,7 @@
 // Delegates to travsr_daemon::init_repo (DEBT-010 closed in Sprint 2).
 use anyhow::Context as _;
 
-use crate::repo::find_git_root_for_write;
+use crate::repo::find_root_for_init;
 use travsr_plugin_host::phase_b::status::Readiness;
 
 // One parameter per `travsr init` flag, the same shape `graph::run` uses. A
@@ -20,7 +20,17 @@ pub fn run(
     let cwd = std::env::current_dir().context("getting current directory")?;
     // Write command: index the worktree we are standing in, never redirect to
     // the main worktree (issue #586).
-    let repo_root = find_git_root_for_write(&cwd)?;
+    let init_root = find_root_for_init(&cwd)?;
+    let repo_root = init_root.root;
+    // RFC-031 D1: say so once, so a user who expected git hooks is not misled
+    // about how the index stays current.
+    if init_root.plain && !quiet && !json {
+        eprintln!(
+            "No git repository here, so this folder is indexed in plain mode: the file \
+             watcher keeps it fresh and the daemon re-checks the whole tree when it \
+             starts. Run `travsr init` again to refresh it by hand."
+        );
+    }
 
     // Apply the operator opt-in before any indexing begins. This sets a
     // process-global flag consulted by run_ra_lsif via allow_unsandboxed_opt_in().

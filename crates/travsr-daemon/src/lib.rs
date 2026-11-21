@@ -1494,6 +1494,103 @@ mod rebase_tests {
     }
 }
 
+/// Meta key recording how a repo is kept fresh (RFC-031 D1): [`VCS_GIT`] or
+/// [`VCS_NONE`]. Written on every init, so a folder that gains or loses a `.git`
+/// is re-classified by the next `travsr init` and not before.
+pub const VCS_META_KEY: &str = "vcs";
+/// A git checkout: git hooks plus the file watcher keep the index fresh.
+pub const VCS_GIT: &str = "git";
+/// Plain mode (RFC-031): no VCS, so the file watcher plus a tree reconcile keep
+/// the index fresh and no git hooks are installed.
+pub const VCS_NONE: &str = "none";
+/// Prefix of the revision marker plain mode stores in `last_commit`.
+///
+/// A plain folder has no commit, and the Phase B scheduler, the cache key and
+/// the status freshness lines all read `last_commit` as "the revision this index
+/// describes". `run_background_phase_b_inner` returns early when it is empty, so
+/// leaving it unset would leave the semantic layer permanently stale after a
+/// restart. The marker is not a git revision: nothing resolves it with git, and
+/// every reader that does ask git treats a revision git cannot resolve as
+/// "unknown".
+pub const PLAIN_REV_PREFIX: &str = "plain-";
+
+/// True when `repo_root` is a git checkout: `.git` is a directory, or a gitlink
+/// file in a linked worktree.
+pub fn is_git_checkout(repo_root: &Path) -> bool {
+    repo_root.join(".git").exists()
+}
+
+/// True when this index was initialised in plain mode (RFC-031 D1). Reads the
+/// stored marker rather than probing for `.git`, so a folder that later gains a
+/// `.git` keeps plain-mode freshness until `travsr init` is run again.
+pub fn is_plain_store(store: &SqliteStore) -> bool {
+    store.get_meta(VCS_META_KEY).ok().flatten().as_deref() == Some(VCS_NONE)
+}
+
+/// The next plain-mode revision marker after `prev`.
+///
+/// Time-based, and strictly greater than `prev` even when two reconciles land in
+/// the same millisecond or the clock steps backwards, because "equal to
+/// `phase_b_commit`" is how every reader decides that nothing changed.
+fn next_plain_revision(prev: &str) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev_ms = prev
+        .strip_prefix(PLAIN_REV_PREFIX)
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .unwrap_or(0);
+    format!("{PLAIN_REV_PREFIX}{:x}", now_ms.max(prev_ms + 1))
+}
+
+/// The revision marker for a plain index after an init pass. Reuses the stored
+/// one when the tree did not change, so a re-run over an unchanged folder finds
+/// Phase B already done at that revision, as it does in a git repo at an
+/// unmoved HEAD, instead of re-running whole-project analysis every time.
+fn plain_revision(store: &SqliteStore, tree_changed: bool) -> String {
+    let prev = store
+        .get_meta("last_commit")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if !tree_changed && prev.starts_with(PLAIN_REV_PREFIX) {
+        prev
+    } else {
+        next_plain_revision(&prev)
+    }
+}
+
+/// The directory walker every indexing pass shares: hidden files included,
+/// symlinks not followed, `.gitignore` and `.travsrignore` honoured.
+///
+/// In plain mode (no `.git` at the root) two things change, and only there:
+///
+/// - `require_git(false)`: the `ignore` crate applies `.gitignore` files only
+///   inside a git repository unless told otherwise, so without it a plain
+///   folder would index `node_modules/` and every other path it excludes.
+/// - `parents(false)`: with the first change alone the crate also applies
+///   `.gitignore` files in folders *above* the root, so a stray `~/.gitignore`
+///   would silently drop files the folder's own rules never mention. The
+///   watcher's matcher (`build_ignore_matcher`) reads only files under the
+///   root, so this also keeps the walk and the watcher in agreement.
+///
+/// Inside a git repo the builder is exactly what it was before plain mode.
+pub fn source_walker(repo_root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(repo_root);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .follow_links(false)
+        // T3 (1a): honor .travsrignore (gitignore-syntax) in addition to .gitignore.
+        // Precedence: SKIP_DIRS (hard) < .gitignore < .travsrignore (user wins).
+        .add_custom_ignore_filename(".travsrignore");
+    if !is_git_checkout(repo_root) {
+        builder.require_git(false).parents(false);
+    }
+    builder
+}
+
 /// Like [`init_repo`], but reports progress via `on_progress` so the CLI can
 /// show that a long indexing run is alive (issue #293). The callback is invoked
 /// on the indexing thread; keep it cheap.
@@ -1623,7 +1720,17 @@ pub fn init_repo_with_progress(
         }
     }
 
-    install_hook(repo_root)?;
+    // RFC-031 D1: no `.git` means plain mode. There is nothing to hook, so none
+    // are installed, and the mode is recorded so the daemon keeps using the
+    // watcher-plus-reconcile path even if a `.git` appears later (until the next
+    // `travsr init` re-classifies the folder).
+    let plain = !is_git_checkout(repo_root);
+    store
+        .set_meta(VCS_META_KEY, if plain { VCS_NONE } else { VCS_GIT })
+        .context("writing vcs to meta")?;
+    if !plain {
+        install_hook(repo_root)?;
+    }
 
     // GHOST-NODE PURGE: directories added to SKIP_DIRS after a previous run may
     // have left stale nodes in graph.db. The hash-delta loop skips files that
@@ -1853,14 +1960,7 @@ pub fn init_repo_with_progress(
     }
     let travsr_local_tracked = travsr_local_tracked(repo_root);
 
-    let walker = WalkBuilder::new(repo_root)
-        .hidden(false)
-        .git_ignore(true)
-        .follow_links(false)
-        // T3 (1a): honor .travsrignore (gitignore-syntax) in addition to .gitignore.
-        // Precedence: SKIP_DIRS (hard) < .gitignore < .travsrignore (user wins).
-        .add_custom_ignore_filename(".travsrignore")
-        .build();
+    let walker = source_walker(repo_root).build();
 
     let mut indexable_paths: Vec<PathBuf> = Vec::new();
     // P1 (#322): collected during the walk so Phase B skips sidecars for absent
@@ -2174,7 +2274,14 @@ pub fn init_repo_with_progress(
     //     Skipped when Phase B already covers HEAD (`phase_b_inline_needed`).
     //   • No commit: `run_background_phase_b` bails when `last_commit` is empty,
     //     so there is no deferred path available for fresh repos.
-    let current_sha = read_head_commit_sha(repo_root).unwrap_or_default();
+    // Plain mode has no commit, so it stamps a revision marker in its place:
+    // one fresh marker when this run changed the tree, the stored one otherwise.
+    // See `PLAIN_REV_PREFIX` for why leaving `last_commit` empty is not an option.
+    let current_sha = if plain {
+        plain_revision(&store, batch_counts.files_written > 0 || ghosts_pruned > 0)
+    } else {
+        read_head_commit_sha(repo_root).unwrap_or_default()
+    };
     let has_commit = !current_sha.is_empty();
     let phase_b_commit_stored = store
         .get_meta("phase_b_commit")
@@ -2441,7 +2548,12 @@ pub fn init_repo_with_progress(
     // Always stamp last_commit after init — independent of whether any file
     // changed. Fixes the regression where reindex_files's any_changed guard
     // suppressed the stamp on clean re-runs (PR #207).
-    if let Ok(sha) = read_head_commit_sha(repo_root) {
+    let stamp_sha = if plain {
+        Ok(current_sha.clone())
+    } else {
+        read_head_commit_sha(repo_root)
+    };
+    if let Ok(sha) = stamp_sha {
         let _ = store.set_meta("last_commit", &sha);
         // #712 (supersedes C4): stamp phase_b_commit when Phase B ran inline and
         // made progress — either every language was clean, or at least one
@@ -4306,17 +4418,9 @@ fn remap_resolved_sites(
 fn collect_present_languages_and_paths(
     repo_root: &Path,
 ) -> (std::collections::HashSet<String>, Vec<PathBuf>) {
-    use ignore::WalkBuilder;
     let mut langs = std::collections::HashSet::new();
     let mut paths = Vec::new();
-    for entry in WalkBuilder::new(repo_root)
-        .hidden(false)
-        .git_ignore(true)
-        .follow_links(false)
-        .add_custom_ignore_filename(".travsrignore")
-        .build()
-        .flatten()
-    {
+    for entry in source_walker(repo_root).build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -4429,21 +4533,13 @@ fn header_parses_as_objc(abs_path: &Path, repo_has_objc: bool) -> bool {
 /// `.m`/`.mm` that already establishes the repo as Obj-C. Callers gate this
 /// behind "batch touches a `.h` file" so it costs nothing on other commits.
 fn repo_has_objc_sources(repo_root: &Path) -> bool {
-    use ignore::WalkBuilder;
-    WalkBuilder::new(repo_root)
-        .hidden(false)
-        .git_ignore(true)
-        .follow_links(false)
-        .add_custom_ignore_filename(".travsrignore")
-        .build()
-        .flatten()
-        .any(|entry| {
-            entry.file_type().is_some_and(|t| t.is_file())
-                && matches!(
-                    entry.path().extension().and_then(|e| e.to_str()),
-                    Some("m") | Some("mm")
-                )
-        })
+    source_walker(repo_root).build().flatten().any(|entry| {
+        entry.file_type().is_some_and(|t| t.is_file())
+            && matches!(
+                entry.path().extension().and_then(|e| e.to_str()),
+                Some("m") | Some("mm")
+            )
+    })
 }
 
 /// Background, single-flight Phase B refresh (#318 O3).
@@ -6133,17 +6229,33 @@ fn run_background_phase_b_inner(
 ///
 /// Returns the Tier-0 callers the reindex left dirty, and how many files were
 /// visited.
+///
+/// The file list is the caller's (RFC-031 D2): a git repo passes
+/// [`tracked_files_from_git`], plain mode passes [`plain_tree_files`]. Everything
+/// after the list is the same, including the mass-delete circuit breaker.
 pub fn reconcile_tracked_tree(
     repo_root: &Path,
     store: &mut SqliteStore,
+    paths: Vec<PathBuf>,
 ) -> anyhow::Result<(travsr_core::DirtySet, usize)> {
-    let mut paths = tracked_files_from_git(repo_root)
-        .context("enumerating tracked files for a whole-tree reconcile")?;
+    reconcile_tracked_tree_subset(repo_root, store, paths, None)
+}
+
+/// [`reconcile_tracked_tree`] where only `reindex_only` (when given) is
+/// reindexed, while the prune still sees every path in `paths`. A caller that
+/// has already hashed the files outside the store lock passes just the ones
+/// that changed, so the lock is not held across a hash of every file.
+fn reconcile_tracked_tree_subset(
+    repo_root: &Path,
+    store: &mut SqliteStore,
+    mut paths: Vec<PathBuf>,
+    reindex_only: Option<&[PathBuf]>,
+) -> anyhow::Result<(travsr_core::DirtySet, usize)> {
     // Same ignore rules as init / the watcher / the hook path (#403).
     let ignore = watcher::build_ignore_matcher(repo_root);
     paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
 
-    let dirty = reindex_files(&paths, repo_root, store)?;
+    let dirty = reindex_files(reindex_only.unwrap_or(&paths), repo_root, store)?;
 
     // `walked` must match the stored VName key format exactly — relative to
     // repo_root, forward slashes — or every tracked file reads as a ghost and
@@ -6806,7 +6918,16 @@ fn reconcile_head_drift(
         "last_commit does not match live HEAD (history moved during daemon downtime), reconciling"
     );
     let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
-    let (dirty, files) = match reconcile_tracked_tree(repo_root, &mut s) {
+    let tracked = match tracked_files_from_git(repo_root)
+        .context("enumerating tracked files for a whole-tree reconcile")
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(err = %e, "head reconcile: reindex failed");
+            return false;
+        }
+    };
+    let (dirty, files) = match reconcile_tracked_tree(repo_root, &mut s, tracked) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(err = %e, "head reconcile: reindex failed");
@@ -6831,6 +6952,212 @@ fn reconcile_head_drift(
         "head reconcile complete: semantic rebuild armed"
     );
     true
+}
+
+/// Plain mode's stand-in for "the next commit" (RFC-031 D2): when live edits
+/// left the semantic layer flagged degraded, mint a new revision so Phase B runs.
+///
+/// Phase B is gated on `last_commit != phase_b_commit`, and a plain folder has
+/// no commit to move `last_commit`, so without this the degraded flag would only
+/// clear on a daemon restart or a manual `travsr init`. Called from the gc tick,
+/// not per edit, so whole-project analysis does not run continuously while
+/// someone is typing (#583). Returns whether a run was armed.
+fn plain_heal_semantic(
+    store: &std::sync::Mutex<SqliteStore>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+) -> bool {
+    {
+        let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+        if !is_plain_store(&s) {
+            return false;
+        }
+        let meta = |k: &str| s.get_meta(k).ok().flatten().unwrap_or_default();
+        let last = meta("last_commit");
+        if meta("phase_b_dirty") != "1" || last.is_empty() || last != meta("phase_b_commit") {
+            return false;
+        }
+        let _ = s.set_meta("last_commit", &next_plain_revision(&last));
+    }
+    phase_b_scheduler.mark_dirty();
+    true
+}
+
+/// One gc tick's freshness work, run on a blocking thread because it takes the
+/// store mutex and walks the tree.
+///
+/// The mode is read from the index on every tick (RFC-031 D1), not once at
+/// startup, so a `travsr init` that re-classifies the folder (`rm -rf .git`, or
+/// `git init` in a plain folder) is followed without restarting the daemon. A
+/// stored marker rather than a `.git` probe also keeps a folder that gains a
+/// `.git` on the plain path until that next init.
+///
+/// A git repo runs [`reconcile_head_drift`] every tick. A plain folder
+/// reconciles the whole tree at startup and after dropped events, recording the
+/// drop count only once the pass succeeded so a failed catch-up (a busy
+/// database, say) is retried on the next tick. On a tick with no reconcile due
+/// it heals a degraded semantic layer instead, so the two never mint competing
+/// revisions in one tick.
+fn gc_freshness_tick(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    plain_seen_drops: &std::sync::Mutex<Option<u64>>,
+    drops_now: u64,
+) {
+    let plain = is_plain_store(&store.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut seen = plain_seen_drops.lock().unwrap_or_else(|e| e.into_inner());
+    if !plain {
+        *seen = None;
+        drop(seen);
+        reconcile_head_drift(repo_root, store, phase_b_scheduler, index_tx);
+        return;
+    }
+    if plain_reconcile_due(true, *seen, drops_now) {
+        if reconcile_plain_tree(repo_root, store, phase_b_scheduler, index_tx).is_some() {
+            *seen = Some(drops_now);
+        }
+    } else if plain_heal_semantic(store, phase_b_scheduler) {
+        tracing::info!(
+            event = "plain.semantic_heal",
+            "edits left the semantic layer degraded, rerunning it"
+        );
+    }
+}
+
+/// Whether a gc tick should run the whole-tree reconcile (RFC-031 D2).
+///
+/// A git repo always reconciles: `reconcile_head_drift` is a cheap marker
+/// compare that returns early when `HEAD` has not moved. Plain mode has no such
+/// marker, so each pass costs a hash of every file and runs only at startup
+/// (`seen_drops` is `None`) or when events were dropped since the last pass.
+fn plain_reconcile_due(plain: bool, seen_drops: Option<u64>, drops_now: u64) -> bool {
+    !plain || seen_drops != Some(drops_now)
+}
+
+/// The files a plain-mode reconcile visits: what the init walk indexes, as
+/// absolute paths. This is the plain-mode stand-in for `git ls-files`.
+///
+/// It is the init walk's own builder ([`source_walker`]) and its own filter
+/// (`SKIP_DIRS`, then [`travsr_core::is_indexable_path`]), so `travsr init` and a
+/// later reconcile can never disagree about which files belong to the index.
+/// Unreadable directories are logged and skipped. A short list is safe: the
+/// prune that follows only removes a file that is also gone from disk.
+pub fn plain_tree_files(repo_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in source_walker(repo_root).build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!("plain reconcile: walk error: {err}");
+                continue;
+            }
+        };
+        // `file_type()` does not follow symlinks, matching the init walk.
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let p = entry.into_path();
+        let rel = p.strip_prefix(repo_root).unwrap_or(&p);
+        if rel.components().any(|c| {
+            crate::watcher::SKIP_DIRS
+                .iter()
+                .any(|skip| c.as_os_str() == *skip)
+        }) {
+            continue;
+        }
+        if travsr_core::is_indexable_path(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
+/// RFC-031 D2: the plain-mode catch-up. A git repo is caught up after downtime
+/// by [`reconcile_head_drift`], which compares a stored commit with `HEAD`. A
+/// plain folder has neither, so this re-checks the whole tree instead. Run at
+/// daemon start, and again after the watcher dropped events (a git repo repairs
+/// those at its next commit; plain mode has no commit to wait for).
+///
+/// The cost of an unchanged file is one hash, because `reindex_files` is
+/// hash-delta gated. When the pass changed anything it moves the revision
+/// marker and arms Phase B, the same two steps `reconcile_head_drift` takes once
+/// a commit has moved, so the call edges do not stay behind the files.
+///
+/// Returns `None` when the pass failed (the caller retries it), otherwise
+/// whether anything changed.
+///
+/// Every file is hashed with the store unlocked, against one snapshot of the
+/// stored hashes, and only the files that differ are handed to the reindex.
+/// Queries are served from the same mutex, so holding it across a hash of every
+/// file would stall them on each daemon start. The final prune still sees the
+/// whole walk.
+fn reconcile_plain_tree(
+    repo_root: &Path,
+    store: &std::sync::Mutex<SqliteStore>,
+    phase_b_scheduler: &phase_b_sched::PhaseBScheduler,
+    index_tx: &std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+) -> Option<bool> {
+    let mut paths = plain_tree_files(repo_root);
+    let ignore = watcher::build_ignore_matcher(repo_root);
+    paths.retain(|p| !watcher::should_skip_all(p, repo_root, &ignore));
+
+    let before = store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_all_file_hashes()
+        .unwrap_or_default();
+    // A file that cannot be read is passed on too: the reindex reports it, or
+    // treats a vanished one as a delete.
+    let changed_paths: Vec<PathBuf> = paths
+        .iter()
+        .filter(|p| {
+            let key = p
+                .strip_prefix(repo_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            match std::fs::read(p) {
+                Ok(bytes) => before.get(&key) != Some(&hex_encode(&hash_bytes(&bytes))),
+                Err(_) => true,
+            }
+        })
+        .cloned()
+        .collect();
+
+    let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let (dirty, files) =
+        match reconcile_tracked_tree_subset(repo_root, &mut s, paths, Some(&changed_paths)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(err = %e, "plain reconcile: reindex failed");
+                return None;
+            }
+        };
+    let after = s.get_all_file_hashes().unwrap_or_default();
+    // A file edited while the daemon ran was already reindexed by the watcher,
+    // so the hashes match here, but the semantic layer was left degraded and
+    // flagged `phase_b_dirty` (#583). That is a reason to rebuild as well.
+    let semantic_dirty = s.get_meta("phase_b_dirty").ok().flatten().as_deref() == Some("1");
+    let changed = before != after || semantic_dirty;
+
+    if changed && s.get_signature_format_version().ok() == Some(SIGNATURE_FORMAT_VERSION) {
+        let prev = s.get_meta("last_commit").ok().flatten().unwrap_or_default();
+        let _ = s.set_meta("last_commit", &next_plain_revision(&prev));
+    }
+    drop(s);
+
+    enqueue_dirty_callers(dirty, repo_root, index_tx);
+    if changed {
+        phase_b_scheduler.mark_dirty();
+    }
+    tracing::info!(
+        event = "plain.reconcile.complete",
+        files,
+        changed,
+        "plain reconcile complete"
+    );
+    Some(changed)
 }
 
 #[cfg(test)]
@@ -14253,6 +14580,271 @@ mod tests {
         );
     }
 
+    // ---- RFC-031 plain mode -------------------------------------------------
+
+    /// A plain-mode store ready for `reconcile_plain_tree`: no git anywhere,
+    /// the signature format stamped so the revision guard passes, and the mode
+    /// recorded the way `travsr init` records it.
+    fn plain_fixture(
+        tmp: &std::path::Path,
+    ) -> (
+        std::sync::Mutex<SqliteStore>,
+        phase_b_sched::PhaseBScheduler,
+        std::sync::mpsc::SyncSender<watcher::WatchEvent>,
+    ) {
+        std::fs::create_dir_all(tmp.join(".travsr")).unwrap();
+        let mut store = travsr_store::SqliteStore::open(&tmp.join(".travsr/graph.db")).unwrap();
+        store
+            .set_signature_format_version(travsr_core::SIGNATURE_FORMAT_VERSION)
+            .unwrap();
+        store.set_meta(VCS_META_KEY, VCS_NONE).unwrap();
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+        let (index_tx, rx) = std::sync::mpsc::sync_channel::<watcher::WatchEvent>(INDEX_QUEUE_CAP);
+        // The receiver is leaked for the test's lifetime so `try_send` never
+        // sees a disconnected queue.
+        std::mem::forget(rx);
+        (std::sync::Mutex::new(store), sched, index_tx)
+    }
+
+    fn rel_sorted(root: &std::path::Path, paths: Vec<std::path::PathBuf>) -> Vec<String> {
+        let mut v: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The reconcile's file list is the init walk's: the folder's own
+    /// `.gitignore` and `.travsrignore` apply, the hard skip list applies, only
+    /// indexable files are listed, and a `.gitignore` *above* the folder does
+    /// not apply (the watcher does not read it either).
+    #[test]
+    fn plain_tree_files_follow_the_init_walk_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("outer/ws");
+        for d in ["src", "generated", "vendor", "node_modules"] {
+            std::fs::create_dir_all(ws.join(d)).unwrap();
+        }
+        std::fs::write(tmp.path().join("outer/.gitignore"), "from_parent.ts\n").unwrap();
+        std::fs::write(ws.join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(ws.join(".travsrignore"), "vendor/\n").unwrap();
+        for rel in [
+            "src/a.ts",
+            "from_parent.ts",
+            "generated/g.ts",
+            "vendor/v.ts",
+            "node_modules/n.ts",
+        ] {
+            std::fs::write(ws.join(rel), "export const x = 1;\n").unwrap();
+        }
+        std::fs::write(ws.join("notes.txt"), "not source").unwrap();
+
+        assert_eq!(
+            rel_sorted(&ws, plain_tree_files(&ws)),
+            vec!["from_parent.ts", "src/a.ts"],
+        );
+    }
+
+    /// Startup catch-up: files that appeared while the daemon was down are
+    /// indexed, the revision marker moves off nothing, and Phase B is armed,
+    /// the same two steps `reconcile_head_drift` takes once a commit has moved.
+    #[test]
+    fn reconcile_plain_tree_indexes_stamps_a_revision_and_arms_phase_b() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        let (store, sched, index_tx) = plain_fixture(tmp.path());
+
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(s.node_count().unwrap() > 0, "the tree must be indexed");
+        let rev = s.get_meta("last_commit").unwrap().unwrap_or_default();
+        assert!(
+            rev.starts_with(PLAIN_REV_PREFIX),
+            "revision marker: {rev:?}"
+        );
+        drop(s);
+        assert!(sched.is_pending(), "Phase B must be armed after a change");
+    }
+
+    /// Nothing changed since the last pass: no new revision, and no whole-project
+    /// Phase B run on every daemon restart.
+    #[test]
+    fn reconcile_plain_tree_is_a_noop_when_the_tree_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        let (store, sched, index_tx) = plain_fixture(tmp.path());
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+        let rev = {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            // What a finished Phase B leaves behind; the first pass above set it
+            // because rewriting Phase A nodes drops a file's call edges (#583).
+            s.set_meta("phase_b_dirty", "0").unwrap();
+            s.get_meta("last_commit").unwrap().unwrap()
+        };
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+
+        assert!(
+            !reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap(),
+            "an unchanged tree reports no change"
+        );
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            s.get_meta("last_commit").unwrap().as_deref(),
+            Some(rev.as_str())
+        );
+        drop(s);
+        assert!(!sched.is_pending(), "no change, so no Phase B run");
+    }
+
+    /// A file deleted while the daemon was down leaves no ghost behind, and the
+    /// deletion counts as a change.
+    #[test]
+    fn reconcile_plain_tree_prunes_a_file_deleted_during_downtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("kept.ts"), "export class Kept { go() {} }").unwrap();
+        std::fs::write(tmp.path().join("gone.ts"), "export class Gone { go() {} }").unwrap();
+        let (store, sched, index_tx) = plain_fixture(tmp.path());
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+        let rev = {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.set_meta("phase_b_dirty", "0").unwrap();
+            s.get_meta("last_commit").unwrap().unwrap()
+        };
+
+        std::fs::remove_file(tmp.path().join("gone.ts")).unwrap();
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let hashes = s.get_all_file_hashes().unwrap();
+        assert!(hashes.contains_key("kept.ts"));
+        assert!(
+            !hashes.contains_key("gone.ts"),
+            "ghost left behind: {hashes:?}"
+        );
+        assert_ne!(
+            s.get_meta("last_commit").unwrap().unwrap(),
+            rev,
+            "a deletion moves the revision"
+        );
+    }
+
+    /// An edit made while the daemon ran was reindexed by the watcher, so its
+    /// hash matches at the next startup, but the semantic layer was left flagged
+    /// degraded. That alone is a reason to rebuild, or a restart would never
+    /// repair the call edges of a file edited yesterday.
+    #[test]
+    fn reconcile_plain_tree_rebuilds_when_the_watcher_left_the_semantic_layer_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        let (store, sched, index_tx) = plain_fixture(tmp.path());
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+        store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_meta("phase_b_dirty", "1")
+            .unwrap();
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+        assert!(sched.is_pending());
+    }
+
+    /// The marker must strictly increase: every reader decides "nothing changed"
+    /// by equality with `phase_b_commit`, so a repeat (two reconciles in one
+    /// millisecond, or a clock that stepped back) would hide a real change.
+    #[test]
+    fn next_plain_revision_is_strictly_increasing() {
+        let mut prev = String::new();
+        for _ in 0..50 {
+            let next = next_plain_revision(&prev);
+            assert!(next.starts_with(PLAIN_REV_PREFIX));
+            assert_ne!(next, prev);
+            if !prev.is_empty() {
+                let n = |s: &str| u64::from_str_radix(&s[PLAIN_REV_PREFIX.len()..], 16).unwrap();
+                assert!(n(&next) > n(&prev), "{next} must follow {prev}");
+            }
+            prev = next;
+        }
+        // A marker from the future (clock stepped back) is still outrun.
+        let future = format!("{PLAIN_REV_PREFIX}{:x}", u64::MAX / 2);
+        let next = next_plain_revision(&future);
+        assert_ne!(next, future);
+        assert!(u64::from_str_radix(&next[PLAIN_REV_PREFIX.len()..], 16).unwrap() > u64::MAX / 2);
+    }
+
+    /// Live edits in a plain folder flag the semantic layer degraded with the two
+    /// markers equal; there is no commit to move them, so the gc tick must mint a
+    /// new revision or the flag would never clear.
+    #[test]
+    fn plain_heal_mints_a_revision_only_when_dirty_and_caught_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("svc.ts"), "export class Svc { go() {} }").unwrap();
+        let (store, sched, index_tx) = plain_fixture(tmp.path());
+        assert!(reconcile_plain_tree(tmp.path(), &store, &sched, &index_tx).unwrap());
+        let meta = |k: &str| {
+            store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_meta(k)
+                .unwrap()
+                .unwrap_or_default()
+        };
+        let before = meta("last_commit");
+        let sched = phase_b_sched::PhaseBScheduler::new(std::time::Duration::from_secs(30));
+
+        // Clean: nothing to heal.
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_commit", &before)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_dirty", "0")
+            .unwrap();
+        assert!(!plain_heal_semantic(&store, &sched));
+        assert!(!sched.is_pending());
+
+        // Dirty with the markers equal: a new revision, and Phase B armed.
+        store
+            .lock()
+            .unwrap()
+            .set_meta("phase_b_dirty", "1")
+            .unwrap();
+        assert!(plain_heal_semantic(&store, &sched));
+        assert!(sched.is_pending());
+        let after = meta("last_commit");
+        assert_ne!(after, before);
+        assert!(after.starts_with(PLAIN_REV_PREFIX));
+
+        // Already behind (a run is owed): leave it alone.
+        assert!(!plain_heal_semantic(&store, &sched));
+        assert_eq!(meta("last_commit"), after);
+    }
+
+    /// A git repo reconciles every tick (a cheap marker compare). Plain mode runs
+    /// at startup, then only when events were dropped since the last pass.
+    #[test]
+    fn plain_reconcile_runs_at_startup_and_after_dropped_events_only() {
+        // Git: always due, whatever the counters say.
+        assert!(plain_reconcile_due(false, None, 0));
+        assert!(plain_reconcile_due(false, Some(7), 7));
+        // Plain: the first tick is due, a quiet tick is not, a drop is.
+        assert!(plain_reconcile_due(true, None, 0));
+        assert!(!plain_reconcile_due(true, Some(0), 0));
+        assert!(plain_reconcile_due(true, Some(0), 3));
+        assert!(!plain_reconcile_due(true, Some(3), 3));
+    }
+
     /// Marker == HEAD is the healthy steady state: the periodic tick must be
     /// a cheap no-op that neither reindexes nor arms Phase B.
     #[test]
@@ -14396,7 +14988,8 @@ mod tests {
             .unwrap();
 
         // First pass: both tracked, both indexed.
-        reconcile_tracked_tree(tmp.path(), &mut store).unwrap();
+        let tracked = tracked_files_from_git(tmp.path()).unwrap();
+        reconcile_tracked_tree(tmp.path(), &mut store, tracked).unwrap();
         let hashes = store.get_all_file_hashes().unwrap();
         assert!(hashes.contains_key("kept.ts"), "kept.ts should be indexed");
         assert!(hashes.contains_key("gone.ts"), "gone.ts should be indexed");
@@ -14410,7 +15003,8 @@ mod tests {
             .status()
             .expect("git rm --cached");
 
-        let (_dirty, files) = reconcile_tracked_tree(tmp.path(), &mut store).unwrap();
+        let tracked = tracked_files_from_git(tmp.path()).unwrap();
+        let (_dirty, files) = reconcile_tracked_tree(tmp.path(), &mut store, tracked).unwrap();
 
         let hashes = store.get_all_file_hashes().unwrap();
         assert!(
@@ -15818,6 +16412,11 @@ impl Daemon {
         // first firing is immediate, so the reconcile doubles as the startup
         // check; the flag stops a slow reconcile from overlapping the next tick.
         let head_reconcile_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Dropped events (watcher queue + indexer queue) as of the last
+        // successful plain reconcile; `None` means none has, so the next tick is
+        // due. Shared with the blocking task so it is recorded only on success.
+        let plain_seen_drops: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
         // #318 O3: poll the Phase B scheduler often enough to honour the debounce
         // window without busy-waiting. The tick is cheap (a single mutex peek);
         // it only spawns work when a re-run is actually due.
@@ -16174,18 +16773,29 @@ impl Daemon {
                         // those edits, so the graph would stay pinned to a
                         // stale commit while reporting healthy. First tick is
                         // immediate → this is also the startup reconciliation.
-                        if !head_reconcile_running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        // RFC-031 D2: a plain folder has no HEAD to compare, so it
+                        // re-checks the whole tree instead: at startup (this first
+                        // tick) and whenever events were dropped since the last
+                        // pass. A git repo is unchanged: every tick, as before.
+                        let drops_now = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                            + _watcher_handle.raw_dropped();
+                        if !head_reconcile_running
+                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
                             let store_rc = Arc::clone(&store);
                             let repo_rc = Arc::clone(&repo_root_arc);
                             let sched_rc = Arc::clone(&phase_b_scheduler);
                             let index_tx_rc = index_tx.clone();
+                            let seen_rc = Arc::clone(&plain_seen_drops);
                             let flag = Arc::clone(&head_reconcile_running);
                             tokio::task::spawn_blocking(move || {
-                                reconcile_head_drift(
+                                gc_freshness_tick(
                                     repo_rc.as_path(),
                                     &store_rc,
                                     &sched_rc,
                                     &index_tx_rc,
+                                    &seen_rc,
+                                    drops_now,
                                 );
                                 flag.store(false, std::sync::atomic::Ordering::Release);
                             });
@@ -16354,18 +16964,29 @@ impl Daemon {
                         }
                         // #621: see the unix gc_tick arm — startup + periodic
                         // reconciliation of last_commit against live HEAD.
-                        if !head_reconcile_running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        // RFC-031 D2: a plain folder has no HEAD to compare, so it
+                        // re-checks the whole tree instead: at startup (this first
+                        // tick) and whenever events were dropped since the last
+                        // pass. A git repo is unchanged: every tick, as before.
+                        let drops_now = WATCH_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+                            + _watcher_handle.raw_dropped();
+                        if !head_reconcile_running
+                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                        {
                             let store_rc = Arc::clone(&store);
                             let repo_rc = Arc::clone(&repo_root_arc);
                             let sched_rc = Arc::clone(&phase_b_scheduler);
                             let index_tx_rc = index_tx.clone();
+                            let seen_rc = Arc::clone(&plain_seen_drops);
                             let flag = Arc::clone(&head_reconcile_running);
                             tokio::task::spawn_blocking(move || {
-                                reconcile_head_drift(
+                                gc_freshness_tick(
                                     repo_rc.as_path(),
                                     &store_rc,
                                     &sched_rc,
                                     &index_tx_rc,
+                                    &seen_rc,
+                                    drops_now,
                                 );
                                 flag.store(false, std::sync::atomic::Ordering::Release);
                             });

@@ -108,12 +108,59 @@ rebuild with `phase_b_scheduler.mark_dirty()`. The plain-mode startup trigger
 does the same two steps, or the call edges stay stale after a restart even
 though every file was rehashed.
 
+**A revision marker stands in for the commit.** `last_commit` is more than a
+display value. `run_background_phase_b_inner` returns immediately when it is
+empty, the query cache keys on it, and `travsr status` and the MCP freshness
+fields read it. A plain folder has no commit, so leaving it empty would leave
+the semantic layer permanently stale after every restart. Plain mode stores a
+`plain-<n>` marker there instead (`n` is a strictly increasing time-based
+number). It is minted when a pass changes the tree and reused when it does not,
+so a re-run over an unchanged folder finds Phase B already done instead of
+repeating whole-project analysis. Nothing resolves it with git: every reader
+that asks git about `last_commit` already treats a revision git cannot resolve
+as "unknown", and a git repo's real commit replaces the marker the next time
+`travsr init` runs there.
+
+The startup reconcile also rebuilds when the watcher left the semantic layer
+flagged degraded (`phase_b_dirty`), not only when file hashes differ. A file
+edited while the daemon ran was reindexed by the watcher, so its hash matches
+at the next start, but its call edges were dropped; without this a restart
+would never repair them. An unchanged tree arms nothing.
+
 **Dropped watcher events.** The daemon's event queues are bounded and drop
 events when full (#736). In a git repo that loss is repaired by the periodic
 HEAD reconcile and the next commit. Plain mode has neither, so a dropped event
 would stay unrepaired until the next daemon restart. When the watcher has
 dropped events since the last reconcile, plain mode runs the same full-tree
 reconcile on the next GC tick.
+
+**Mode changes while the daemon runs.** The GC tick reads the `vcs` marker from
+the index each time rather than once at startup, so a `travsr init` that
+re-classifies the folder (`rm -rf .git`, or `git init` in a plain folder) is
+followed without a restart. A plain reconcile counts as done, for dropped-event
+purposes, only once it succeeded; a failed catch-up is retried on the next tick.
+It hashes files with the store unlocked and reindexes only the ones that differ.
+A later command finds a plain root through the registry or, failing that, the
+nearest ancestor holding `.travsr/graph.db`.
+
+**Semantic layer after live edits.** Phase B is gated on `last_commit` differing
+from `phase_b_commit`, and a plain folder has no commit to move it. A live edit
+sets `phase_b_dirty` with the two markers equal, so nothing would rerun Phase B
+until a restart. On each GC tick (every five minutes, not per edit, to keep the
+#583 rule that typing does not trigger whole-project analysis) a plain index with
+`phase_b_dirty=1` and equal markers mints a new `plain-<n>` revision and arms
+the debounced Phase B run.
+
+**Text search.** `find_pattern` runs `git grep --no-index --exclude-standard`
+over the working tree in plain mode. It honours the folder's `.gitignore`, and
+the result lines go through the same filters as in a git repo (`SKIP_DIRS`,
+binary files, `.travsrignore`). The pass that re-includes gitignored files
+needs a repository and is skipped.
+
+**Index status fields.** `get_index_status` reports `staleness.is_stale` and
+`head_commit` as null in plain mode, since there is no HEAD to compare. After a
+later `git init` with no commit yet, `last_commit` keeps its `plain-<n>` marker
+until the first commit.
 
 No git hooks are installed in plain mode, and `status` reports the freshness
 source as `watcher` rather than `post-commit hook`.

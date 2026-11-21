@@ -77,7 +77,7 @@ pub(crate) const SERVER_NAME: &str = "travsr";
 /// `initialize`'s `instructions` (plan 8.5): what this server is for and which
 /// tools to reach for first, in plain words, over both stdio and SSE.
 pub(crate) const INSTRUCTIONS: &str = "Travsr answers questions about this project's code from a \
-map of its files, definitions and calls, kept up to date on every commit. Reach for it \
+map of its files, definitions and calls, kept up to date as the code changes. Reach for it \
 before searching text: search_symbol finds where something is defined, get_callers and \
 find_references list every use with file and line, get_context answers a question in \
 plain words, and find_pattern is a text search over the same files. Every answer is \

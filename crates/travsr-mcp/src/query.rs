@@ -376,9 +376,9 @@ pub fn dirty_semantic_state(resolved: u64, pending: u64) -> String {
     if resolved == 0 && pending == 0 {
         "stale (run travsr init to refresh)".to_string()
     } else if pending > 0 {
-        format!("{pending} reference(s) in edits not yet committed are not traced yet")
+        format!("{pending} reference(s) in recent edits are not traced yet")
     } else {
-        "edits not yet committed were traced where found; commit for a full refresh".to_string()
+        "recent edits were traced where found; a full refresh is still pending".to_string()
     }
 }
 

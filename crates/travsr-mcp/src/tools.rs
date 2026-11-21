@@ -279,16 +279,16 @@ pub fn phase_b_degraded_note(store: &SqliteStore) -> Option<String> {
                 Some(STALE.to_string())
             } else if pending == 0 {
                 Some(
-                    "[note: a background update dropped some calls; edits not yet \
-                     committed were traced again where found, but a few calls may \
-                     be missing until the next commit.]"
+                    "[note: a background update dropped some calls; recent edits \
+                     were traced again where found, but a few calls may be \
+                     missing until the next full refresh.]"
                         .to_string(),
                 )
             } else {
                 Some(format!(
-                    "[note: {pending} reference(s) in edits not yet committed are \
-                     not traced yet, so a few calls may be missing until the next \
-                     commit; other results are current.]"
+                    "[note: {pending} reference(s) in recent edits are not \
+                     traced yet, so a few calls may be missing until the next \
+                     full refresh; other results are current.]"
                 ))
             }
         }
@@ -352,7 +352,7 @@ fn live_overlay_note(store: &SqliteStore, answer: &str, has_live_row: bool) -> O
     let mut parts = Vec::new();
     if live > 0 {
         parts.push(format!(
-            "{live} call{} found in edits not yet committed {} included and marked `live` \
+            "{live} call{} found in recent edits {} included and marked `live` \
              (repo-wide)",
             if live == 1 { "" } else { "s" },
             if live == 1 { "is" } else { "are" }
@@ -3194,6 +3194,12 @@ fn build_travsrignore_matcher(repo_root: &std::path::Path) -> Option<ignore::git
     builder.build().ok()
 }
 
+/// True when this index was initialised in plain mode (no VCS, RFC-031 D1).
+/// Reads the stored `vcs` marker the daemon writes, not the presence of `.git`.
+fn is_plain_store(store: &SqliteStore) -> bool {
+    store.get_meta("vcs").ok().flatten().as_deref() == Some("none")
+}
+
 /// Outcome of a `git grep` invocation, distinguishing a clean zero-match run
 /// from a search the regex engine could not even compile (#517 DD-4). Exit
 /// codes, measured against `git grep`: `0` = matched, `1` = no match, anything
@@ -3403,12 +3409,21 @@ fn run_git_grep(
     // is in the graph the moment the watcher sees it, and "always fresh" means
     // the search has to see it too); `--exclude-standard` keeps `.gitignore`
     // authoritative, matching the walker's `git_ignore(true)`.
+    //
+    // A plain folder (RFC-031, `vcs=none`) has no repository, so `git grep`
+    // without `--no-index` refuses to run. `--no-index --exclude-standard`
+    // searches the working tree directly and still honours the folder's own
+    // `.gitignore`. `SKIP_DIRS`, binary files and `.travsrignore` are filtered
+    // from these lines below exactly as in a git repo.
+    let plain = is_plain_store(store);
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_root)
-        .arg("grep")
-        .arg("--untracked")
-        .arg("--exclude-standard");
+    cmd.arg("-C").arg(repo_root).arg("grep");
+    if plain {
+        cmd.arg("--no-index");
+    } else {
+        cmd.arg("--untracked");
+    }
+    cmd.arg("--exclude-standard");
     with_common_args(&mut cmd);
     for spec in pathspecs {
         cmd.arg(spec);
@@ -3423,10 +3438,16 @@ fn run_git_grep(
     // `!` rule in `.travsrignore` re-included. `--no-index` searches the given
     // paths directly instead of consulting the index or the ignore rules that
     // excluded them in the first place. Empty for any repo without a `!` rule.
-    let reincluded = scoped_to_pathspecs(
-        travsrignore_reincluded_files(repo_root, remaining()),
-        pathspecs,
-    );
+    // Pass 2 lists ignored files with `git ls-files`, which needs a repository,
+    // so a plain folder has nothing to add here.
+    let reincluded = if plain {
+        Vec::new()
+    } else {
+        scoped_to_pathspecs(
+            travsrignore_reincluded_files(repo_root, remaining()),
+            pathspecs,
+        )
+    };
     let mut pass2_error: Option<String> = None;
     for chunk in argv_chunks(&reincluded) {
         let mut cmd = Command::new("git");
@@ -19160,7 +19181,7 @@ mod snippet_tests {
         // This drops the heavy "degraded, run init" note, but not all caution:
         // the counts are repo-wide, so a resolved file cannot prove a *separate*
         // headless edit (which leaves no rows) also came back. So the note is a
-        // light "a few edges may be missing until the next commit", never the
+        // light "a few edges may be missing until the next full refresh", never the
         // false "results are current".
         let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
         store.set_meta("last_commit", "abc").unwrap();
@@ -19192,8 +19213,8 @@ mod snippet_tests {
             "a resolved overlay must drop the heavy degraded/run-init note, got: {note}"
         );
         assert!(
-            note.contains("until the next commit"),
-            "the light caution must still name the commit as the full refresh, got: {note}"
+            note.contains("until the next full refresh"),
+            "the light caution must still name a full refresh, got: {note}"
         );
     }
 
@@ -19469,7 +19490,7 @@ mod snippet_tests {
         let note = live_overlay_note(&store, "callers in a.ts:3", true)
             .expect("an overlay must be announced");
         assert!(
-            note.contains("1 call found in edits not yet committed is included"),
+            note.contains("1 call found in recent edits is included"),
             "singular form: {note}"
         );
         assert!(
@@ -22622,6 +22643,38 @@ mod snippet_tests {
             out.contains("untracked.rs"),
             "an indexed-but-untracked file must be searchable: {out}"
         );
+    }
+
+    #[test]
+    fn find_pattern_works_in_a_plain_folder_without_a_repository() {
+        // RFC-031 plain mode: no `.git` anywhere, so a bare `git grep` dies with
+        // "not a git repository". The search must run over the working tree,
+        // honour the folder's own `.gitignore`, and skip the hard `SKIP_DIRS`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = "fn charge() {}\n";
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("kept.rs"), body).unwrap();
+        for d in ["ignored", "node_modules", ".travsr"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+            std::fs::write(root.join(d).join("dep.rs"), body).unwrap();
+        }
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        store.set_meta("repo_root", root.to_str().unwrap()).unwrap();
+        store.set_meta("vcs", "none").unwrap();
+
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !git_ok {
+            return; // git is missing in this sandbox: nothing to exercise
+        }
+        let out = find_pattern(&store, "charge", None, false, 0);
+        assert!(out.contains("kept.rs"), "plain folder search failed: {out}");
+        for hidden in ["ignored/dep.rs", "node_modules/dep.rs", ".travsr/dep.rs"] {
+            assert!(!out.contains(hidden), "{hidden} must stay out: {out}");
+        }
     }
 
     #[test]

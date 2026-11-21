@@ -46,7 +46,7 @@
 curl -fsSL https://travsr.com/install.sh | sh   # shell installer, no Node needed
 npm install -g @travsr.com/travsr               # npm
 
-# 2. Set up your project (any git repository)
+# 2. Set up your project (a git repository, or any plain folder)
 cd your-project
 travsr init
 ```
@@ -66,6 +66,20 @@ override the default `~/.local/bin`. If `travsr.com` is unreachable, use the
 GitHub fallback URL:
 `https://github.com/Travsr-com/travsr/releases/latest/download/install.sh`.
 See [SECURITY.md](SECURITY.md) for what the script verifies before installing.
+
+### Folders without git
+
+`travsr init` also works in a folder that is not a git repository. It indexes
+the folder in plain mode, prints one line saying so, and installs no git hooks.
+The file watcher keeps the index current while the daemon runs, and the daemon
+re-checks the whole folder each time it starts, so edits made while it was
+stopped are picked up too. `.gitignore` and `.travsrignore` in the folder apply
+as they do in a repo; `.gitignore` files in folders above it do not. `travsr
+status` shows `kept fresh by: file watcher` for these folders.
+
+Plain mode refuses your home directory and the filesystem root, and it refuses
+a folder below a git repository at `~` (a dotfiles repo), since either would
+index far more than you meant. Run `travsr init` inside the folder you want.
 
 ### Other tools
 
@@ -818,8 +832,8 @@ Pre-built binaries are available on the [Releases](https://github.com/Travsr-com
 
 ## Troubleshooting
 
-- **`not inside a git repository`**
-  Run `git init` before `travsr init`.
+- **`not inside a git repository or an initialized folder`**
+  Run `travsr init` in the folder first. It works with or without git.
 
 - **`not initialized: run travsr init`**
   Run `travsr init` in the repo root before using `graph`, `ask`, `status`, or `mcp`.

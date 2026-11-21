@@ -495,7 +495,7 @@ pub fn render_summary(s: &InitSummary) -> Vec<String> {
             stage("Traced calls".to_string());
         }
         if s.keeping_fresh != "not_started" {
-            stage("Keeping it fresh on every commit".to_string());
+            stage("Keeping it fresh as you work".to_string());
         }
         if !s.connected.tools.is_empty() {
             let names: Vec<&str> = s
@@ -986,7 +986,7 @@ mod tests {
                 "  \u{2713} Got search ranking",
                 "  \u{2713} Read 5 files",
                 "  \u{2713} Traced calls",
-                "  \u{2713} Keeping it fresh on every commit",
+                "  \u{2713} Keeping it fresh as you work",
                 "  \u{2713} Connected to Claude Code, Cursor",
                 "  Claude Code asks once whether to trust this project's tools: accept it \
                  (or run /mcp in Claude Code).",

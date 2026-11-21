@@ -1591,7 +1591,10 @@ async fn run(cli: Cli) -> Result<()> {
                             .unwrap_or_default(),
                     ));
             let dirty = if whole_tree {
-                let (dirty, files) = travsr_daemon::reconcile_tracked_tree(&repo_root, &mut store)?;
+                let tracked = travsr_daemon::tracked_files_from_git(&repo_root)
+                    .context("enumerating tracked files for a whole-tree reconcile")?;
+                let (dirty, files) =
+                    travsr_daemon::reconcile_tracked_tree(&repo_root, &mut store, tracked)?;
                 tracing::debug!(
                     event = event.as_deref().unwrap_or(""),
                     files,
