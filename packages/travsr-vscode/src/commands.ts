@@ -742,6 +742,33 @@ function shortTarget(target: string): string {
 }
 
 /** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
+/** How long the Health page waits for `get_index_status`. Longer than the
+ *  client's 10 s default: the tool runs git over the working tree and reads the
+ *  analyzers' state, which took 3.6 to 8.2 s on its own on a large Windows
+ *  repository, and the page asks several other tools at the same moment. */
+export const INDEX_STATUS_TIMEOUT_MS = 30_000;
+
+/** Read `get_index_status` for the Health page.
+ *
+ *  The client answers "" both for a tool this binary does not serve and for a
+ *  reply that did not arrive in time, and the page used to call either one "not
+ *  reported by this binary", sending the reader to check a binary that was
+ *  fine. An unknown tool is answered at once; an empty answer that took the
+ *  whole wait ran out of time, and is marked \`timedOut\`. */
+export async function readIndexHealth(
+  client: Pick<McpClient, "callTool">,
+  timeoutMs: number = INDEX_STATUS_TIMEOUT_MS,
+  now: () => number = Date.now
+): Promise<IndexHealth> {
+  const started = now();
+  const raw = await client.callTool("get_index_status", {}, undefined, timeoutMs);
+  const health = parseIndexHealth(raw);
+  if (!health.available && raw.trim() === "" && now() - started >= timeoutMs * 0.95) {
+    return { ...health, timedOut: true };
+  }
+  return health;
+}
+
 /** Parse the `get_index_status` envelope. Anything unparseable is reported as
  *  unavailable rather than as a healthy default. */
 export function parseIndexHealth(raw: string): IndexHealth {
@@ -1833,10 +1860,9 @@ export function registerShowGraphStats(
     const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
     // Drift, straight from the daemon. An older binary does not serve this tool
     // and the client answers "" for an unknown tool, which parseIndexHealth
-    // reports as unavailable rather than as fresh.
-    const index = reuse
-      ? lastIndex
-      : parseIndexHealth(await client.callTool("get_index_status"));
+    // reports as unavailable rather than as fresh; a reply that ran out of time
+    // is told apart from that (readIndexHealth).
+    const index = reuse ? lastIndex : await readIndexHealth(client);
     // The sections. Skipped on a log-only refresh, which is what changing Lines
     // or File does: those spawns are the expensive half and nothing above the
     // log has changed.

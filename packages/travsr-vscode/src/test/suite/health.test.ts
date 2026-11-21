@@ -8,7 +8,12 @@ import {
 } from "../../webviews";
 import type { Diagnostic, HealthData, IndexHealth, RepoRow, StatsView } from "../../webviews";
 import { EMPTY_HEALTH } from "../../webviews";
-import { parseIndexHealth, activeLogLevel } from "../../commands";
+import {
+  parseIndexHealth,
+  activeLogLevel,
+  readIndexHealth,
+  INDEX_STATUS_TIMEOUT_MS,
+} from "../../commands";
 import type { LogEntry } from "../../webviews";
 import {
   detectShellKind,
@@ -409,6 +414,16 @@ suite("health panel rendering", () => {
     });
     assert.ok(noDaemon.includes("while the daemon is stopped"), "stopped-daemon reason");
     assert.ok(!noDaemon.includes("not reported by this binary"), "and not the binary's age");
+  });
+
+  test("an index status that ran out of time says so, not that the binary lacks it", () => {
+    // Seen live: get_index_status took 3.6 to 8.2 s on its own on a large
+    // repository, the page asks several tools at once, and the old 10 s wait
+    // ran out. The panel then blamed a binary that serves the tool fine.
+    const slow = buildStatsHtml(STATS, [], [], 500, undefined, 0, { ...UNKNOWN_INDEX, timedOut: true }, RUNNING);
+    assert.ok(slow.includes("took too long to arrive"), "timeout reason");
+    assert.ok(slow.includes("Refresh"), "and the remedy");
+    assert.ok(!slow.includes("not reported by this binary"), "not the binary's age");
   });
 
   test("the header carries a timestamp the document can count from", () => {
@@ -1138,5 +1153,52 @@ suite("terminal command building", () => {
       formatCommandLine("/usr/bin/travsr", ["init"], "posix"),
       "/usr/bin/travsr init"
     );
+  });
+});
+
+suite("Health: reading get_index_status", () => {
+  const FRESH_REPLY =
+    '<travsr-data>{"indexed_commit":"abc","head_commit":"abc","phase_a":{"state":"done"},' +
+    '"staleness":{"behind_by":0,"is_stale":false,"working_tree_dirty":false}}</travsr-data>';
+
+  /** A client whose reply arrives after `elapsed` ms on a fake clock. */
+  function fakeClient(reply: string, elapsed: number) {
+    let t = 1_000;
+    const calls: Array<{ name: string; timeoutMs?: number }> = [];
+    return {
+      calls,
+      now: () => t,
+      client: {
+        callTool: async (name: string, _args?: Record<string, string>, _s?: AbortSignal, timeoutMs?: number) => {
+          calls.push({ name, timeoutMs });
+          t += elapsed;
+          return reply;
+        },
+      },
+    };
+  }
+
+  test("waits 30 s for it, longer than the client's 10 s default", async () => {
+    const f = fakeClient(FRESH_REPLY, 4_000);
+    const h = await readIndexHealth(f.client, undefined, f.now);
+    assert.deepStrictEqual(f.calls, [{ name: "get_index_status", timeoutMs: INDEX_STATUS_TIMEOUT_MS }]);
+    assert.strictEqual(INDEX_STATUS_TIMEOUT_MS, 30_000);
+    assert.strictEqual(h.available, true);
+    assert.strictEqual(h.isStale, false);
+    assert.strictEqual(h.timedOut, undefined);
+  });
+
+  test("an empty reply that took the whole wait is a timeout", async () => {
+    const f = fakeClient("", INDEX_STATUS_TIMEOUT_MS);
+    const h = await readIndexHealth(f.client, undefined, f.now);
+    assert.strictEqual(h.available, false);
+    assert.strictEqual(h.timedOut, true);
+  });
+
+  test("an empty reply that came back at once is a binary without the tool", async () => {
+    const f = fakeClient("", 15);
+    const h = await readIndexHealth(f.client, undefined, f.now);
+    assert.strictEqual(h.available, false);
+    assert.ok(!h.timedOut, "an unknown tool answers immediately: not a timeout");
   });
 });
