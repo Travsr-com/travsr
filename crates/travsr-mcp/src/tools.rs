@@ -10660,6 +10660,10 @@ fn get_graph_json_raw(
         // File mode: the import schema uses a two-hop chain
         //   file --[Depends]--> import_node --[ResolvesTo]--> file
         // Look through the intermediary to emit direct file→file edges.
+        // Rust's `mod foo;` is the same shape through a defined node,
+        //   file --[DefinesBinding]--> file-module --[ResolvesTo]--> file
+        // so it is followed too (#1130); other defined symbols have no
+        // ResolvesTo edges and add nothing.
         if kind_filter == "file" {
             use travsr_core::EdgeKind;
             if direction == "deps" || direction == "both" {
@@ -10668,7 +10672,7 @@ fn get_graph_json_raw(
                     // then fetch once instead of one get_node per res.dst.
                     let mut res_targets: Vec<NodeId> = Vec::new();
                     for dep in &dep_edges {
-                        if !matches!(dep.kind, EdgeKind::Depends) {
+                        if !matches!(dep.kind, EdgeKind::Depends | EdgeKind::DefinesBinding) {
                             continue;
                         }
                         if let Ok(res_edges) = store.iter_edges_from(dep.dst) {
@@ -10687,7 +10691,7 @@ fn get_graph_json_raw(
                         .collect();
                     for target_id in res_targets {
                         if let Some(target) = node_map.get(&target_id) {
-                            if target.kind != "file" {
+                            if target.kind != "file" || target.id == current_id {
                                 continue;
                             }
                             if edge_seen.insert((current_id, target.id, "imports")) {
@@ -10717,7 +10721,10 @@ fn get_graph_json_raw(
                         }
                         if let Ok(rev_dep_edges) = store.iter_edges_to(rev_res.src) {
                             for rev_dep in &rev_dep_edges {
-                                if matches!(rev_dep.kind, EdgeKind::Depends) {
+                                if matches!(
+                                    rev_dep.kind,
+                                    EdgeKind::Depends | EdgeKind::DefinesBinding
+                                ) {
                                     source_ids.push(rev_dep.src);
                                 }
                             }
@@ -10731,7 +10738,7 @@ fn get_graph_json_raw(
                         .collect();
                     for source_id in source_ids {
                         if let Some(source) = node_map.get(&source_id) {
-                            if source.kind != "file" {
+                            if source.kind != "file" || source.id == current_id {
                                 continue;
                             }
                             if edge_seen.insert((source.id, current_id, "imports")) {
@@ -14299,6 +14306,82 @@ mod tests {
     }
 
     // ── P3 overview / LOD tests ────────────────────────────────────────────────
+
+    /// #1130: Rust's `mod foo;` (file --DefinesBinding--> file-module
+    /// --ResolvesTo--> file) is a file-level link in both directions, and a
+    /// defined symbol without ResolvesTo edges adds nothing.
+    #[test]
+    fn file_graph_follows_rust_mod_declarations() {
+        use travsr_core::{Edge, EdgeKind, Node, VName};
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let parent = Node::new(VName::new("", "", "src/ui/mod.rs", "rust", "file"), "file");
+        let child = Node::new(
+            VName::new("", "", "src/ui/terminal.rs", "rust", "file"),
+            "file",
+        );
+        let filemod = Node::new(
+            VName::new("", "", "src/ui/mod.rs", "rust", "filemod:terminal"),
+            "file-module",
+        );
+        let func = Node::new(
+            VName::new("", "", "src/ui/mod.rs", "rust", "fn:run"),
+            "function",
+        );
+        for n in [&parent, &child, &filemod, &func] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .put_edge(&Edge::new(parent.id, filemod.id, EdgeKind::DefinesBinding))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(parent.id, func.id, EdgeKind::DefinesBinding))
+            .unwrap();
+        store
+            .put_edge(&Edge::new(filemod.id, child.id, EdgeKind::ResolvesTo))
+            .unwrap();
+
+        let graph = |query: &str| -> serde_json::Value {
+            let raw = get_graph_json(
+                &store,
+                &GraphJsonParams {
+                    query,
+                    direction: "both",
+                    depth: 2,
+                    kind_filter: "file",
+                    provenance: "",
+                    token_budget: 0,
+                    mode: "",
+                    path_prefix: "",
+                },
+            );
+            let body = raw
+                .trim_start_matches("<travsr-data>")
+                .split("</travsr-data>")
+                .next()
+                .unwrap()
+                .trim();
+            serde_json::from_str(body).unwrap()
+        };
+        for query in ["src/ui/terminal.rs", "src/ui/mod.rs"] {
+            let g = graph(query);
+            let nodes: Vec<&str> = g["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["path"].as_str().unwrap())
+                .collect();
+            assert_eq!(nodes.len(), 2, "{query}: both files, nothing else: {g}");
+            assert!(
+                nodes.contains(&"src/ui/mod.rs") && nodes.contains(&"src/ui/terminal.rs"),
+                "{g}"
+            );
+            assert_eq!(
+                g["edges"].as_array().unwrap().len(),
+                1,
+                "{query}: one mod.rs -> terminal.rs link: {g}"
+            );
+        }
+    }
 
     fn make_file_graph_store() -> travsr_store::SqliteStore {
         use travsr_core::{Edge, EdgeKind, Node, VName};
