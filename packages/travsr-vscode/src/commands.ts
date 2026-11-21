@@ -760,13 +760,29 @@ export async function readIndexHealth(
   timeoutMs: number = INDEX_STATUS_TIMEOUT_MS,
   now: () => number = Date.now
 ): Promise<IndexHealth> {
-  const started = now();
-  const raw = await client.callTool("get_index_status", {}, undefined, timeoutMs);
+  const { raw, timedOut } = await callToolTimed(client, "get_index_status", timeoutMs, now);
   const health = parseIndexHealth(raw);
-  if (!health.available && raw.trim() === "" && now() - started >= timeoutMs * 0.95) {
-    return { ...health, timedOut: true };
-  }
-  return health;
+  return !health.available && timedOut ? { ...health, timedOut: true } : health;
+}
+
+/**
+ * Call a tool and say whether an empty reply ran out of time.
+ *
+ * The client answers "" for a tool this binary lacks, for a tool error, and for
+ * a reply that did not arrive within `timeoutMs`. The first two come back at
+ * once; an empty reply that took (nearly) the whole wait is the timeout. The
+ * Health page reports that one as "Travsr was busy" rather than as a missing
+ * feature (#1129, and #1127 for the index status).
+ */
+export async function callToolTimed(
+  client: Pick<McpClient, "callTool">,
+  name: string,
+  timeoutMs: number,
+  now: () => number = Date.now
+): Promise<{ raw: string; timedOut: boolean }> {
+  const started = now();
+  const raw = await client.callTool(name, {}, undefined, timeoutMs);
+  return { raw, timedOut: raw.trim() === "" && now() - started >= timeoutMs * 0.95 };
 }
 
 /** Parse the `get_index_status` envelope. Anything unparseable is reported as
@@ -1035,12 +1051,14 @@ export async function gatherHealth(
     }
   };
 
-  const [versionOut, daemonOut, embedOut, langOut, healthRaw, reposRaw, repoLangsRaw, configOut] = await Promise.all([
+  const [versionOut, daemonOut, embedOut, langOut, healthReply, reposRaw, repoLangsRaw, configOut] = await Promise.all([
     settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
     settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), 8_000), ""),
     settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
     settle(spawnLangCommand(binary, ["lang", "list", "--json"], root ?? process.cwd(), 60_000), ""),
-    settle(client.callTool("get_graph_health"), ""),
+    // The integrity report gets the same longer wait as the index status: it
+    // reads the whole graph, and arrives alongside everything else here (#1129).
+    settle(callToolTimed(client, "get_graph_health", INDEX_STATUS_TIMEOUT_MS), { raw: "", timedOut: false }),
     settle(client.callTool("repos_list"), ""),
     // Which languages the graph actually found in this repo, so the Languages
     // table only offers to install or enable an analyzer the repo can use.
@@ -1122,7 +1140,7 @@ export async function gatherHealth(
 
   // Integrity, from the daemon's own report.
   let integrity: IntegrityView | null = null;
-  const healthBody = stripEnvelope(healthRaw).trim();
+  const healthBody = stripEnvelope(healthReply.raw).trim();
   if (healthBody !== "") {
     try {
       const h = JSON.parse(healthBody) as {
@@ -1258,6 +1276,7 @@ export async function gatherHealth(
     languages,
     ...(languagesSkew !== undefined ? { languagesSkew } : {}),
     integrity,
+    integrityTimedOut: integrity === null && healthReply.timedOut,
   };
 }
 

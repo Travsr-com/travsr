@@ -13,6 +13,7 @@ import {
   activeLogLevel,
   readIndexHealth,
   INDEX_STATUS_TIMEOUT_MS,
+  callToolTimed,
 } from "../../commands";
 import type { LogEntry } from "../../webviews";
 import {
@@ -424,6 +425,14 @@ suite("health panel rendering", () => {
     assert.ok(slow.includes("took too long to arrive"), "timeout reason");
     assert.ok(slow.includes("Refresh"), "and the remedy");
     assert.ok(!slow.includes("not reported by this binary"), "not the binary's age");
+  });
+
+  test("an integrity report that ran out of time says so (#1129)", () => {
+    const slow = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, { ...RUNNING, integrity: null, integrityTimedOut: true });
+    assert.ok(slow.includes("integrity report took too long to arrive"), "timeout reason");
+    assert.ok(!slow.includes("Could not read the integrity report"), "not a failure");
+    const failed = buildStatsHtml(STATS, [], [], 500, undefined, 0, FRESH, { ...RUNNING, integrity: null });
+    assert.ok(failed.includes("Could not read the integrity report"), "a real failure keeps its message");
   });
 
   test("the header carries a timestamp the document can count from", () => {
@@ -1200,5 +1209,32 @@ suite("Health: reading get_index_status", () => {
     const h = await readIndexHealth(f.client, undefined, f.now);
     assert.strictEqual(h.available, false);
     assert.ok(!h.timedOut, "an unknown tool answers immediately: not a timeout");
+  });
+});
+
+suite("Health: telling a slow tool from a missing one (#1129)", () => {
+  const client = (reply: string, elapsed: number, clock: { t: number }) => ({
+    callTool: async () => {
+      clock.t += elapsed;
+      return reply;
+    },
+  });
+
+  test("an empty reply that took the whole wait timed out", async () => {
+    const clock = { t: 0 };
+    const r = await callToolTimed(client("", 30_000, clock), "get_graph_health", 30_000, () => clock.t);
+    assert.deepStrictEqual(r, { raw: "", timedOut: true });
+  });
+
+  test("an empty reply that came back at once did not", async () => {
+    const clock = { t: 0 };
+    const r = await callToolTimed(client("", 20, clock), "get_graph_health", 30_000, () => clock.t);
+    assert.strictEqual(r.timedOut, false);
+  });
+
+  test("a real reply is never a timeout, however slow", async () => {
+    const clock = { t: 0 };
+    const r = await callToolTimed(client("<travsr-data>{}</travsr-data>", 30_000, clock), "x", 30_000, () => clock.t);
+    assert.strictEqual(r.timedOut, false);
   });
 });
