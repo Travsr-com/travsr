@@ -24,6 +24,16 @@ ignore = [
     # "unmaintained", not a vulnerability, and no patched release exists.
     # Revisit when liquid migrates off anymap2.
     { id = "RUSTSEC-2026-0319", reason = "build-time transitive (liquid/tract codegen), no runtime exposure" },
+    # chrono is unmaintained (RUSTSEC-2026-0543); all versions are affected and
+    # no patched release exists, so there is nothing to upgrade to. It is a
+    # direct runtime dependency of travsr-cli only, used for the `--since`
+    # window of the log viewer, local-or-UTC formatting of log timestamps, and
+    # one date stamp on a consent record. It parses no untrusted network input,
+    # and the advisory is "unmaintained", not a vulnerability. The advisory
+    # recommends jiff or time; revisit as a migration (a dozen call sites in
+    # travsr-cli/src/main.rs and lang.rs). time needs care for local offsets in
+    # a multithreaded process, which is why this is an ignore and not a swap.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not vulnerable; runtime use is log-time formatting only; revisit as a jiff/time migration" },
 ]
 
 [licenses]
