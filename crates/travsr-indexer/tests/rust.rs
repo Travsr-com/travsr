@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::{link_imports_rust, Indexer};
+use travsr_indexer::{link_imports_rust, link_imports_rust_fs, Indexer};
 
 fn fixture_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust/simple.rs")
@@ -195,7 +195,8 @@ fn link_imports_rust_double_super_traverses_two_levels() {
 
     let edges = link_imports_rust(&out.nodes, "src/a/b/mod.rs", "");
 
-    // super::super::utils from src/a/b/mod.rs → src/utils.rs + src/utils/mod.rs
+    // super::super::utils from src/a/b/mod.rs: the module src/utils.rs or
+    // src/utils/mod.rs, or an item `utils` in the crate root (lib.rs, main.rs).
     assert!(
         edges.iter().any(|e| e.kind == EdgeKind::ResolvesTo),
         "super::super:: should resolve two directory levels up"
@@ -205,8 +206,8 @@ fn link_imports_rust_double_super_traverses_two_levels() {
             .iter()
             .filter(|e| e.kind == EdgeKind::ResolvesTo)
             .count(),
-        2,
-        "double super:: must produce exactly 2 ResolvesTo candidates"
+        4,
+        "double super:: must produce exactly 4 ResolvesTo candidates"
     );
 }
 
@@ -399,6 +400,203 @@ fn a_mod_declared_in_an_ordinary_file_lives_in_its_directory() {
     );
     assert!(got.contains(&"src/bar/foo.rs".to_string()), "{got:?}");
     assert!(!got.contains(&"src/foo.rs".to_string()), "{got:?}");
+}
+
+/// Review of #1132: Cargo roots a `main.rs` in a subdirectory of `src/bin`,
+/// `tests`, `examples` or `benches` in that subdirectory.
+#[test]
+fn a_main_rs_in_a_subdirectory_is_its_own_crate_root() {
+    for (file, want, wrong) in [
+        (
+            "crates/x/src/bin/tool/main.rs",
+            "crates/x/src/bin/tool/cli.rs",
+            "crates/x/src/bin/cli.rs",
+        ),
+        (
+            "crates/x/tests/foo/main.rs",
+            "crates/x/tests/foo/cli.rs",
+            "crates/x/tests/cli.rs",
+        ),
+        (
+            "crates/x/examples/demo/main.rs",
+            "crates/x/examples/demo/cli.rs",
+            "crates/x/examples/cli.rs",
+        ),
+    ] {
+        let got = resolved_targets("use crate::cli::Args;\n", file, &[want, wrong]);
+        assert_eq!(got, vec![want.to_string()], "{file}");
+    }
+}
+
+/// Review of #1132: with one segment after `super::` / `crate::`, the item
+/// lives in the starting module, whose file was never linked.
+#[test]
+fn a_single_segment_path_names_the_enclosing_module() {
+    let got = resolved_targets(
+        "use super::ApiError;\n",
+        "crates/cli/src/ui/terminal.rs",
+        &[
+            "crates/cli/src/ui.rs",
+            "crates/cli/src/ui/mod.rs",
+            "crates/cli/src/lib.rs",
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            "crates/cli/src/ui.rs".to_string(),
+            "crates/cli/src/ui/mod.rs".to_string()
+        ]
+    );
+
+    // At the crate root the module is the root file.
+    let got = resolved_targets(
+        "use crate::Config;\n",
+        "crates/cli/src/ui/terminal.rs",
+        &[
+            "crates/cli/src/lib.rs",
+            "crates/cli/src/main.rs",
+            "crates/cli/src.rs",
+            "crates/cli/src/mod.rs",
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            "crates/cli/src/lib.rs".to_string(),
+            "crates/cli/src/main.rs".to_string()
+        ]
+    );
+    let got = resolved_targets(
+        "use super::Config;\n",
+        "crates/cli/src/ui/mod.rs",
+        &["crates/cli/src/lib.rs", "crates/cli/src.rs"],
+    );
+    assert_eq!(got, vec!["crates/cli/src/lib.rs".to_string()]);
+
+    // A file never links to itself, and a flat test's own root is itself.
+    let got = resolved_targets(
+        "use crate::Config;\n",
+        "crates/cli/src/lib.rs",
+        &["crates/cli/src/lib.rs", "crates/cli/src/main.rs"],
+    );
+    assert_eq!(got, vec!["crates/cli/src/main.rs".to_string()]);
+    let got = resolved_targets(
+        "use crate::Helper;\n",
+        "crates/cli/tests/it.rs",
+        &["crates/cli/tests/it.rs", "crates/cli/tests.rs"],
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+/// Like [`resolved_targets`], linking against a repository laid out on disk
+/// (`files` are created empty, `Cargo.toml` included).
+fn resolved_targets_fs(
+    files: &[&str],
+    source: &str,
+    vname_path: &str,
+    candidates: &[&str],
+) -> Vec<String> {
+    let repo = tempfile::tempdir().unwrap();
+    for f in files {
+        let p = repo.path().join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "").unwrap();
+    }
+    let snippet = repo.path().join("snippet.rs");
+    std::fs::write(&snippet, source).unwrap();
+    let out = Indexer::new()
+        .parse_file_with_vname(&snippet, vname_path)
+        .unwrap();
+    let edges = link_imports_rust_fs(&out.nodes, vname_path, "c", repo.path());
+    candidates
+        .iter()
+        .filter(|c| {
+            let id = travsr_core::VName::new("c", "", **c, "rust", "file").id();
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::ResolvesTo && e.dst == id)
+        })
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// Review of #1132: a package nested under a top-level `src/` (rust-lang/rust's
+/// `src/tools/clippy`) is told apart from a module inside a crate's `src/` by
+/// the nearest `Cargo.toml`, which the path alone cannot do.
+#[test]
+fn the_nearest_manifest_decides_the_crate() {
+    let layout = [
+        "Cargo.toml",
+        "src/main.rs",
+        "src/tools/clippy/Cargo.toml",
+        "src/tools/clippy/src/lib.rs",
+        "src/tools/clippy/tests/ui.rs",
+    ];
+    let got = resolved_targets_fs(
+        &layout,
+        "use crate::helpers::run;\nmod support;\n",
+        "src/tools/clippy/tests/ui.rs",
+        &[
+            "src/tools/clippy/tests/helpers.rs",
+            "src/tools/clippy/tests/support.rs",
+            "src/helpers.rs",
+            "src/tools/clippy/tests/ui/support.rs",
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            "src/tools/clippy/tests/helpers.rs".to_string(),
+            "src/tools/clippy/tests/support.rs".to_string()
+        ]
+    );
+
+    // Control: under the root package's own src/, tests/ is a module.
+    let got = resolved_targets_fs(
+        &layout,
+        "use crate::util::f;\n",
+        "src/tests/foo.rs",
+        &["src/util.rs", "src/tests/util.rs"],
+    );
+    assert_eq!(got, vec!["src/util.rs".to_string()]);
+}
+
+#[test]
+fn a_multi_file_test_is_found_by_its_main_rs() {
+    let layout = [
+        "Cargo.toml",
+        "src/lib.rs",
+        "tests/foo/main.rs",
+        "tests/foo/helper.rs",
+        "tests/common/mod.rs",
+        "tests/it.rs",
+    ];
+    // A module of the tests/foo crate resolves `crate::` in tests/foo.
+    let got = resolved_targets_fs(
+        &layout,
+        "use crate::common::setup;\n",
+        "tests/foo/helper.rs",
+        &["tests/foo/common.rs", "tests/common.rs"],
+    );
+    assert_eq!(got, vec!["tests/foo/common.rs".to_string()]);
+    // ...and its root file is that main.rs, which the path alone cannot know.
+    let got = resolved_targets_fs(
+        &layout,
+        "use crate::Args;
+",
+        "tests/foo/helper.rs",
+        &["tests/foo/main.rs", "tests/foo.rs", "src/lib.rs"],
+    );
+    assert_eq!(got, vec!["tests/foo/main.rs".to_string()]);
+    // tests/common/ has no main.rs: it is a module shared by flat tests.
+    let got = resolved_targets_fs(
+        &layout,
+        "use crate::fixtures::load;\n",
+        "tests/common/mod.rs",
+        &["tests/fixtures.rs", "tests/common/fixtures.rs"],
+    );
+    assert_eq!(got, vec!["tests/fixtures.rs".to_string()]);
 }
 
 // ── use_as_clause — alias stripped ────────────────────────────────────────────

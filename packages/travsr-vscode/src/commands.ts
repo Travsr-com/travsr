@@ -741,7 +741,6 @@ function shortTarget(target: string): string {
   return target.split("::")[0].replace(/^travsr_/, "").replace(/_/g, "-");
 }
 
-/** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
 /** How long the Health page waits for `get_index_status`. Longer than the
  *  client's 10 s default: the tool runs git over the working tree and reads the
  *  analyzers' state, which took 3.6 to 8.2 s on its own on a large Windows
@@ -1286,6 +1285,7 @@ export async function gatherHealth(
   };
 }
 
+/** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
 export function buildStatsView(raw: string): StatsView {
   const lines = stripEnvelope(raw).split("\n");
   const field = (key: string): string => {
@@ -2547,18 +2547,6 @@ export function registerShowExecutionPath(
   });
 }
 
-/**
- * What is wrong with this repo's index, as `travsr status` reports it.
- *
- * The CLI already phrases every one of these for a person and names the command
- * that fixes it, so this parses that rather than reimplementing the mapping in
- * TypeScript and letting the two drift.
- *
- * These are all repo-scoped: an analyzer that crashed, a language with no tool
- * registered, an approval that was never given. None of them belong to a file,
- * which is why they are cards here rather than entries in the Problems panel,
- * which wants a file to attach to.
- */
 /** Limits for the CLI commands the Health page runs, the same ones travsr ui
  *  uses for them (#1131). */
 export const CLI_TIMEOUTS_MS = {
@@ -2622,10 +2610,27 @@ export function diagnosticsNotRun(reason: string): Diagnostic {
   };
 }
 
+/**
+ * What is wrong with this repo's index, as `travsr status` reports it.
+ *
+ * The CLI already phrases every one of these for a person and names the command
+ * that fixes it, so this parses that rather than reimplementing the mapping in
+ * TypeScript and letting the two drift.
+ *
+ * These are all repo-scoped: an analyzer that crashed, a language with no tool
+ * registered, an approval that was never given. None of them belong to a file,
+ * which is why they are cards here rather than entries in the Problems panel,
+ * which wants a file to attach to.
+ */
 export async function readDiagnostics(
   binary: string,
   cwd: string,
-  run: (binary: string, args: string[], cwd: string, timeoutMs: number) => Promise<{ out: string; code: number | null }> =
+  run: (
+    binary: string,
+    args: string[],
+    cwd: string,
+    timeoutMs: number
+  ) => Promise<{ out: string; code: number | null; spawnError?: string }> =
     spawnLangCommandResult
 ): Promise<Diagnostic[]> {
   // `warning:` lines print only with --verbose; plain status is plain words.
@@ -2657,9 +2662,12 @@ export async function readDiagnostics(
   // an empty list would read as a clean bill of health (#1131). The two get
   // different cards, since a binary that will not start is no timeout (review
   // of #1132).
-  if (r.code === null) {
-    const startError = /^error: (.+)/.exec(out.trim());
-    found.push(startError ? diagnosticsNotRun(startError[1]) : DIAGNOSTICS_UNREAD);
+  // The start failure is reported by the spawner itself, not read from the
+  // output, which a timed-out run may also begin with `error:`.
+  if (r.spawnError !== undefined) {
+    found.push(diagnosticsNotRun(r.spawnError));
+  } else if (r.code === null) {
+    found.push(DIAGNOSTICS_UNREAD);
   }
   return found;
 }
@@ -2673,7 +2681,8 @@ export async function readDiagnostics(
 /** Run a short lang command and resolve its combined output plus exit code.
  *  `code` is `null` on timeout or spawn error, so a caller that must confirm a
  *  command actually succeeded (a security-consent grant) can check `code === 0`
- *  rather than trust empty output. */
+ *  rather than trust empty output. `spawnError` is set only when the process
+ *  could not be started, so a caller can tell that from a timeout. */
 /** `out` is stdout+stderr interleaved, which is what the human-facing callers
  *  want (a CLI remedy line is as likely on stderr as on stdout). `stdout` is
  *  stdout alone, for the one caller that must `JSON.parse` the result: #755
@@ -2686,18 +2695,18 @@ function spawnLangCommandResult(
   args: string[],
   cwd?: string,
   timeoutMs = 4_000
-): Promise<{ out: string; stdout: string; code: number | null }> {
+): Promise<{ out: string; stdout: string; code: number | null; spawnError?: string }> {
   return new Promise((resolve) => {
     let out = "";
     let stdout = "";
     let resolved = false;
-    const done = (v: { out: string; stdout: string; code: number | null }): void => { if (!resolved) { resolved = true; resolve(v); } };
+    const done = (v: { out: string; stdout: string; code: number | null; spawnError?: string }): void => { if (!resolved) { resolved = true; resolve(v); } };
     const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { const s = d.toString(); out += s; stdout += s; });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done({ out, stdout, code: null }); }, timeoutMs);
     proc.on("close", (code) => { clearTimeout(timer); done({ out, stdout, code }); });
-    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, stdout: "", code: null }); });
+    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, stdout: "", code: null, spawnError: e.message }); });
   });
 }
 

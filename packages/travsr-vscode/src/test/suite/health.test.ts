@@ -1253,7 +1253,7 @@ suite("Health: analyzer diagnostics (#1131)", () => {
     "warning: 'typescript' analysis: could not run travsr-lsif-ts (emitter not found) [emitter_missing]",
     "",
   ].join("\n");
-  const runner = (replies: Array<{ out: string; code: number | null }>) => {
+  const runner = (replies: Array<{ out: string; code: number | null; spawnError?: string }>) => {
     const calls: Array<{ args: string[]; timeoutMs: number }> = [];
     return {
       calls,
@@ -1283,11 +1283,17 @@ suite("Health: analyzer diagnostics (#1131)", () => {
   });
 
   test("a binary that will not start is said so, not called a timeout (review of #1132)", async () => {
-    const r = runner([{ out: "error: spawn travsr ENOENT", code: null }]);
+    const r = runner([{ out: "error: spawn travsr ENOENT", code: null, spawnError: "spawn travsr ENOENT" }]);
     const diags = await readDiagnostics("travsr", "/repo", r.run);
     assert.strictEqual(diags.length, 1);
     assert.ok(diags[0].hint.includes("could not be run (spawn travsr ENOENT)"), diags[0].hint);
     assert.ok(!diags[0].hint.includes("did not finish in time"), "not a timeout");
+  });
+
+  test("a timeout whose output starts with error: is still a timeout (review of #1132)", async () => {
+    const r = runner([{ out: "error: daemon busy, retrying\n", code: null }]);
+    const diags = await readDiagnostics("travsr", "/repo", r.run);
+    assert.deepStrictEqual(diags, [DIAGNOSTICS_UNREAD]);
   });
 
   test("an older binary without --verbose falls back to plain status", async () => {
