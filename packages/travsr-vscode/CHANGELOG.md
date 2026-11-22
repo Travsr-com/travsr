@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **The Health page no longer blames the binary when index status is just slow.** On a large repository `get_index_status` took 3.6 to 8.2 s on its own, and the page asks several tools at once, so the client's 10 s wait ran out and Index freshness said "Index status is not reported by this binary" for a binary that serves it. The page now waits 30 s for it. If the reply still doesn't arrive, it says "Index status took too long to arrive (Travsr was busy). Press Refresh to read it again." A binary that really lacks the tool still gets the old message, because an unknown tool answers at once.
 - **`Travsr: Stop Browser UI` stops the page's running commands too (#1119).** Stop, an Open for another repository, and deactivate used to end `travsr ui` with `kill()`, which skipped its cleanup, so a running Terminal command or `lang list` was left behind on every OS. The extension now stops the server by closing its stdin, which runs its graceful shutdown. It kills it only if it's still there 8 s later (a travsr that predates `TRAVSR_UI_EXIT_ON_STDIN_EOF`). Closing the window can't wait 8 s, so then the server is also sent SIGTERM at once on macOS and Linux (the new CLI stops gracefully on it, an older one dies as before), and on Windows it is killed after 3 s while VS Code waits for the extension to finish. On a fixed `travsr.ui.port`, a replacement server starts once the old one has exited and freed the port.
 
 ### Added

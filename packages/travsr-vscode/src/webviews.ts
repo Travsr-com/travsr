@@ -859,6 +859,10 @@ export interface IndexHealth {
    *  not serve `get_index_status` looks like. The panel says so rather than
    *  rendering the gaps as answers. */
   available: boolean;
+  /** The reply did not arrive within the wait (Travsr was busy), which says
+   *  nothing about the binary: shown as "took too long", not as an old
+   *  binary. */
+  timedOut?: boolean;
 }
 
 export const UNKNOWN_INDEX: IndexHealth = {
@@ -1572,7 +1576,11 @@ export function buildStatsHtml(
           ? "Index status could not be read: Travsr is not answering."
           : !daemonRunning
             ? "Index status could not be read while the daemon is stopped."
-            : "Index status is not reported by this binary."
+            : index.timedOut
+              ? // A slow reply is not a missing one: on a large repository
+                // get_index_status takes seconds, more while an analyzer runs.
+                "Index status took too long to arrive (Travsr was busy). Press Refresh to read it again."
+              : "Index status is not reported by this binary."
       );
 
   const indexSec = section(
