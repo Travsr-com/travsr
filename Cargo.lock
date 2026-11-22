@@ -3930,6 +3930,7 @@ dependencies = [
  "flate2",
  "fs2",
  "ignore",
+ "nix",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

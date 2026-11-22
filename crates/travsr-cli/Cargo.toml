@@ -80,6 +80,11 @@ tempfile = { workspace = true }
 # `travsr ui` router tests drive it with `ServiceExt::oneshot`.
 tower = { workspace = true, features = ["util"] }
 
+[target.'cfg(unix)'.dependencies]
+# Safe killpg(2) for stopping a `travsr ui` page command with everything it
+# started (review of #1126). Already in the tree via travsr-plugin-host.
+nix = { workspace = true }
+
 # tests/daemon_pipe.rs builds the #572 grandparent-handle repro (CreatePipe +
 # SetHandleInformation) to prove the daemon spawn's inherit allowlist holds.
 [target.'cfg(windows)'.dev-dependencies]

@@ -94,17 +94,17 @@ pub(super) async fn cli(
     };
     let exe = std::env::current_exe()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let child = match tokio::process::Command::new(exe)
-        .args(*args)
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(*args)
         .current_dir(&repo.root)
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    super::terminal::in_own_process_group(&mut cmd);
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             return Ok(Json(CliResponse {

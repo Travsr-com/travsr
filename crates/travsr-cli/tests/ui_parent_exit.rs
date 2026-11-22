@@ -112,3 +112,26 @@ fn sigterm_is_a_clean_stop() {
         "a clean stop, not death by signal: {status:?}"
     );
 }
+
+/// Review of #1126: the SIGTERM listener used to be created only when the
+/// shutdown future was first polled, after "serving" was printed, and a signal
+/// in between killed the server outright (200 of 200 runs). Spawning `kill`
+/// as above adds enough delay to miss that window, so this signals from here,
+/// the moment the line is read, several times over.
+#[cfg(unix)]
+#[test]
+fn sigterm_right_after_serving_is_still_a_clean_stop() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    for run in 0..10 {
+        let (child, _dir) = start(false);
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        kill(pid, Signal::SIGTERM).unwrap();
+        let status = exits_within(child, Duration::from_secs(15))
+            .unwrap_or_else(|| panic!("run {run}: travsr ui must stop on SIGTERM"));
+        assert!(
+            status.success(),
+            "run {run}: a clean stop, not death by signal: {status:?}"
+        );
+    }
+}

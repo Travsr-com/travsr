@@ -278,9 +278,14 @@ export class BrowserUiServer implements vscode.Disposable {
   /** A fixed-port start is waiting for the server it replaces to exit. */
   private waiting = false;
 
-  /** Resolves when the last server stopped through its stdin has exited:
-   *  a server on a fixed port must be gone before its successor binds it. */
-  private retiring: Promise<void> | undefined;
+  /** The port the current server was asked for (0 for any free port). */
+  private port = 0;
+
+  /** Servers stopped through their stdin that have not exited yet, each with
+   *  the port it was asked for and a promise of its exit. A server on a fixed
+   *  port must be gone before its successor binds it, and every one of them
+   *  must be gone before the window closes (review of #1126). */
+  private readonly retiring = new Map<UiProcess, { port: number; exited: Promise<void> }>();
 
   /** Whether a server process is alive (starting or serving). */
   get running(): boolean {
@@ -298,10 +303,17 @@ export class BrowserUiServer implements vscode.Disposable {
    *  same binary, port and repo. */
   start(binary: string, repo: string, port: number): Promise<StartResult> {
     const key = [binary, normalizePort(port), repo].join("\u0000");
-    if (this.proc && this.key === key && this.started) return this.started;
+    // A start still queued behind a retiring server is the same request too;
+    // stopping it would cancel the first caller (review of #1126).
+    if ((this.proc || this.waiting) && this.key === key && this.started) return this.started;
     this.stop();
-    const previous = normalizePort(port) !== 0 ? this.retiring : undefined;
-    if (!previous) return this.launch(binary, repo, port, key);
+    // Only a server asked for this same port can be holding it (review of
+    // #1126): another port's retirement is no reason to wait.
+    const wanted = normalizePort(port);
+    const holders =
+      wanted === 0 ? [] : [...this.retiring.values()].filter((r) => r.port === wanted).map((r) => r.exited);
+    if (holders.length === 0) return this.launch(binary, repo, port, key);
+    const previous = Promise.all(holders);
 
     // A fixed port stays bound until the server being replaced has exited,
     // which a graceful stop no longer makes immediate (#1119). Launch after it.
@@ -335,6 +347,7 @@ export class BrowserUiServer implements vscode.Disposable {
     this.proc = proc;
     this.repo = repo;
     this.key = key;
+    this.port = normalizePort(port);
 
     let cancel: (() => void) | undefined;
     const started = new Promise<StartResult>((resolve, reject) => {
@@ -420,16 +433,17 @@ export class BrowserUiServer implements vscode.Disposable {
     // A start waiting for the previous server on its port has no process yet.
     if (!proc && !cancel) return false;
     const wasServing = this.serving;
+    const port = this.port;
     this.clear();
     // Settled before the process goes, so its exit is not taken for a failed
     // start (review of #1101).
     cancel?.();
     if (proc) {
       const exited = this.end(proc);
-      this.retiring = exited;
-      void exited?.then(() => {
-        if (this.retiring === exited) this.retiring = undefined;
-      });
+      if (exited) {
+        this.retiring.set(proc, { port, exited });
+        void exited.then(() => this.retiring.delete(proc));
+      }
     }
     if (wasServing) this.runningEmitter.fire(false);
     return true;
@@ -495,6 +509,10 @@ export class BrowserUiServer implements vscode.Disposable {
    * - Windows: close stdin and kill after SHUTDOWN_FALLBACK_MS. `deactivate`
    *   returns this, so VS Code waits for it, and the timer keeps the host
    *   alive meanwhile.
+   *
+   * The same goes for every server `stop()` retired that has not exited yet
+   * (Stop, or Open for another repo, just before the window closed): their
+   * fallback kill is on an unref'd timer the host would not wait for.
    */
   shutdown(): Promise<void> {
     const proc = this.proc;
@@ -503,12 +521,46 @@ export class BrowserUiServer implements vscode.Disposable {
     this.clear();
     cancel?.();
     if (wasServing) this.runningEmitter.fire(false);
-    if (!proc) return Promise.resolve();
     const windows = this.platform === "win32";
-    return (
-      this.end(proc, { killNow: !windows, fallbackMs: SHUTDOWN_FALLBACK_MS, keepAlive: windows }) ??
-      Promise.resolve()
+    const exits: Promise<void>[] = [...this.retiring].map(([old, { exited }]) =>
+      this.hurry(old, exited, windows)
     );
+    if (proc) {
+      const exited = this.end(proc, {
+        killNow: !windows,
+        fallbackMs: SHUTDOWN_FALLBACK_MS,
+        keepAlive: windows,
+      });
+      if (exited) exits.push(exited);
+    }
+    return Promise.all(exits).then(() => undefined);
+  }
+
+  /** Bring forward the kill of a server whose stdin is already closed: at once
+   *  on macOS and Linux, after SHUTDOWN_FALLBACK_MS on Windows on a timer that
+   *  keeps the host alive. Resolves when it has exited or been killed. */
+  private hurry(proc: UiProcess, exited: Promise<void>, windows: boolean): Promise<void> {
+    const kill = (): void => {
+      try {
+        proc.kill();
+      } catch {
+        /* already gone */
+      }
+    };
+    if (!windows) {
+      kill();
+      return exited;
+    }
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        kill();
+        resolve();
+      }, SHUTDOWN_FALLBACK_MS);
+      void exited.then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   dispose(): void {
@@ -527,6 +579,7 @@ export class BrowserUiServer implements vscode.Disposable {
     this.proc = undefined;
     this.repo = undefined;
     this.key = undefined;
+    this.port = 0;
     this.started = undefined;
     this.cancelStart = undefined;
     this.serving = false;

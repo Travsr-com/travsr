@@ -297,6 +297,85 @@ suite("review of #1126: closing the window stops every travsr", () => {
     assert.ok(!server.running);
     server.dispose();
   });
+
+  /** A (ignoring the end of file, like v1.4.0) serves on 7330, then an Open
+   *  for B on 7330 retires A and queues B behind it. */
+  const retireOn7330 = async (platform: string) => {
+    const s = serverOn(platform);
+    const a = s.server.start("travsr", "/a", 7330);
+    s.calls[0].proc.withStdin(false);
+    serve(s.calls[0].proc, 7330);
+    await a;
+    const b = s.server.start("travsr", "/b", 7330);
+    b.catch(() => undefined);
+    assert.ok(s.calls[0].proc.stdin!.ended, "A was asked to stop");
+    assert.strictEqual(s.calls.length, 1, "B waits for A");
+    return { ...s, b };
+  };
+
+  test("macOS/Linux: a server already retired by Stop or Open is killed too", async () => {
+    const { calls, server } = await retireOn7330("linux");
+    const t0 = Date.now();
+    await server.shutdown();
+    assert.ok(calls[0].proc.killed, "A must not keep holding 7330 into the next session");
+    assert.ok(Date.now() - t0 < 1_000, "at once, not after the 8 s fallback");
+    await tick();
+    assert.strictEqual(calls.length, 1, "the queued start never spawns");
+  });
+
+  test("Windows: a server already retired is killed after the short wait", async function () {
+    this.timeout(8_000);
+    const { calls, server } = await retireOn7330("win32");
+    const t0 = Date.now();
+    await server.shutdown();
+    assert.ok(calls[0].proc.killed, "A must not keep holding 7330 into the next session");
+    assert.ok(Date.now() - t0 < SHUTDOWN_FALLBACK_MS + 1_500, "within the wait deactivate returns");
+  });
+
+  test("a fixed-port start waits for the server on that port, not the last one stopped", async () => {
+    const { calls, server } = serverOn("linux");
+    const a = server.start("travsr", "/a", 7330);
+    calls[0].proc.withStdin(true, 60);
+    serve(calls[0].proc, 7330);
+    await a;
+    // B on a free port retires A at once (no wait), then C wants 7330 back.
+    const b = server.start("travsr", "/b", 0);
+    assert.strictEqual(calls.length, 2, "port 0 does not wait");
+    calls[1].proc.withStdin(true, 0);
+    serve(calls[1].proc, 51);
+    await b;
+    const c = server.start("travsr", "/c", 7330);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(calls.length, 2, "A still holds 7330, though B was the last one stopped");
+    await new Promise((r) => setTimeout(r, 80));
+    assert.strictEqual(calls.length, 3, "C launched once A exited");
+    serve(calls[2].proc, 7330);
+    await c;
+    server.dispose();
+  });
+
+  test("a start on another port does not wait for a retiring server", async () => {
+    const { calls, server } = serverOn("linux");
+    const a = server.start("travsr", "/a", 7331);
+    calls[0].proc.withStdin(true, 200);
+    serve(calls[0].proc, 7331);
+    await a;
+    void server.start("travsr", "/b", 7330).catch(() => undefined);
+    assert.strictEqual(calls.length, 2, "7330 is free: launched at once");
+    server.dispose();
+  });
+
+  test("the same Open while queued is the same start, not a cancellation", async () => {
+    const { calls, server, b } = await retireOn7330("linux");
+    const again = server.start("travsr", "/b", 7330);
+    assert.strictEqual(again, b, "the first caller keeps its start");
+    calls[0].proc.emit("exit", 0);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(calls.length, 2, "B spawned once");
+    serve(calls[1].proc, 7330);
+    assert.strictEqual((await again).url, "http://localhost:7330/");
+    server.dispose();
+  });
 });
 
 suite("#1119: Stop ends the server through its stdin", () => {

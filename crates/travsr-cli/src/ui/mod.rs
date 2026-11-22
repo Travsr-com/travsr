@@ -187,10 +187,37 @@ enum StopReason {
     Terminate,
 }
 
+/// The SIGTERM listener, created by [`listen_for_terminate`].
+#[cfg(unix)]
+type TerminateSignal = Option<tokio::signal::unix::Signal>;
+/// No SIGTERM off Unix: a stand-in so [`run`] reads the same everywhere.
+#[cfg(not(unix))]
+struct TerminateSignal;
+
+/// Take over SIGTERM now. Called first thing in [`run`], before the bind and
+/// the "serving" line: a listener created only when the shutdown future is
+/// first polled left a window after that line in which SIGTERM still had its
+/// default action and killed the server with no cleanup (review of #1126:
+/// 200 of 200 runs died when signalled right after "serving"). From here on
+/// the signal is queued until [`stop_requested`] reads it.
+fn listen_for_terminate() -> TerminateSignal {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        signal(SignalKind::terminate()).ok()
+    }
+    #[cfg(not(unix))]
+    TerminateSignal
+}
+
 /// Wait until something asks the server to stop. `parent` is the stdin
 /// watcher; when it gives up on an unreadable stdin it never fires, since that
-/// says nothing about the parent.
-async fn stop_requested(parent: Option<tokio::sync::oneshot::Receiver<()>>) -> StopReason {
+/// says nothing about the parent. `terminate` is the SIGTERM listener taken
+/// over at startup ([`listen_for_terminate`]).
+async fn stop_requested(
+    parent: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg_attr(not(unix), allow(unused_variables))] terminate: TerminateSignal,
+) -> StopReason {
     let parent_gone = async {
         let closed = match parent {
             Some(rx) => rx.await.is_ok(),
@@ -202,14 +229,11 @@ async fn stop_requested(parent: Option<tokio::sync::oneshot::Receiver<()>>) -> S
     };
     let terminate = async {
         #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            match signal(SignalKind::terminate()) {
-                Ok(mut s) => {
-                    s.recv().await;
-                }
-                Err(_) => std::future::pending::<()>().await,
+        match terminate {
+            Some(mut s) => {
+                s.recv().await;
             }
+            None => std::future::pending::<()>().await,
         }
         #[cfg(not(unix))]
         std::future::pending::<()>().await
@@ -221,22 +245,17 @@ async fn stop_requested(parent: Option<tokio::sync::oneshot::Receiver<()>>) -> S
     }
 }
 
-/// Stop the page's running commands for every reason but Ctrl-C, and return
-/// how many were stopped.
+/// Stop the page's running commands, and return how many were stopped.
 ///
 /// On a closed stdin or SIGTERM nobody is left to read their answers (#1119:
 /// the extension's Stop ends stdin, and on macOS and Linux its fallback kill is
 /// SIGTERM). Stopping them now means their request futures end as soon as the
 /// child does, so the graceful shutdown finishes instead of waiting out a
-/// minute-long `lang list`, and none is left running after the server. A
-/// terminal user's Ctrl-C needs nothing: the shell signals the whole process
-/// group, children included.
-fn stop_page_commands(reason: StopReason) -> usize {
-    if reason == StopReason::Interrupt {
-        0
-    } else {
-        terminal::kill_running_commands()
-    }
+/// minute-long `lang list`, and none is left running after the server. Ctrl-C
+/// too: each command runs in a process group of its own (review of #1126), so
+/// the terminal's SIGINT no longer reaches it.
+fn stop_page_commands() -> usize {
+    terminal::kill_running_commands()
 }
 
 /// Exit code of a forced stop: the parent was gone and the graceful shutdown
@@ -247,6 +266,7 @@ const FORCED_EXIT_CODE: i32 = 2;
 /// Start the server and block until Ctrl-C (or, with
 /// [`EXIT_ON_STDIN_EOF_ENV`] set, until stdin closes).
 pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> anyhow::Result<()> {
+    let terminate = listen_for_terminate();
     let ip = parse_host(&host)?;
     if !ip.is_loopback() && !allow_remote {
         anyhow::bail!(
@@ -305,8 +325,8 @@ pub async fn run(host: String, port: u16, allow_remote: bool, open: bool) -> any
     };
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
-            let reason = stop_requested(parent).await;
-            let killed = stop_page_commands(reason);
+            let reason = stop_requested(parent, terminate).await;
+            let killed = stop_page_commands();
             if reason == StopReason::Interrupt {
                 return;
             }
@@ -1400,36 +1420,30 @@ mod tests {
     }
 
     /// #1119: stopping because the parent closed stdin or because of SIGTERM
-    /// stops the page's running commands; Ctrl-C leaves that to the shell.
+    /// stops the page's running commands. Ctrl-C does too since the review of
+    /// #1126: each command has a process group of its own, out of the
+    /// terminal's reach. These sleepers have no group of their own, which also
+    /// covers the fallback to killing the process alone.
     #[test]
-    fn a_stop_ends_the_page_commands_except_on_ctrl_c() {
+    fn every_stop_ends_the_page_commands() {
         let _serial = terminal::tracked_test_lock();
-        let sleeper = || {
-            std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+        for reason in [
+            StopReason::ParentGone,
+            StopReason::Terminate,
+            StopReason::Interrupt,
+        ] {
+            let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
                 .args(if cfg!(windows) {
                     &["/C", "ping -n 30 127.0.0.1 >NUL"][..]
                 } else {
                     &["30"][..]
                 })
                 .spawn()
-                .unwrap()
-        };
-        for reason in [StopReason::ParentGone, StopReason::Terminate] {
-            let mut child = sleeper();
+                .unwrap();
             let _tracked = terminal::TrackedCommand::new(child.id());
-            assert_eq!(stop_page_commands(reason), 1, "{reason:?}");
+            assert_eq!(stop_page_commands(), 1, "{reason:?}");
             let status = child.wait().unwrap();
             assert!(!status.success(), "{reason:?}: the command was not stopped");
         }
-        let mut child = sleeper();
-        let tracked = terminal::TrackedCommand::new(child.id());
-        assert_eq!(stop_page_commands(StopReason::Interrupt), 0);
-        assert_eq!(
-            terminal::kill_running_commands(),
-            1,
-            "Ctrl-C left it tracked"
-        );
-        let _ = child.wait();
-        drop(tracked);
     }
 }
