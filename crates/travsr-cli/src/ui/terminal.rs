@@ -324,22 +324,22 @@ pub(super) async fn run(
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let command = shell_line(&plan.args);
     let started = std::time::Instant::now();
-    let child = tokio::process::Command::new(exe)
-        .args(&plan.args)
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(&plan.args)
         .current_dir(&repo.root)
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not start travsr: {e}"),
-            )
-        })?;
+        .kill_on_drop(true);
+    in_own_process_group(&mut cmd);
+    let child = cmd.spawn().map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not start travsr: {e}"),
+        )
+    })?;
     // Registered for as long as it runs, so a forced exit can stop it.
     let _tracked = child.id().map(TrackedCommand::new);
     let resp = match tokio::time::timeout(Duration::from_secs(plan.secs), child.wait_with_output())
@@ -378,13 +378,15 @@ pub(super) async fn run(
     Ok(Json(resp))
 }
 
-/// Process ids of the terminal-page commands still running.
+/// Process ids of the page's commands still running: the Terminal page's
+/// (`/api/run`) and the allowlisted ones the Health page runs (`/api/cli`,
+/// such as a minutes-long `lang list`).
 ///
-/// Each one is spawned with `kill_on_drop`, which is enough for a normal stop:
-/// the request future is dropped and the command with it. A forced exit
-/// ([`kill_running_commands`], when the parent of `travsr ui` is gone and the
-/// graceful shutdown stalls) leaves through `std::process::exit`, which runs no
-/// destructors, so it stops them from this list instead (review of #1101).
+/// Each is spawned with `kill_on_drop`, but that only fires when its request
+/// future is dropped, which a stop does not do: on a closed stdin or SIGTERM
+/// the graceful shutdown would wait for the command, and a forced exit runs no
+/// destructors. So a stop kills them from this list ([`kill_running_commands`],
+/// review of #1101, #1119).
 fn running_commands() -> &'static std::sync::Mutex<std::collections::BTreeSet<u32>> {
     static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
         std::sync::OnceLock::new();
@@ -392,10 +394,10 @@ fn running_commands() -> &'static std::sync::Mutex<std::collections::BTreeSet<u3
 }
 
 /// Keeps a pid in [`running_commands`] while its command runs.
-struct TrackedCommand(u32);
+pub(super) struct TrackedCommand(u32);
 
 impl TrackedCommand {
-    fn new(pid: u32) -> Self {
+    pub(super) fn new(pid: u32) -> Self {
         running_commands()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -413,7 +415,27 @@ impl Drop for TrackedCommand {
     }
 }
 
-/// Stop every terminal-page command still running, before a forced exit.
+/// Serializes the tests that use the process-wide [`running_commands`] list.
+#[cfg(test)]
+pub(super) fn tracked_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Put a page command in a process group of its own (macOS, Linux), so that
+/// [`kill_running_commands`] can stop it together with whatever it started.
+/// Killing only the direct child left a subprocess of it holding the piped
+/// stdout and stderr open, and `wait_with_output` waited for that, so the
+/// request outlived the stop and the subprocess outlived the server (review of
+/// #1126). On Windows `taskkill /T` already ends the whole tree.
+pub(super) fn in_own_process_group(cmd: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    cmd.process_group(0);
+    #[cfg(not(unix))]
+    let _ = cmd;
+}
+
+/// Stop every tracked command still running, when the server is stopping.
 /// Commands from the action buttons (`init`, `fsck --fix`) are not here on
 /// purpose: they are left to finish, since stopping one halfway is worse.
 pub(super) fn kill_running_commands() -> usize {
@@ -422,17 +444,74 @@ pub(super) fn kill_running_commands() -> usize {
             .into_iter()
             .collect();
     for &pid in &pids {
-        travsr_plugin_host::watchdog::kill_pid(pid);
+        kill_command(pid);
     }
     pids.len()
+}
+
+/// Kill a page command and everything it started: its process group on macOS
+/// and Linux ([`in_own_process_group`] made the group id its pid), the process
+/// tree on Windows.
+fn kill_command(pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+        if let Ok(raw) = i32::try_from(pid) {
+            if killpg(Pid::from_raw(raw), Signal::SIGKILL).is_ok() {
+                return;
+            }
+        }
+    }
+    // No such group (a command spawned before it had one): the process alone.
+    travsr_plugin_host::watchdog::kill_pid(pid);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Review of #1126: a subprocess of a page command kept its piped output
+    /// open, so `wait_with_output` waited for it after the command was killed.
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_command_also_stops_what_it_started() {
+        let _serial = tracked_test_lock();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.args(["-c", "sleep 30 & wait"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            in_own_process_group(&mut cmd);
+            let child = cmd.spawn().unwrap();
+            let tracked = TrackedCommand::new(child.id().unwrap());
+            // Let the shell start its sleep.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let started = std::time::Instant::now();
+            assert_eq!(kill_running_commands(), 1);
+            let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+                .await
+                .expect("the output closed once the group was killed")
+                .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "took {:?}: the sleep still held the pipes",
+                started.elapsed()
+            );
+            assert!(!out.status.success(), "{:?}", out.status);
+            drop(tracked);
+        });
+    }
+
     #[test]
     fn a_tracked_command_is_listed_while_it_runs_and_killed_on_a_forced_exit() {
+        let _serial = tracked_test_lock();
         let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
             .args(if cfg!(windows) {
                 &["/C", "ping -n 30 127.0.0.1 >NUL"][..]

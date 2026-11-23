@@ -93,3 +93,45 @@ fn closing_stdin_does_nothing_without_the_variable() {
         "travsr ui exited on its own after stdin closed: {status:?}"
     );
 }
+
+/// #1119: on macOS and Linux the extension's fallback kill, `kill <pid>` and
+/// service managers send SIGTERM. `travsr ui` now takes the graceful path on
+/// it (stopping the page's commands first) instead of dying at once, so the
+/// process exits cleanly rather than by the signal.
+#[cfg(unix)]
+#[test]
+fn sigterm_is_a_clean_stop() {
+    let (child, _dir) = start(false);
+    let pid = child.id().to_string();
+    let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(sent.success());
+    let status =
+        exits_within(child, Duration::from_secs(15)).expect("travsr ui must stop on SIGTERM");
+    assert!(
+        status.success(),
+        "a clean stop, not death by signal: {status:?}"
+    );
+}
+
+/// Review of #1126: the SIGTERM listener used to be created only when the
+/// shutdown future was first polled, after "serving" was printed, and a signal
+/// in between killed the server outright (200 of 200 runs). Spawning `kill`
+/// as above adds enough delay to miss that window, so this signals from here,
+/// the moment the line is read, several times over.
+#[cfg(unix)]
+#[test]
+fn sigterm_right_after_serving_is_still_a_clean_stop() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    for run in 0..10 {
+        let (child, _dir) = start(false);
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
+        kill(pid, Signal::SIGTERM).unwrap();
+        let status = exits_within(child, Duration::from_secs(15))
+            .unwrap_or_else(|| panic!("run {run}: travsr ui must stop on SIGTERM"));
+        assert!(
+            status.success(),
+            "run {run}: a clean stop, not death by signal: {status:?}"
+        );
+    }
+}

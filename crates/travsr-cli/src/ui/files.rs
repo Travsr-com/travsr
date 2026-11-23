@@ -94,35 +94,52 @@ pub(super) async fn cli(
     };
     let exe = std::env::current_exe()
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let child = tokio::process::Command::new(exe)
-        .args(*args)
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(*args)
         .current_dir(&repo.root)
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let resp = match tokio::time::timeout(Duration::from_secs(*secs), child).await {
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            CliResponse {
-                out: format!("{stdout}{stderr}"),
-                stdout,
-                code: out.status.code(),
-            }
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    super::terminal::in_own_process_group(&mut cmd);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return Ok(Json(CliResponse {
+                out: format!("error: {e}"),
+                stdout: String::new(),
+                code: None,
+            }))
         }
-        Ok(Err(e)) => CliResponse {
-            out: format!("error: {e}"),
-            stdout: String::new(),
-            code: None,
-        },
-        Err(_) => CliResponse {
-            out: String::new(),
-            stdout: String::new(),
-            code: None,
-        },
     };
+    // Tracked while it runs, so stopping the server stops it too (#1119): a
+    // `lang list` can run for minutes, and kill_on_drop alone never fires when
+    // the server is signalled to stop.
+    let _tracked = child.id().map(super::terminal::TrackedCommand::new);
+    let resp =
+        match tokio::time::timeout(Duration::from_secs(*secs), child.wait_with_output()).await {
+            Ok(Ok(out)) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                CliResponse {
+                    out: format!("{stdout}{stderr}"),
+                    stdout,
+                    code: out.status.code(),
+                }
+            }
+            Ok(Err(e)) => CliResponse {
+                out: format!("error: {e}"),
+                stdout: String::new(),
+                code: None,
+            },
+            Err(_) => CliResponse {
+                out: String::new(),
+                stdout: String::new(),
+                code: None,
+            },
+        };
     Ok(Json(resp))
 }
 
