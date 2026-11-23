@@ -741,7 +741,6 @@ function shortTarget(target: string): string {
   return target.split("::")[0].replace(/^travsr_/, "").replace(/_/g, "-");
 }
 
-/** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
 /** How long the Health page waits for `get_index_status`. Longer than the
  *  client's 10 s default: the tool runs git over the working tree and reads the
  *  analyzers' state, which took 3.6 to 8.2 s on its own on a large Windows
@@ -760,13 +759,29 @@ export async function readIndexHealth(
   timeoutMs: number = INDEX_STATUS_TIMEOUT_MS,
   now: () => number = Date.now
 ): Promise<IndexHealth> {
-  const started = now();
-  const raw = await client.callTool("get_index_status", {}, undefined, timeoutMs);
+  const { raw, timedOut } = await callToolTimed(client, "get_index_status", timeoutMs, now);
   const health = parseIndexHealth(raw);
-  if (!health.available && raw.trim() === "" && now() - started >= timeoutMs * 0.95) {
-    return { ...health, timedOut: true };
-  }
-  return health;
+  return !health.available && timedOut ? { ...health, timedOut: true } : health;
+}
+
+/**
+ * Call a tool and say whether an empty reply ran out of time.
+ *
+ * The client answers "" for a tool this binary lacks, for a tool error, and for
+ * a reply that did not arrive within `timeoutMs`. The first two come back at
+ * once; an empty reply that took (nearly) the whole wait is the timeout. The
+ * Health page reports that one as "Travsr was busy" rather than as a missing
+ * feature (#1129, and #1127 for the index status).
+ */
+export async function callToolTimed(
+  client: Pick<McpClient, "callTool">,
+  name: string,
+  timeoutMs: number,
+  now: () => number = Date.now
+): Promise<{ raw: string; timedOut: boolean }> {
+  const started = now();
+  const raw = await client.callTool(name, {}, undefined, timeoutMs);
+  return { raw, timedOut: raw.trim() === "" && now() - started >= timeoutMs * 0.95 };
 }
 
 /** Parse the `get_index_status` envelope. Anything unparseable is reported as
@@ -1035,12 +1050,17 @@ export async function gatherHealth(
     }
   };
 
-  const [versionOut, daemonOut, embedOut, langOut, healthRaw, reposRaw, repoLangsRaw, configOut] = await Promise.all([
-    settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd()), ""),
-    settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), 8_000), ""),
-    settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd()), ""),
+  const [versionOut, daemonOut, embedOut, langOut, healthReply, reposRaw, repoLangsRaw, configOut] = await Promise.all([
+    // The same limits travsr ui gives these commands (#1131): on a loaded
+    // machine each one took 2 to 5 s on its own, and run together the old 4 s
+    // and 8 s limits cut them off, so a running daemon read as "not running".
+    settle(spawnLangCommand(binary, ["--version"], root ?? process.cwd(), CLI_TIMEOUTS_MS.version), ""),
+    settle(spawnLangCommand(binary, ["daemon", "status"], root ?? process.cwd(), CLI_TIMEOUTS_MS.daemonStatus), ""),
+    settle(spawnLangCommand(binary, ["embed", "list", "--json"], root ?? process.cwd(), CLI_TIMEOUTS_MS.embedList), ""),
     settle(spawnLangCommand(binary, ["lang", "list", "--json"], root ?? process.cwd(), 60_000), ""),
-    settle(client.callTool("get_graph_health"), ""),
+    // The integrity report gets the same longer wait as the index status: it
+    // reads the whole graph, and arrives alongside everything else here (#1129).
+    settle(callToolTimed(client, "get_graph_health", INDEX_STATUS_TIMEOUT_MS), { raw: "", timedOut: false }),
     settle(client.callTool("repos_list"), ""),
     // Which languages the graph actually found in this repo, so the Languages
     // table only offers to install or enable an analyzer the repo can use.
@@ -1049,7 +1069,7 @@ export async function gatherHealth(
     // binary rather than by parsing `.travsr/config.toml` here, so the env var
     // and the global file are accounted for the same way the daemon accounts
     // for them, and an older binary with no such key simply yields nothing.
-    settle(spawnLangCommand(binary, ["config", "list", "--json"], root ?? process.cwd()), ""),
+    settle(spawnLangCommand(binary, ["config", "list", "--json"], root ?? process.cwd(), CLI_TIMEOUTS_MS.configList), ""),
   ]);
 
   const binaryVersion = (/(\d+\.\d+\.\d+[^\s]*)/.exec(versionOut) ?? [])[1] ?? "";
@@ -1058,7 +1078,10 @@ export async function gatherHealth(
   // gives in a terminal. "starting" counts as up: the control socket is not
   // ready yet but the process is alive and will start watching.
   const daemonLine = (/^daemon:\s*(.+)$/m.exec(daemonOut) ?? [])[1]?.trim() ?? "";
-  const daemonRunning = /^running|^starting/.test(daemonLine);
+  // No answer at all (cut off, or failed to start) is not "not running": fall
+  // back to the daemon's lock file, as the server's own check does (#1131).
+  const daemonRunning =
+    daemonLine === "" && root ? daemonLockSaysRunning(root) : /^running|^starting/.test(daemonLine);
   const daemonDetail = daemonLine;
 
   // Sidecars. `embed list --json` reports every model in the catalog; the panel
@@ -1122,7 +1145,7 @@ export async function gatherHealth(
 
   // Integrity, from the daemon's own report.
   let integrity: IntegrityView | null = null;
-  const healthBody = stripEnvelope(healthRaw).trim();
+  const healthBody = stripEnvelope(healthReply.raw).trim();
   if (healthBody !== "") {
     try {
       const h = JSON.parse(healthBody) as {
@@ -1258,9 +1281,11 @@ export async function gatherHealth(
     languages,
     ...(languagesSkew !== undefined ? { languagesSkew } : {}),
     integrity,
+    integrityTimedOut: integrity === null && healthReply.timedOut,
   };
 }
 
+/** Build the stats dashboard view from `get_graph_stats` + local graph.db. */
 export function buildStatsView(raw: string): StatsView {
   const lines = stripEnvelope(raw).split("\n");
   const field = (key: string): string => {
@@ -1840,7 +1865,24 @@ export function registerShowGraphStats(
   const render = async (): Promise<string> => {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const reuse = logOnly && lastStats !== undefined;
-    const stats = reuse ? (lastStats as StatsView) : buildStatsView(await client.callTool("get_graph_stats"));
+    const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
+    // Started together, not one after another (review of #1132): with the
+    // longer waits #1131 gave them, running them in turn pushed a busy
+    // machine's first paint to about two and a half minutes.
+    const statsP = reuse
+      ? Promise.resolve(lastStats as StatsView)
+      : client.callTool("get_graph_stats").then(buildStatsView);
+    // readDiagnostics spawns `travsr status --verbose`.
+    const diagsP: Promise<Diagnostic[]> = reuse
+      ? Promise.resolve(lastDiags)
+      : root
+        ? readDiagnostics(bin, root)
+        : Promise.resolve([]);
+    // Drift, straight from the daemon. An older binary does not serve this tool
+    // and the client answers "" for an unknown tool, which parseIndexHealth
+    // reports as unavailable rather than as fresh; a reply that ran out of time
+    // is told apart from that (readIndexHealth).
+    const indexP = reuse ? Promise.resolve(lastIndex) : readIndexHealth(client);
     // Read straight from the log file rather than asking the daemon: it works
     // after a crash, which is when the panel is worth opening. This is the
     // cheap half, and the only half a log-only refresh needs.
@@ -1855,20 +1897,17 @@ export function registerShowGraphStats(
         ? logFile
         : (logFiles.files[0]?.name ?? "");
     const log = root && selected !== "" ? readDaemonLogFile(root, selected, logLines) : [];
-    const bin = vscode.workspace.getConfiguration("travsr").get<string>("binaryPath") || "travsr";
-    // readDiagnostics spawns `travsr status --verbose`.
-    const diags = reuse ? lastDiags : root ? await readDiagnostics(bin, root) : [];
-    // Drift, straight from the daemon. An older binary does not serve this tool
-    // and the client answers "" for an unknown tool, which parseIndexHealth
-    // reports as unavailable rather than as fresh; a reply that ran out of time
-    // is told apart from that (readIndexHealth).
-    const index = reuse ? lastIndex : await readIndexHealth(client);
+    const [stats, diags] = await Promise.all([statsP, diagsP]);
     // The sections. Skipped on a log-only refresh, which is what changing Lines
     // or File does: those spawns are the expensive half and nothing above the
-    // log has changed.
-    const health = reuse
-      ? lastHealth
-      : await gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""), diags);
+    // log has changed. They need the diagnostics, and run while the index
+    // status is still arriving.
+    const [index, health] = await Promise.all([
+      indexP,
+      reuse
+        ? Promise.resolve(lastHealth)
+        : gatherHealth(client, bin, root, log, stats.dbSize, logFiles, path.basename(root ?? ""), diags),
+    ]);
     lastStats = stats;
     lastDiags = diags;
     lastIndex = index;
@@ -2508,6 +2547,69 @@ export function registerShowExecutionPath(
   });
 }
 
+/** Limits for the CLI commands the Health page runs, the same ones travsr ui
+ *  uses for them (#1131). */
+export const CLI_TIMEOUTS_MS = {
+  version: 8_000,
+  daemonStatus: 30_000,
+  embedList: 15_000,
+  configList: 8_000,
+} as const;
+
+/**
+ * Whether the daemon's lock file says it is running, for when `travsr daemon
+ * status` gave no answer. Mirrors the server's `daemon_running`: on Windows a
+ * running daemon holds `.travsr/daemon.lock` exclusively, so reading it fails
+ * with EBUSY or EPERM; elsewhere it holds the daemon's pid, checked for life;
+ * no file means no daemon.
+ */
+export function daemonLockSaysRunning(
+  root: string,
+  read: (p: string) => string = (p) => fs.readFileSync(p, "utf8"),
+  alive: (pid: number) => boolean = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      // EPERM: it exists but belongs to someone else.
+      return (e as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+): boolean {
+  let content: string;
+  try {
+    content = read(path.join(root, ".travsr", "daemon.lock"));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "EBUSY" || code === "EPERM";
+  }
+  const pid = Number.parseInt(content.trim(), 10);
+  return Number.isInteger(pid) && pid > 0 && alive(pid);
+}
+
+/** How long `travsr status --verbose` may take for the Health page. The same
+ *  45 s `travsr ui` gives it: it took 5 to 6.5 s on a large Windows
+ *  repository, and the old 4 s default killed it before it printed a single
+ *  `warning:` line, so the page reported "no problems" (#1131). */
+export const DIAGNOSTICS_TIMEOUT_MS = 45_000;
+
+/** The card shown when the diagnostics could not be read: never "no problems". */
+export const DIAGNOSTICS_UNREAD: Diagnostic = {
+  severity: "warn",
+  title: "Analyzer diagnostics could not be read",
+  hint: "travsr status --verbose did not finish in time, so analyzer problems are unknown rather than absent. Press Refresh to read them again.",
+};
+
+/** The card for a `travsr status --verbose` that could not be started at all
+ *  (the binary is missing or not executable): not a timeout. */
+export function diagnosticsNotRun(reason: string): Diagnostic {
+  return {
+    severity: "warn",
+    title: "Analyzer diagnostics could not be read",
+    hint: `travsr status --verbose could not be run (${reason}), so analyzer problems are unknown rather than absent. Check travsr.binaryPath, then press Refresh.`,
+  };
+}
+
 /**
  * What is wrong with this repo's index, as `travsr status` reports it.
  *
@@ -2520,13 +2622,24 @@ export function registerShowExecutionPath(
  * which is why they are cards here rather than entries in the Problems panel,
  * which wants a file to attach to.
  */
-export async function readDiagnostics(binary: string, cwd: string): Promise<Diagnostic[]> {
+export async function readDiagnostics(
+  binary: string,
+  cwd: string,
+  run: (
+    binary: string,
+    args: string[],
+    cwd: string,
+    timeoutMs: number
+  ) => Promise<{ out: string; code: number | null; spawnError?: string }> =
+    spawnLangCommandResult
+): Promise<Diagnostic[]> {
   // `warning:` lines print only with --verbose; plain status is plain words.
   // A binary older than --verbose printed them by default.
-  let out = await spawnLangCommand(binary, ["status", "--verbose"], cwd);
-  if (out.includes("unexpected argument '--verbose'")) {
-    out = await spawnLangCommand(binary, ["status"], cwd);
+  let r = await run(binary, ["status", "--verbose"], cwd, DIAGNOSTICS_TIMEOUT_MS);
+  if (r.out.includes("unexpected argument '--verbose'")) {
+    r = await run(binary, ["status"], cwd, DIAGNOSTICS_TIMEOUT_MS);
   }
+  const out = r.out;
   const found: Diagnostic[] = [];
   for (const line of out.split("\n")) {
     const m = /^\s*warning:\s*(.+)$/.exec(line);
@@ -2545,6 +2658,17 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
       command: cmd ? cmd[1] : undefined,
     });
   }
+  // Killed on the timeout, or failed to start: what it printed is partial, and
+  // an empty list would read as a clean bill of health (#1131). The two get
+  // different cards, since a binary that will not start is no timeout (review
+  // of #1132).
+  // The start failure is reported by the spawner itself, not read from the
+  // output, which a timed-out run may also begin with `error:`.
+  if (r.spawnError !== undefined) {
+    found.push(diagnosticsNotRun(r.spawnError));
+  } else if (r.code === null) {
+    found.push(DIAGNOSTICS_UNREAD);
+  }
   return found;
 }
 
@@ -2557,7 +2681,8 @@ export async function readDiagnostics(binary: string, cwd: string): Promise<Diag
 /** Run a short lang command and resolve its combined output plus exit code.
  *  `code` is `null` on timeout or spawn error, so a caller that must confirm a
  *  command actually succeeded (a security-consent grant) can check `code === 0`
- *  rather than trust empty output. */
+ *  rather than trust empty output. `spawnError` is set only when the process
+ *  could not be started, so a caller can tell that from a timeout. */
 /** `out` is stdout+stderr interleaved, which is what the human-facing callers
  *  want (a CLI remedy line is as likely on stderr as on stdout). `stdout` is
  *  stdout alone, for the one caller that must `JSON.parse` the result: #755
@@ -2570,18 +2695,18 @@ function spawnLangCommandResult(
   args: string[],
   cwd?: string,
   timeoutMs = 4_000
-): Promise<{ out: string; stdout: string; code: number | null }> {
+): Promise<{ out: string; stdout: string; code: number | null; spawnError?: string }> {
   return new Promise((resolve) => {
     let out = "";
     let stdout = "";
     let resolved = false;
-    const done = (v: { out: string; stdout: string; code: number | null }): void => { if (!resolved) { resolved = true; resolve(v); } };
+    const done = (v: { out: string; stdout: string; code: number | null; spawnError?: string }): void => { if (!resolved) { resolved = true; resolve(v); } };
     const proc = cp.spawn(binary, args, { env: { ...process.env, TERM: "dumb", NO_COLOR: "1" }, ...(cwd ? { cwd } : {}) });
     proc.stdout?.on("data", (d: Buffer) => { const s = d.toString(); out += s; stdout += s; });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } done({ out, stdout, code: null }); }, timeoutMs);
     proc.on("close", (code) => { clearTimeout(timer); done({ out, stdout, code }); });
-    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, stdout: "", code: null }); });
+    proc.on("error", (e) => { clearTimeout(timer); done({ out: `error: ${e.message}`, stdout: "", code: null, spawnError: e.message }); });
   });
 }
 

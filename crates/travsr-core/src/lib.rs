@@ -43,7 +43,7 @@ pub mod noise;
 ///       re-parses files that changed, so an ObjC repo would hold collapsed
 ///       signatures for untouched files and full selectors for the rest, with
 ///       nothing able to tell the halves apart.
-///   4 - current: Phase A now emits enum members as `variant:Enum.Member`
+///   4 - Phase A now emits enum members as `variant:Enum.Member`
 ///       nodes (and Rust union fields as `field:U.f`), landed in #1023 without
 ///       a version bump. That is the same shape as the v2 entry: Phase A
 ///       captures nodes an older database lacks, and incremental reindex only
@@ -51,6 +51,13 @@ pub mod noise;
 ///       variants for any untouched file (`find_references ReindexCommit` found
 ///       nothing, #1053) with nothing to tell it apart from a file that truly
 ///       has none. Bumping forces the full re-parse that back-fills them.
+///   5 - current: Rust `use` paths now resolve `super::`, `self::` and
+///       `crate::` and module directories (#1130), so Phase A emits Rust
+///       import edges an older database lacks. Linking runs only for files the
+///       incremental reindex re-parses, so a database built before #1130 keeps
+///       no Rust import links for any untouched file (a plain `travsr init`
+///       after upgrading still showed none). Bumping forces the full re-parse
+///       that links them.
 ///
 /// The constant does not invalidate anything by itself. It is a marker some code
 /// paths compare against, and only those paths act on a bump:
@@ -71,7 +78,7 @@ pub mod noise;
 /// schema version only, so queries keep answering from the old-format graph: it
 /// is stale, not corrupt, and the write-path refusals above are what stop the
 /// two formats from ever mixing.
-pub const SIGNATURE_FORMAT_VERSION: u8 = 4;
+pub const SIGNATURE_FORMAT_VERSION: u8 = 5;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 

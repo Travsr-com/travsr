@@ -21,8 +21,8 @@ use ignore::WalkBuilder;
 use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
-    hash_bytes, link_imports_aliased, link_imports_go, link_imports_python_fs, link_imports_rust,
-    parse_tsconfig_path_aliases, FfiMarker,
+    hash_bytes, link_imports_aliased, link_imports_go, link_imports_python_fs,
+    link_imports_rust_fs, parse_tsconfig_path_aliases, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
@@ -483,7 +483,7 @@ fn index_paths_parallel(
                             link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
                         }
                         Some(Language::Rust) => {
-                            link_imports_rust(&out.nodes, &vname_path, &corpus)
+                            link_imports_rust_fs(&out.nodes, &vname_path, &corpus, &repo)
                         }
                         Some(Language::Python) => {
                             link_imports_python_fs(&out.nodes, &vname_path, &corpus, &repo)
@@ -6465,7 +6465,9 @@ pub fn reindex_files_reporting(
             Some(Language::TypeScript) => {
                 link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
             }
-            Some(Language::Rust) => link_imports_rust(&out.nodes, &vname_path, &corpus),
+            Some(Language::Rust) => {
+                link_imports_rust_fs(&out.nodes, &vname_path, &corpus, repo_root)
+            }
             Some(Language::Python) => {
                 link_imports_python_fs(&out.nodes, &vname_path, &corpus, repo_root)
             }

@@ -413,21 +413,61 @@ pub fn parse_tsconfig_path_aliases(repo_root: &Path) -> Vec<(String, String)> {
 /// Both candidate paths are always emitted; only the one whose `file:` node was
 /// actually indexed will be reachable during graph traversal.
 ///
-/// External crate paths (e.g. `use std::fmt`, `use tokio::Runtime`) and
-/// `crate::*` paths are silently skipped — cross-crate resolution is provided
-/// by LSIF in Sprint 9. Wildcard imports (`use foo::*`) are also skipped.
+/// `crate::` paths resolve against the crate root's directory (#1130): `src/`,
+/// `src/bin/` for a binary, or the `tests/`, `examples/` or `benches/`
+/// directory a file sits in, taken from `vname_path` here and from the nearest
+/// `Cargo.toml` by [`link_imports_rust_fs`]. External crate paths (e.g. `use std::fmt`, `use
+/// tokio::Runtime`) are silently skipped: cross-crate resolution is provided by
+/// LSIF. Wildcard imports (`use foo::*`) are also skipped.
+///
+/// The last segment of a path may be a module or an item in one
+/// (`use super::files::CLI_SLOT_WAIT` is a constant in `files.rs`), so both
+/// readings are emitted as candidates. Paths resolve from the *module's*
+/// directory: an ordinary `foo.rs` keeps its submodules in `foo/` and its
+/// parent's items beside it, while `mod.rs`, `lib.rs` and `main.rs` are their
+/// directory's module (#1130: `super::` from `ui/terminal.rs` used to resolve
+/// one directory too high, so no Rust `use` ever reached a file).
 ///
 /// `corpus` must match the corpus used when file nodes were indexed (ARCH-102).
 ///
 /// Call this after [`Indexer::parse_file_with_vname`] for `.rs` files and
 /// persist the returned edges alongside the parse output.
 pub fn link_imports_rust(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
-    let dir = match Path::new(vname_path).parent() {
-        Some(p) => p,
-        None => return Vec::new(),
+    link_rust(nodes, vname_path, corpus, None)
+}
+
+/// [`link_imports_rust`] with the repository on disk: the crate a file belongs
+/// to is taken from the nearest `Cargo.toml` above it instead of guessed from
+/// the path, so a package nested under a top-level `src/` (rust-lang/rust's
+/// `src/tools/clippy/tests/ui.rs`) and a multi-file test or binary
+/// (`tests/foo/main.rs`) resolve against their own crate root. Paths with no
+/// manifest above them fall back to the path-only rules.
+pub fn link_imports_rust_fs(
+    nodes: &[Node],
+    vname_path: &str,
+    corpus: &str,
+    repo_root: &Path,
+) -> Vec<Edge> {
+    link_rust(nodes, vname_path, corpus, Some(repo_root))
+}
+
+fn link_rust(nodes: &[Node], vname_path: &str, corpus: &str, repo: Option<&Path>) -> Vec<Edge> {
+    let file = Path::new(vname_path);
+    let Some(dir) = file.parent() else {
+        return Vec::new();
+    };
+    let crate_root = crate_root_dir(file, repo);
+    let module = RustModule {
+        file,
+        self_dir: rust_module_dir(file, dir, crate_root.as_deref()),
+        crate_root,
     };
 
     let mut edges = Vec::new();
+    let mut link = |from, path: &str| {
+        let target_id = rust_file_node_id(corpus, path);
+        edges.push(Edge::new(from, target_id, EdgeKind::ResolvesTo));
+    };
 
     for node in nodes {
         match node.kind.as_str() {
@@ -439,23 +479,19 @@ pub fn link_imports_rust(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<
                 if path.ends_with("::*") || path == "*" {
                     continue;
                 }
-                if let Some(base) = resolve_rust_module_path(path, dir) {
-                    for candidate in rust_candidate_paths(&base) {
-                        let target_id = rust_file_node_id(corpus, &candidate);
-                        edges.push(Edge::new(node.id, target_id, EdgeKind::ResolvesTo));
-                    }
+                for candidate in resolve_rust_use(path, &module) {
+                    link(node.id, &candidate);
                 }
             }
             "file-module" => {
-                // `mod foo;` — resolve to foo.rs / foo/mod.rs relative to the
-                // declaring file's directory.
+                // `mod foo;`: resolve to foo.rs / foo/mod.rs in the declaring
+                // module's directory (`bar.rs` keeps it in `bar/`, #1130).
                 let Some(name) = node.vname.signature.strip_prefix("filemod:") else {
                     continue;
                 };
-                let base = normalize_vname_path(&dir.join(name));
+                let base = normalize_vname_path(&module.self_dir.join(name));
                 for candidate in rust_candidate_paths(&base) {
-                    let target_id = rust_file_node_id(corpus, &candidate);
-                    edges.push(Edge::new(node.id, target_id, EdgeKind::ResolvesTo));
+                    link(node.id, &candidate);
                 }
             }
             _ => {}
@@ -465,36 +501,229 @@ pub fn link_imports_rust(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<
     edges
 }
 
-/// Resolve a within-crate Rust module path to a base filesystem path (no
-/// extension). Returns `None` for external crate references and `crate::*`
-/// (cross-crate resolution deferred to Sprint 9 LSIF).
+/// What `use` resolution needs to know about the importing file, worked out
+/// once per file.
+struct RustModule<'a> {
+    file: &'a Path,
+    /// The directory holding this module's children ([`rust_module_dir`]).
+    self_dir: std::path::PathBuf,
+    /// The directory `crate::` resolves against ([`crate_root_dir`]).
+    crate_root: Option<std::path::PathBuf>,
+}
+
+/// Resolve a within-crate Rust `use` path to candidate repo-relative file
+/// paths. Empty for external crates and wildcards.
 ///
-/// Handles:
-/// - `self::foo::bar`           → `{dir}/foo/bar`
-/// - `super::foo`               → `{parent_dir}/foo`
-/// - `super::super::foo`        → `{grandparent_dir}/foo`
-fn resolve_rust_module_path(use_path: &str, dir: &Path) -> Option<std::path::PathBuf> {
-    if let Some(rest) = use_path.strip_prefix("self::") {
-        let segments: std::path::PathBuf = rest.split("::").collect();
-        return Some(normalize_vname_path(&dir.join(segments)));
-    }
-    if use_path.starts_with("super::") {
-        let mut base = dir.to_path_buf();
+/// Starting directory (the module's own, see [`link_imports_rust`]):
+/// - `self::`  : the module's directory (`{dir}` for `mod.rs`/`lib.rs`/
+///   `main.rs`, `{dir}/{stem}` for `{stem}.rs`);
+/// - `super::` : one module up per `super` (`{dir}`'s parent for `mod.rs`-like
+///   files, `{dir}` for `{stem}.rs`);
+/// - `crate::` : the crate root's directory ([`crate_root_dir`]), skipped when
+///   the path is in no crate layout.
+///
+/// Then the remaining segments, read twice: all of them as modules
+/// (`super::files` -> `files`), and all but the last, which is then an item
+/// (`super::files::CONST` -> `files`). Deeper prefixes are not emitted, so a
+/// nested path does not also link every enclosing module. With one segment
+/// the item reading names the starting module itself (`use super::ApiError`
+/// is an item of `ui.rs` or `ui/mod.rs`; `use crate::Config` one of `lib.rs`
+/// or `main.rs`), so that module's file is the candidate.
+fn resolve_rust_use(use_path: &str, module: &RustModule<'_>) -> Vec<String> {
+    let (base, rest) = if let Some(rest) = use_path.strip_prefix("self::") {
+        (module.self_dir.clone(), rest)
+    } else if use_path.starts_with("super::") {
+        let mut base = module.self_dir.clone();
         let mut rest = use_path;
         while let Some(stripped) = rest.strip_prefix("super::") {
-            base = base.parent().map(Path::to_path_buf)?;
+            match base.parent() {
+                Some(p) => base = p.to_path_buf(),
+                None => return Vec::new(),
+            }
             rest = stripped;
         }
-        if rest.is_empty() {
-            return None;
+        (base, rest)
+    } else if let Some(rest) = use_path.strip_prefix("crate::") {
+        match &module.crate_root {
+            Some(root) => (root.clone(), rest),
+            None => return Vec::new(),
         }
-        let segments: std::path::PathBuf = rest.split("::").collect();
-        return Some(normalize_vname_path(&base.join(segments)));
+    } else {
+        // A bare external identifier (`std::`, `serde::`): not in this repo.
+        return Vec::new();
+    };
+    if rest.is_empty() {
+        return Vec::new();
     }
-    // `crate::*` and bare external identifiers: skip.
-    // DEBT(travsr-indexer): crate:: resolution requires the crate root path,
-    // which is not available from vname_path alone. Deferred to Sprint 9 LSIF.
-    None
+    let segments: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: String| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for take in [segments.len(), segments.len().saturating_sub(1)] {
+        if take == 0 {
+            for p in module_files(&base, module) {
+                push(p);
+            }
+            continue;
+        }
+        let mut path = base.clone();
+        for seg in &segments[..take] {
+            path.push(seg);
+        }
+        for p in rust_candidate_paths(&normalize_vname_path(&path)) {
+            push(p);
+        }
+    }
+    out
+}
+
+/// The files that can hold the module whose children live in `dir`.
+///
+/// At the crate root that is the crate's root file: `lib.rs` or `main.rs` in
+/// `src/`, `main.rs` in a multi-file binary, test, example or bench. A flat
+/// `tests/foo.rs` (or `src/bin/foo.rs`) is its own crate root, so a path back
+/// to it from that file names nothing new, and from a module of it the root
+/// file is not known; both give nothing. Anywhere else it is `{dir}.rs` or
+/// `{dir}/mod.rs`. The importing file itself is never a candidate.
+fn module_files(dir: &Path, module: &RustModule<'_>) -> Vec<String> {
+    let dir = normalize_vname_path(dir);
+    let files: Vec<String> = if module.crate_root.as_deref() == Some(dir.as_path()) {
+        let last = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if root_dir_holds_crate_roots(&dir) {
+            Vec::new()
+        } else if last == "src" {
+            ["lib.rs", "main.rs"]
+                .iter()
+                .map(|f| slash_path(&dir.join(f)))
+                .collect()
+        } else {
+            vec![slash_path(&dir.join("main.rs"))]
+        }
+    } else if dir.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        rust_candidate_paths(&dir).to_vec()
+    };
+    let me = slash_path(module.file);
+    files.into_iter().filter(|f| *f != me).collect()
+}
+
+fn slash_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// The directory that holds a Rust file's child modules: its own directory for
+/// `mod.rs`, `lib.rs`, `main.rs`, `build.rs` and any other crate root (a flat
+/// `tests/foo.rs`, `src/bin/foo.rs`), else `{dir}/{stem}` (Rust 2018 module
+/// layout: `bar.rs` keeps `mod foo;` in `bar/foo.rs`).
+fn rust_module_dir(file: &Path, dir: &Path, crate_root: Option<&Path>) -> std::path::PathBuf {
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let is_crate_root = matches!(stem, "lib" | "main")
+        || file.file_name().is_some_and(|n| n == "build.rs")
+        || crate_root.is_some_and(|root| root == dir && root_dir_holds_crate_roots(root));
+    if stem == "mod" || is_crate_root {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    }
+}
+
+/// Whether every `.rs` directly in `dir` is a crate root of its own: an
+/// integration test, example or bench, or a `src/bin` binary. Not `src/`,
+/// where only `lib.rs` / `main.rs` are (review of #1132).
+fn root_dir_holds_crate_roots(dir: &Path) -> bool {
+    let last = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    matches!(last, "tests" | "examples" | "benches")
+        || (last == "bin"
+            && dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "src"))
+}
+
+/// The directory `crate::` paths resolve against for a repo-relative Rust
+/// path, or `None` when it is in no recognisable crate layout.
+///
+/// With the repository on disk (`repo`), the package is the nearest directory
+/// above the file holding a `Cargo.toml`, and the file's place in it decides,
+/// as Cargo does: `tests/`, `examples/` or `benches/` (or a subdirectory of
+/// one with its own `main.rs`), `src/bin/` (likewise), else `src/`.
+///
+/// Without one, or with no manifest above the file, the path alone decides:
+/// - a `tests/`, `examples/` or `benches/` directory that is not inside `src/`
+///   (each file there is its own crate, rooted in that directory);
+/// - `src/bin/` for a binary there;
+/// - otherwise the last `src/`;
+/// - and for a `main.rs` directly in a subdirectory of one of the first two,
+///   that subdirectory (`src/bin/tool/main.rs`, `tests/foo/main.rs`).
+///
+/// The path alone cannot tell a package nested under a top-level `src/` from a
+/// module inside a crate's `src/`, which is why the daemon uses the manifest.
+fn crate_root_dir(file: &Path, repo: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Some(root) = repo.and_then(|repo| crate_root_from_manifest(file, repo)) {
+        return Some(root);
+    }
+    let root = crate_root_from_path(file)?;
+    let dir = file.parent()?;
+    let is_subdir_main = file.file_name().is_some_and(|n| n == "main.rs")
+        && dir.parent() == Some(root.as_path())
+        && root_dir_holds_crate_roots(&root);
+    Some(if is_subdir_main {
+        dir.to_path_buf()
+    } else {
+        root
+    })
+}
+
+fn crate_root_from_manifest(file: &Path, repo: &Path) -> Option<std::path::PathBuf> {
+    let dir = file.parent()?;
+    let package = dir
+        .ancestors()
+        .find(|d| repo.join(d).join("Cargo.toml").is_file())?;
+    let rel = dir.strip_prefix(package).ok()?;
+    let comps: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
+    let has_main = |sub: &Path| repo.join(sub).join("main.rs").is_file();
+    // `{base}/{name}/main.rs` is a crate of its own; anything else under
+    // `{base}` belongs to the crate rooted in `{base}`.
+    let multi_file = |base: std::path::PathBuf, sub: Option<&&str>| match sub {
+        Some(name) if has_main(&base.join(name)) => base.join(name),
+        _ => base,
+    };
+    match comps.as_slice() {
+        [] if file.file_name().is_some_and(|n| n == "build.rs") => Some(package.to_path_buf()),
+        [layout, rest @ ..] if matches!(*layout, "tests" | "examples" | "benches") => {
+            Some(multi_file(package.join(layout), rest.first()))
+        }
+        ["src", "bin", rest @ ..] => {
+            Some(multi_file(package.join("src").join("bin"), rest.first()))
+        }
+        ["src", ..] => Some(package.join("src")),
+        _ => None,
+    }
+}
+
+fn crate_root_from_path(file: &Path) -> Option<std::path::PathBuf> {
+    let comps: Vec<_> = file
+        .parent()
+        .map(|p| p.components().collect())
+        .unwrap_or_default();
+    let name = |i: usize| comps[i].as_os_str().to_str().unwrap_or("");
+    let first_src = (0..comps.len()).find(|&i| name(i) == "src");
+    // A tests/examples/benches directory beside src/, not a module inside it.
+    let crate_dir = (0..comps.len()).rev().find(|&i| {
+        matches!(name(i), "tests" | "examples" | "benches") && first_src.map_or(true, |s| i < s)
+    });
+    let last_src = (0..comps.len()).rev().find(|&i| name(i) == "src");
+    let end = match (crate_dir, last_src) {
+        (Some(t), _) => t,
+        (None, Some(s)) if s + 1 < comps.len() && name(s + 1) == "bin" => s + 1,
+        (None, Some(s)) => s,
+        (None, None) => return None,
+    };
+    Some(comps[..=end].iter().collect())
 }
 
 /// Returns the two candidate repo-relative file paths for a Rust module:

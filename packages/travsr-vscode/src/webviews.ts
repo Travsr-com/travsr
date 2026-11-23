@@ -1038,6 +1038,9 @@ export interface HealthData {
    *  the section says which binary is behind instead of guessing at cells. */
   languagesSkew?: LangContractSkew;
   integrity: IntegrityView | null;
+  /** The integrity report did not arrive within the wait (Travsr was busy),
+   *  which is not the same as it failing (#1129). */
+  integrityTimedOut?: boolean;
 }
 
 export const EMPTY_HEALTH: HealthData = {
@@ -1627,7 +1630,11 @@ export function buildStatsHtml(
         : statusChip("ok", "consistent"),
     act("Run fsck", "runFsck") + act("Compact", "compact"),
     integ === null
-      ? unavailable("Could not read the integrity report.")
+      ? unavailable(
+          health.integrityTimedOut
+            ? "The integrity report took too long to arrive (Travsr was busy). Press Refresh to read it again."
+            : "Could not read the integrity report."
+        )
       : row("graph.db", integ.dbSize) +
         // No action. Log pruning is the daemon's own job, applied at start and
         // when the day rolls, against a 7 file and 50 MB budget; there is no
