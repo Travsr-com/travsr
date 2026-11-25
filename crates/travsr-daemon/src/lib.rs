@@ -2303,7 +2303,7 @@ pub fn init_repo_with_progress(
                 std::collections::HashSet::new();
             // #738: track how many positional refs survived resolution so the
             // degradation flag reflects landed edges, not just "did ra run".
-            let lsif_parsed = pb_positional.len();
+            let lsif_parsed = lsif_resolvable_refs(&pb_positional);
             let mut lsif_resolved = 0usize;
             match store.resolve_lsif_positional_refs(&corpus, &pb_positional) {
                 Ok(resolved) => {
@@ -3888,6 +3888,21 @@ fn is_outside_repo(path: &str) -> bool {
             && b[0].is_ascii_alphabetic()
             && b[1] == b':'
             && matches!(b[2], b'/' | b'\\'))
+}
+
+/// #1112: the positional refs that must land on an indexed symbol, the "parsed"
+/// half of the `all_refs_dropped` check: calls into code defined in the repo.
+/// A call into `std` or a registry crate never resolves, and neither does a
+/// non-call use of a local (`status` in `assert!(status.success())`), so a repo
+/// with only those has no calls to trace, not a dropped batch. A call whose
+/// caller is outside the repo as well still counts: that is #738's shape, where
+/// a path prefix mismatch left every path absolute.
+fn lsif_resolvable_refs(refs: &[travsr_core::LsifPositionalRef]) -> usize {
+    refs.iter()
+        .filter(|r| {
+            r.is_call && (!is_outside_repo(&r.callee_def_path) || is_outside_repo(&r.caller_path))
+        })
+        .count()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5925,7 +5940,7 @@ fn run_background_phase_b_inner(
     let mut lsif_covered: std::collections::HashSet<(String, u32, String)> =
         std::collections::HashSet::new();
     // #738: track surviving positional refs for the degradation flag.
-    let lsif_parsed = pb_positional.len();
+    let lsif_parsed = lsif_resolvable_refs(&pb_positional);
     let mut lsif_resolved = 0usize;
     match s.resolve_lsif_positional_refs(&corpus, &pb_positional) {
         Ok(resolved) => {
@@ -10366,6 +10381,39 @@ mod tests {
             degraded(&store),
             "",
             "an empty ref batch (no rust refs) must not be flagged as degraded"
+        );
+    }
+
+    /// #1112: a repo whose only calls go into `std` (`fn main() {}` plus a smoke
+    /// test calling `Command::new` and reading a local) has nothing to resolve,
+    /// so it must not count toward `all_refs_dropped`. #738's shape, every path
+    /// left absolute by a prefix mismatch, still counts.
+    #[test]
+    fn lsif_resolvable_refs_counts_in_repo_calls_only() {
+        let r = |caller: &str, callee: &str, is_call: bool| travsr_core::LsifPositionalRef {
+            caller_path: caller.into(),
+            caller_line: 8,
+            callee_def_path: callee.into(),
+            callee_def_line: 5,
+            is_call,
+            caller_col: None,
+            callee_name: None,
+        };
+        let smoke = "crates/cli/tests/smoke.rs";
+        let std_new = r(
+            smoke,
+            "/rustup/lib/rustlib/src/rust/library/std/src/process.rs",
+            true,
+        );
+        let local_use = r(smoke, smoke, false);
+        assert_eq!(lsif_resolvable_refs(&[std_new.clone(), local_use]), 0);
+        assert_eq!(
+            lsif_resolvable_refs(&[std_new, r("src/a.rs", "src/b.rs", true)]),
+            1
+        );
+        assert_eq!(
+            lsif_resolvable_refs(&[r("C:/repo/src/a.rs", "C:/repo/src/b.rs", true)]),
+            1
         );
     }
 
