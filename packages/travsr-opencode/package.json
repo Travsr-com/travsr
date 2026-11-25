@@ -1,0 +1,31 @@
+{
+  "name": "travsr-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode plugin: the Travsr code graph as MCP tools plus per-turn graph context",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr",
+    "directory": "packages/travsr-opencode"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts"
+  },
+  "files": [
+    "index.ts"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.27"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.32",
+    "@types/node": "22.15.3",
+    "typescript": "5.8.3"
+  }
+}
