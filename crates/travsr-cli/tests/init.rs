@@ -910,8 +910,11 @@ fn init_path_indexes_that_dir_and_reports_repo() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // `repo` is the cwd as the OS reports it (a Windows 8.3 short name, no
+    // `\\?\`), so compare the directories, not the spellings.
     let root = tmp.path().canonicalize().unwrap();
-    assert_eq!(v["repo"], root.to_string_lossy().as_ref());
+    let repo = std::path::Path::new(v["repo"].as_str().unwrap());
+    assert_eq!(repo.canonicalize().unwrap(), root);
     assert!(root.join(".travsr/graph.db").is_file());
     assert!(!elsewhere.path().join(".travsr").exists());
 
