@@ -134,6 +134,25 @@ fn place_note_in_envelope(text: String, note: &str) -> String {
     }
 }
 
+/// #1113: name the checkout and commit a global answer came from. The global
+/// server cannot tell that its caller sits in a linked worktree (that check
+/// lives in travsr-cli), so the agent gets what it needs to compare with its
+/// own `git rev-parse --short HEAD`. `None` when the index has no commit yet.
+fn index_source_note(db_path: &std::path::Path) -> Option<String> {
+    let root = db_path.parent()?.parent()?;
+    let commit = SqliteStore::open_read_only(db_path)
+        .ok()?
+        .get_meta("last_commit")
+        .ok()
+        .flatten()?;
+    let root = registry::strip_verbatim_prefix(&root.to_string_lossy()).into_owned();
+    Some(format!(
+        "[note: answered from {} at commit {}; a linked worktree or other checkout may differ, compare with your `git rev-parse --short HEAD`.]",
+        crate::sanitize::sanitize_log_value(&root, 512),
+        crate::sanitize::sanitize_log_value(&commit, 64),
+    ))
+}
+
 /// Capabilities advertised in the `initialize` response. The `prompts`
 /// capability is only declared when `mcp-sampling` is enabled, so that a
 /// spec-compliant client can discover and call the `prompts/*` endpoints that
@@ -1408,6 +1427,19 @@ fn handle_tool_call_global(
         tool_calls_total = 1u64,
         "mcp.tool_call complete"
     );
+    // The observability tools already name `repo` and `indexed_commit`, in a
+    // JSON body a prose line would break.
+    let observability = matches!(
+        tool_name,
+        "get_index_status" | "get_daemon_logs" | "get_graph_health"
+    );
+    let text = match repo_arg.and_then(|key| repos.get(key)) {
+        Some(db) if !observability => match index_source_note(db) {
+            Some(note) => place_note_in_envelope(text, &note),
+            None => text,
+        },
+        _ => text,
+    };
     ok_response(
         id,
         serde_json::json!({ "content": [{ "type": "text", "text": with_stale_build_note(text) }] }),
@@ -1819,6 +1851,24 @@ mod tests {
         );
         // get_graph_json returns raw JSON, which has no envelope to land in.
         assert_eq!(place("{\"nodes\":[]}"), "{\"nodes\":[]}");
+    }
+
+    /// #1113: the note names the checkout root and the indexed commit, and is
+    /// absent before the first index.
+    #[test]
+    fn index_source_note_names_root_and_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".travsr")).unwrap();
+        let db = tmp.path().join(".travsr/graph.db");
+        let mut store = SqliteStore::open(&db).unwrap();
+        assert_eq!(index_source_note(&db), None);
+        store.set_meta("last_commit", "abc1234").unwrap();
+        drop(store);
+        let note = index_source_note(&db).unwrap();
+        // The root goes through the same redaction as every logged path, so a
+        // temp dir under the home directory (Windows CI) reads as `~\...`.
+        let root = crate::sanitize::sanitize_log_value(&tmp.path().to_string_lossy(), 512);
+        assert!(note.contains(&format!("answered from {root} at commit abc1234")));
     }
 
     const ALL_TOOLS: &[&str] = &[
