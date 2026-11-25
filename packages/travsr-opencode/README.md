@@ -2,9 +2,10 @@
 
 OpenCode plugin that makes the agent use the Travsr code graph without being told to.
 
-On load it finds the `travsr` binary (installing it with the signed shell installer if absent),
-indexes the repository if it is a git repo with no index yet, and registers the Travsr MCP
-server with Code Mode off so each tool is visible to the model by name.
+On load it finds the `travsr` binary and, if the directory is already indexed, registers the
+Travsr MCP server with Code Mode off so each tool is visible to the model by name. It never
+installs travsr and never indexes a repository: with no binary, or no index (run `travsr init`
+yourself), it logs one warning and OpenCode runs as if the plugin were absent.
 
 On every model request it:
 
@@ -19,7 +20,8 @@ On every model request it:
 { "plugins": [{ "package": "/path/to/packages/travsr-opencode", "options": { "binary": "/path/to/travsr" } }] }
 ```
 
-`binary` is optional; without it the plugin uses `travsr` on PATH, then `~/.local/bin/travsr`.
+`binary` is optional; without it the plugin uses `travsr` on PATH, then `~/.local/bin/travsr`
+(`travsr.exe` on Windows).
 
 An existing `travsr` MCP entry is kept as written, except that Code Mode is turned off unless the
 entry sets `codemode` itself. Disable the server with `"disabled": true` under `mcp.servers.travsr`

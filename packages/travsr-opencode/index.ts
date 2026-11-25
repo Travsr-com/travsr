@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import type { Message } from "@opencode/ai"
 import { execFile } from "node:child_process"
-import { appendFileSync, existsSync } from "node:fs"
+import { appendFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { promisify } from "node:util"
@@ -9,7 +9,7 @@ import { promisify } from "node:util"
 const run = promisify(execFile)
 
 // Where install.sh puts the binary when TRAVSR_INSTALL_DIR is unset.
-const INSTALLED = join(homedir(), ".local", "bin", "travsr")
+const INSTALLED = join(homedir(), ".local", "bin", process.platform === "win32" ? "travsr.exe" : "travsr")
 
 // Names in a prompt that we resolve per turn. More is noise the model has to read past.
 const MAX_SYMBOLS = 3
@@ -43,8 +43,16 @@ export default Plugin.define({
   async setup(ctx) {
     const cwd = ctx.location.directory
     const binary = ctx.options.binary ?? (await locate())
-    if (!binary) return
-    await index(binary, cwd)
+    if (!binary) {
+      console.warn("travsr: binary not found; install with `npm i -g travsr` or set the `binary` option")
+      return
+    }
+    // Never index from a plugin: `init` installs git hooks, writes ignore files and starts a
+    // daemon. An unindexed repo (or no repo) leaves OpenCode as if the plugin were absent.
+    if (!(await succeeds(binary, ["status"], cwd))) {
+      console.warn("travsr: this directory has no index; run `travsr init` to enable the graph")
+      return
+    }
 
     // Optional trace of what the plugin added and which tools the model called, one line each.
     const logFile: string | undefined = ctx.options.log
@@ -123,27 +131,17 @@ export default Plugin.define({
   },
 })
 
-// An explicit binary, else the one on PATH, else install it. undefined when all three fail, and
-// OpenCode then runs as if the plugin were absent.
+// The binary on PATH, else where install.sh puts it. Never installs: that is the user's call.
 async function locate() {
   for (const candidate of ["travsr", INSTALLED]) {
     if (await succeeds(candidate, ["--version"], process.cwd())) return candidate
   }
-  if (!(await succeeds("sh", ["-c", "curl -fsSL https://travsr.com/install.sh | sh"], process.cwd()))) return undefined
-  return existsSync(INSTALLED) ? INSTALLED : undefined
-}
-
-// Index a git repository the first time OpenCode opens it. Outside git there is no repository to
-// index, and indexing a home directory by accident is worse than no graph.
-async function index(binary: string, cwd: string) {
-  if (await succeeds(binary, ["status"], cwd)) return
-  if (!(await succeeds("git", ["rev-parse", "--show-toplevel"], cwd))) return
-  await succeeds(binary, ["init", "--quiet", "--no-connect"], cwd)
+  return undefined
 }
 
 async function succeeds(file: string, args: string[], cwd: string) {
   try {
-    await run(file, args, { cwd, timeout: 600_000 })
+    await run(file, args, { cwd, timeout: 10_000 })
     return true
   } catch {
     return false
@@ -172,7 +170,7 @@ async function definitions(binary: string, cwd: string, names: string[]) {
         type Def = { path: string; line: number; kind: string; signature: string }
         const out: { resolved_to: Def | null; candidates: Def[] } = JSON.parse(stdout)
         const defs = out.resolved_to ? [out.resolved_to] : out.candidates.slice(0, MAX_SYMBOLS)
-        return defs.map((d) => `${name}: ${d.kind} ${d.signature} at ${d.path}:${d.line}`)
+        return defs.map((d) => `${clean(name)}: ${clean(d.kind)} ${clean(d.signature)} at ${clean(d.path)}:${d.line}`)
       } catch {
         return []
       }
@@ -180,4 +178,14 @@ async function definitions(binary: string, cwd: string, names: string[]) {
   )
   if (!lines.flat().length) return undefined
   return ["<travsr-data>", "Definitions of names in this request, from the code graph:", ...lines.flat(), "</travsr-data>"].join("\n")
+}
+
+// `references --format json` is not sanitised (only MCP responses are), and a path or signature
+// comes from the repo, so a file named `</travsr-data>...` could close the envelope early. Same
+// rule as sanitize_for_mcp: drop control characters, escape the tag characters.
+function clean(text: string) {
+  return text
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
 }
