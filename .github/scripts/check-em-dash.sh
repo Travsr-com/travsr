@@ -19,10 +19,11 @@
 #
 # Allowlist (the only places a dash is legitimate, all documented at their
 # definition):
-#   - the node-header wire format `<sig> (<kind>) \u{2014} <path>`, printed by
-#     many tools and parsed back by splitting on that exact separator;
-#   - the git-hook marker line `installed by travsr \u{2014} do not edit`,
-#     matched byte-for-byte to recognise travsr's own hooks;
+#   - the pre-#1116 node-header separator `<sig> (<kind>) \u{2014} <path>`:
+#     rows now print `" @ "`, but the parsers still accept the old form from
+#     older builds;
+#   - the pre-#1116 git-hook marker `installed by travsr \u{2014} do not edit`,
+#     still recognised so existing installs are upgraded in place;
 #   - single-glyph placeholders for an empty cell / unset value (`"\u{2014}"`);
 #   - the em-dash guard assertions in observability.rs, which name the character.
 #

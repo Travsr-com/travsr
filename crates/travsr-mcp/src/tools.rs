@@ -1132,7 +1132,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
             if !sites.is_empty() {
                 for line in sites {
                     lines.push(format!(
-                        "{tag} {} ({}) \u{2014} {}:{}{live}",
+                        "{tag} {} ({}) @ {}:{}{live}",
                         display_label(src_node),
                         src_node.kind,
                         src_node.vname.path,
@@ -1146,7 +1146,7 @@ fn get_callers_raw(store: &SqliteStore, symbol: &str, path: Option<&str>) -> Str
         // report the node's definition line as before.
         let loc = src_node.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
-            "{tag} {} ({}) \u{2014} {}{}{live}",
+            "{tag} {} ({}) @ {}{}{live}",
             display_label(src_node),
             src_node.kind,
             src_node.vname.path,
@@ -1969,7 +1969,7 @@ fn ambiguous_definitions_message(symbol: &str, nodes: &[CoreNode], advice: &str)
     for n in nodes.iter().take(shown) {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         out.push_str(&format!(
-            "  {} ({}) \u{2014} {}{}\n",
+            "  {} ({}) @ {}{}\n",
             display_label(n),
             n.kind,
             n.vname.path,
@@ -2004,7 +2004,7 @@ fn path_miss_message(symbol: &str, hint: &str, defs: &[CoreNode]) -> String {
     for n in defs.iter().take(shown) {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         out.push_str(&format!(
-            "  {} ({}) \u{2014} {}{}\n",
+            "  {} ({}) @ {}{}\n",
             display_label(n),
             n.kind,
             n.vname.path,
@@ -2340,7 +2340,7 @@ fn references_body_for_family(store: &SqliteStore, family: &[CoreNode]) -> Strin
     for n in family {
         let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
         lines.push(format!(
-            "  {} ({}) \u{2014} {}{}",
+            "  {} ({}) @ {}{}",
             display_label(n),
             n.kind,
             n.vname.path,
@@ -2374,7 +2374,7 @@ fn references_body_for_family(store: &SqliteStore, family: &[CoreNode]) -> Strin
 fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String {
     let resolved_loc = target.line.map(|l| format!(":{l}")).unwrap_or_default();
     let header = format!(
-        "resolved: {} ({}) \u{2014} {}{}",
+        "resolved: {} ({}) @ {}{}",
         display_label(target),
         target.kind,
         target.vname.path,
@@ -6272,12 +6272,7 @@ fn search_symbol_raw(
         .iter()
         .map(|n| {
             let loc = n.line.map(|l| format!(":{l}")).unwrap_or_default();
-            format!(
-                "{} ({}) \u{2014} {}{loc}",
-                display_label(n),
-                n.kind,
-                n.vname.path
-            )
+            format!("{} ({}) @ {}{loc}", display_label(n), n.kind, n.vname.path)
         })
         .collect();
     let mut body = lines.join("\n");
@@ -7311,8 +7306,8 @@ fn ambiguous_endpoint_message(which: &str, name: &str, candidates: &[CoreNode]) 
         )
     };
     for n in candidates.into_iter().take(limit) {
-        // " at " rather than the em-dash `graph` uses for the same list. This
-        // is a diagnostic message, not the `<sig> (<kind>) \u{2014} <path>` wire
+        // " at " rather than the " @ " `graph` uses for the same list. This
+        // is a diagnostic message, not the `<sig> (<kind>) @ <path>` wire
         // header packages/travsr-vscode parses, so it has no separator to
         // preserve and falls under the no-em-dash rule the CI gate enforces.
         let loc = if n.vname.path.is_empty() {
@@ -7436,14 +7431,8 @@ fn get_execution_path_body(
         .iter()
         .position(|n| n.id == snk.id)
         .map_or(path.len(), |i| i + 1);
-    let render = |n: &travsr_core::Node| {
-        format!(
-            "{} ({}) \u{2014} {}",
-            display_label(n),
-            n.kind,
-            n.vname.path
-        )
-    };
+    let render =
+        |n: &travsr_core::Node| format!("{} ({}) @ {}", display_label(n), n.kind, n.vname.path);
 
     let mut out = String::new();
     // Count hops, not symbols. `route_end` is how many nodes the route spans, so
@@ -8145,14 +8134,14 @@ fn format_node_line(
     };
     if n.package.is_empty() {
         format!(
-            "{} ({}) \u{2014} {}{loc}{via}{score_str}",
+            "{} ({}) @ {}{loc}{via}{score_str}",
             display_label(n),
             n.kind,
             n.vname.path
         )
     } else {
         format!(
-            "{} ({}) \u{2014} {}{loc} [package: {}]{via}{score_str}",
+            "{} ({}) @ {}{loc} [package: {}]{via}{score_str}",
             display_label(n),
             n.kind,
             n.vname.path,
@@ -8854,7 +8843,7 @@ fn get_context_body(
                             format!(" [package: {}]", n.package)
                         };
                         format!(
-                            "  {} ({}) \u{2014} {}{loc}{pkg}",
+                            "  {} ({}) @ {}{loc}{pkg}",
                             display_label(n),
                             n.kind,
                             n.vname.path
@@ -16177,8 +16166,8 @@ fn token_display_name(tok: &SymbolToken<'_>) -> String {
 ///
 /// Detection order (first match wins per token):
 /// 1. Starts with `"nodeId:"` → [`SymbolToken::NodeId`]
-/// 2. Contains `" \u{2014} "` (em-dash with spaces, the `get_context` header
-///    separator) → [`SymbolToken::FullHeader`]
+/// 2. Contains `" @ "` (the `get_context` header separator; the older
+///    `" \u{2014} "` is still accepted) → [`SymbolToken::FullHeader`]
 /// 3. Last `:` is followed by purely digits and the prefix contains `/`
 ///    → [`SymbolToken::PathLine`]
 /// 4. Everything else → [`SymbolToken::BareSig`]
@@ -16224,13 +16213,19 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
                 }
             }
 
-            // Tier 1: full get_context header — contains em-dash separator.
+            // Tier 1: full get_context header, which contains the row separator.
             // Real format (see `format_node_line`):
-            //   "{sig} ({kind}) \u{2014} {path}:{line} [package: {pkg}] [via: ..] [score: ..]"
+            //   "{sig} ({kind}) @ {path}:{line} [package: {pkg}] [via: ..] [score: ..]"
             // `[package: ..]` is omitted when the package is empty, and the path
             // always carries a trailing ":{line}" definition locator. The " ("
-            // separates sig from kind; " \u{2014} " separates kind from path.
-            if let Some(em_pos) = token.find(" \u{2014} ") {
+            // separates sig from kind; " @ " separates kind from path.
+            // #1116: rows from older builds (or pasted from them) used
+            // " \u{2014} ", which is still accepted.
+            let sep = [" @ ", " \u{2014} "]
+                .into_iter()
+                .filter_map(|s| token.find(s).map(|p| (p, s.len())))
+                .min();
+            if let Some((em_pos, sep_len)) = sep {
                 // sig is everything before the first " ("
                 let before_em = &token[..em_pos];
                 let sig = if let Some(p) = before_em.find(" (") {
@@ -16242,7 +16237,7 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
                 // "[via:", "[score:", ..). Matching " [" generally is required
                 // because the package field is dropped for package-less nodes,
                 // in which case " [via:" is the first trailer.
-                let after_em = &token[em_pos + " \u{2014} ".len()..];
+                let after_em = &token[em_pos + sep_len..];
                 let path_with_loc = match after_em.find(" [") {
                     Some(p) => after_em[..p].trim(),
                     None => after_em.trim(),
@@ -16253,7 +16248,7 @@ fn parse_symbol_tokens(symbols_arg: &str) -> Vec<SymbolToken<'_>> {
                 if !sig.is_empty() && !path.is_empty() {
                     return Some(SymbolToken::FullHeader { sig, path });
                 }
-                // Has em-dash but no usable path — fall through to BareSig.
+                // Has the separator but no usable path: fall through to BareSig.
                 if !sig.is_empty() {
                     return Some(SymbolToken::BareSig(sig));
                 }
@@ -16632,7 +16627,7 @@ fn get_snippets_body(
             format!(" [package: {}]", node.package)
         };
         let header = format!(
-            "{} ({}) \u{2014} {}{loc}{pkg}{}",
+            "{} ({}) @ {}{loc}{pkg}{}",
             display_label(node),
             node.kind,
             node.vname.path,
@@ -17845,7 +17840,7 @@ mod snippet_tests {
         let store = make_store_with_meta(&[node_a, node_b], dir.path());
 
         // Caller passes the full header with path — should resolve to a.ts only.
-        let full_header = "fn:run (function) \u{2014} a.ts [package: mypkg]";
+        let full_header = "fn:run (function) @ a.ts [package: mypkg]";
         let result = get_snippets_body(&store, full_header, 2000, SnippetMode::Full, None);
 
         assert!(
@@ -17960,7 +17955,7 @@ mod snippet_tests {
         }
         let flat = format_node_line(&seed, "seed", Some(0.80), None, Some("exact-name"), false);
         assert_eq!(
-            flat, "fn:run (function) \u{2014} a.ts:1 [via: seed · exact-name] [score: 0.80]",
+            flat, "fn:run (function) @ a.ts:1 [via: seed · exact-name] [score: 0.80]",
             "flag-off render must match the frozen pre-§14 format byte-for-byte"
         );
     }
@@ -17973,8 +17968,8 @@ mod snippet_tests {
         assert_eq!(t0.len(), 1);
         assert!(matches!(t0[0], SymbolToken::NodeId(42)));
 
-        // Tier 1: full header — contains em-dash (U+2014).
-        let full = "fn:run (function) \u{2014} src/cmd/serve.rs [package: server]";
+        // Tier 1: full header, which contains the " @ " row separator.
+        let full = "fn:run (function) @ src/cmd/serve.rs [package: server]";
         let t1 = parse_symbol_tokens(full);
         assert_eq!(t1.len(), 1);
         assert!(
@@ -17984,7 +17979,8 @@ mod snippet_tests {
             t1[0]
         );
 
-        // Tier 1 — qualified name with double colons.
+        // Tier 1, qualified name with double colons, in the pre-#1116 em-dash
+        // form that rows pasted from older builds still carry.
         let method = "fn:Iterator::next (method) \u{2014} std/iter.rs [package: std]";
         let t1m = parse_symbol_tokens(method);
         assert_eq!(t1m.len(), 1);
@@ -18415,7 +18411,7 @@ mod snippet_tests {
         std::env::remove_var("TRAVSR_NO_RERANK");
         let first = result
             .lines()
-            .find(|l| l.contains(" — "))
+            .find(|l| l.contains(" @ "))
             .unwrap_or_default();
         assert!(first.starts_with("fn:frob_handles_empty "), "{result}");
     }
@@ -18449,7 +18445,7 @@ mod snippet_tests {
         std::env::remove_var("TRAVSR_NO_RERANK");
         let first = result
             .lines()
-            .find(|l| l.contains(" — "))
+            .find(|l| l.contains(" @ "))
             .unwrap_or_default();
         assert!(first.starts_with("struct:Frob "), "{result}");
     }
@@ -22468,7 +22464,7 @@ mod snippet_tests {
     #[test]
     fn an_echoed_symbol_cannot_start_a_line_of_its_own() {
         let store = travsr_store::SqliteStore::open_in_memory().unwrap();
-        let forged = "zzz']\n[call] fn:evil (function) \u{2014} src/a.rs:1";
+        let forged = "zzz']\n[call] fn:evil (function) @ src/a.rs:1";
         for out in [
             get_callers(&store, forged, None),
             find_references(&store, forged, None),

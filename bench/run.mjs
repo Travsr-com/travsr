@@ -110,8 +110,8 @@ function parseNodes(text) {
   for (const line of strip(text).split("\n")) {
     const sec = /^##\s+(exact|semantic|relevant)\b/.exec(line);
     if (sec) { section = sec[1]; continue; }
-    if (!line.includes(" — ")) continue;
-    const m = /^(\S+)\s+\(([^)]+)\)\s+—\s+(.+?)(?:\s+\[|$)/.exec(line);
+    if (!line.includes(" @ ") && !line.includes(" \u2014 ")) continue;
+    const m = /^(\S+)\s+\(([^)]+)\)\s+[@\u2014]\s+(.+?)(?:\s+\[|$)/.exec(line);
     if (!m) continue;
     out.push({ sig: m[1], kind: m[2], path: m[3].replace(/:\d+$/, ""), matchSource: section });
   }

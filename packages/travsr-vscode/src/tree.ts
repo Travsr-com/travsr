@@ -191,7 +191,7 @@ export class TravsrTreeDataProvider
         // PROTOCOL, not prose: `get_callers` and friends print
         // `<sig> (<kind>) — <path>` and this splits on that exact
         // separator, so a punctuation sweep that reaches it breaks it.
-        const m = /^(\[[^\]]+\])\s+(\S+)(?:\s+\([^)]+\))?\s+—\s+(.+)$/.exec(
+        const m = /^(\[[^\]]+\])\s+(\S+)(?:\s+\([^)]+\))?\s+[@\u2014]\s+(.+)$/.exec(
           line
         );
         if (m) {

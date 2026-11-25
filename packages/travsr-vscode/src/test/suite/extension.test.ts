@@ -14,12 +14,12 @@ suite("parseEnvelope returns result rows only", () => {
     // Real get_callers output while semantic analysis is behind.
     const raw =
       "<travsr-data>\n" +
-      "[call] fn:blastCommand (function) — src/codelens.ts:67 ~\n" +
+      "[call] fn:blastCommand (function) @ src/codelens.ts:67 ~\n" +
       "~ = matched by name, not resolved by type\n" +
       "</travsr-data>\n" +
       "[note: call-graph index incomplete; call edges may be missing.]";
     assert.deepStrictEqual(parseEnvelope(raw), [
-      "[call] fn:blastCommand (function) — src/codelens.ts:67 ~",
+      "[call] fn:blastCommand (function) @ src/codelens.ts:67 ~",
     ]);
   });
 
@@ -164,7 +164,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
   test("renders caller lines and blast radius in hover card", async () => {
     const mcp = makeMcp({
       get_callers:
-        "[call] fn:bar (function) — src/bar.ts\n[structural] class:Foo (class) — src/foo.ts",
+        "[call] fn:bar (function) @ src/bar.ts\n[structural] class:Foo (class) @ src/foo.ts",
       get_blast_radius: "src/a.ts\nsrc/b.ts\nsrc/c.ts",
     });
     const provider = new CallersHoverProvider(mcp);
@@ -190,7 +190,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
   test("hover shows '… and N more' when callers exceed 5", async () => {
     const callerLines = Array.from(
       { length: 8 },
-      (_, i) => `[call] fn:fn${i} (function) — src/f${i}.ts`
+      (_, i) => `[call] fn:fn${i} (function) @ src/f${i}.ts`
     ).join("\n");
     const mcp = makeMcp({
       get_callers: callerLines,
@@ -222,7 +222,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
     let callCount = 0;
     const mcp: import("../../mcp").McpClient = {
       callTool: async (name: string) => {
-        if (name === "get_callers") { callCount++; return `[call] fn:caller${callCount} (function) — src/c.ts`; }
+        if (name === "get_callers") { callCount++; return `[call] fn:caller${callCount} (function) @ src/c.ts`; }
         return "";
       },
       isConnected: () => true,
@@ -246,7 +246,7 @@ suite("VSCODE-203: CallersHoverProvider", () => {
     const mcp: import("../../mcp").McpClient = {
       callTool: async (name: string) => {
         if (name === "get_blast_radius") { blastCallCount++; return "src/a.ts\n"; }
-        return `[call] fn:fn${blastCallCount} (function) — src/x.ts`;
+        return `[call] fn:fn${blastCallCount} (function) @ src/x.ts`;
       },
       isConnected: () => true,
       dispose: () => undefined,

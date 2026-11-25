@@ -72,7 +72,7 @@ suite("VSCODE-247: parseSynonymList", () => {
 
 suite("VSCODE-247: parseExecutionPath", () => {
   test("builds chained synthetic graph from prose lines", () => {
-    const raw = "fn:a (function) — src/a.ts\nfn:b (function) — src/b.ts\nfn:c (function) — src/c.ts";
+    const raw = "fn:a (function) @ src/a.ts\nfn:b (function) @ src/b.ts\nfn:c (function) @ src/c.ts";
     const data = parseExecutionPath(raw);
     assert.strictEqual(data.nodes.length, 3);
     assert.strictEqual(data.edges.length, 2, "n nodes → n-1 chained edges");
@@ -91,11 +91,11 @@ suite("VSCODE-247: parseExecutionPath", () => {
     const raw =
       "<travsr-data>\n" +
       "path (1 step, source to sink):\n" +
-      "fn:a (function) — src/a.ts\n" +
-      "fn:b (function) — src/b.ts\n" +
+      "fn:a (function) @ src/a.ts\n" +
+      "fn:b (function) @ src/b.ts\n" +
       "\n" +
       "nearby context (1 node, within the corridor around that path, NOT on it):\n" +
-      "fn:c (function) — src/c.ts\n" +
+      "fn:c (function) @ src/c.ts\n" +
       "</travsr-data>\n" +
       "[note: call-graph index incomplete; call edges may be missing.]";
     const data = parseExecutionPath(raw);

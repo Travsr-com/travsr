@@ -103,7 +103,7 @@ fn ambiguous_repo(n: usize) -> tempfile::TempDir {
 fn definition_lines(stderr: &str) -> usize {
     stderr
         .lines()
-        .filter(|l| l.contains("fn:processPayment (function) \u{2014}"))
+        .filter(|l| l.contains("fn:processPayment (function) @"))
         .count()
 }
 
@@ -129,8 +129,8 @@ fn test_graph_cli_ambiguous_2_to_20() {
         !stderr.contains("exact signatures listed below"),
         "must not offer the useless exact-signature hatch for identical sigs: {stderr}"
     );
-    assert!(stderr.contains("fn:processPayment (function) \u{2014} file_a.ts:1"));
-    assert!(stderr.contains("fn:processPayment (function) \u{2014} file_b.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) @ file_a.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) @ file_b.ts:1"));
     assert!(stderr.contains("ambiguous symbol query"));
 }
 
@@ -409,8 +409,8 @@ fn test_graph_cli_still_ambiguous_path() {
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains("'processPayment' is ambiguous, 2 definitions."));
     assert!(stderr.contains("share an identical signature, so only the path distinguishes them"));
-    assert!(stderr.contains("fn:processPayment (function) \u{2014} subdir1/file.ts:1"));
-    assert!(stderr.contains("fn:processPayment (function) \u{2014} subdir2/file.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) @ subdir1/file.ts:1"));
+    assert!(stderr.contains("fn:processPayment (function) @ subdir2/file.ts:1"));
 }
 
 /// #757: a struct and its own impl block live in ONE file, so `--path` cannot
