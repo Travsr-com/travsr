@@ -113,6 +113,11 @@ enum Command {
             value_enum
         )]
         guard: Option<guard::GuardMode>,
+        /// Index this directory instead of the current one, as if run from
+        /// there. With --json, the summary's `repo` is the key to pass as
+        /// `repo` to MCP tools later.
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
     },
     /// Detect AI coding tools and wire them to the Travsr MCP server + rules.
     Connect {
@@ -928,15 +933,22 @@ async fn run(cli: Cli) -> Result<()> {
             allow_unsandboxed_lsif,
             no_connect,
             guard,
-        } => init::run(
-            quiet,
-            json,
-            jobs,
-            force,
-            allow_unsandboxed_lsif,
-            no_connect,
-            guard,
-        )?,
+            path,
+        } => {
+            if let Some(dir) = path {
+                std::env::set_current_dir(&dir)
+                    .with_context(|| format!("cannot index --path {}", dir.display()))?;
+            }
+            init::run(
+                quiet,
+                json,
+                jobs,
+                force,
+                allow_unsandboxed_lsif,
+                no_connect,
+                guard,
+            )?
+        }
         // Before anything that prints: stdout is the hook's decision channel,
         // the same way `travsr mcp --stdio`'s is the protocol channel.
         Command::Guard { explain } => guard::run(explain)?,
