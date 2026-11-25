@@ -32,7 +32,7 @@ struct RepoTarget {
 /// Returned by [`resolve_single_repo`] for both "no such repo" and "repo
 /// registered but its db is missing/stale", kept identical so the tool
 /// cannot be used to probe which names exist in the registry.
-const UNKNOWN_REPO_ERR: &str =
+pub(crate) const UNKNOWN_REPO_ERR: &str =
     "unknown repo, supply a valid `repo` name (run repos_list to discover names)";
 const AMBIGUOUS_REPO_ERR: &str =
     "ambiguous: multiple repos registered, supply `repo` (run repos_list to discover names)";
@@ -289,6 +289,12 @@ fn json_response(payload: &serde_json::Value) -> String {
 
 fn error_payload(reason: &str) -> serde_json::Value {
     serde_json::json!({ "error": reason })
+}
+
+/// #1111: the answer every global tool gives for a `repo` it cannot resolve,
+/// the same envelope these tools already returned.
+pub(crate) fn repo_error_text(reason: &str) -> String {
+    json_response(&error_payload(reason))
 }
 
 // ── #636: phase_b_warnings decoding (shared by get_index_status) ──────────────

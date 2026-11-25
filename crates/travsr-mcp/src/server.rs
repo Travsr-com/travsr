@@ -1155,7 +1155,8 @@ fn handle_request_global(req: RpcRequest) -> Option<String> {
 /// Only live entries count, and entries sharing one graph.db (a legacy
 /// bare-name key next to its path key) count once. A name matching several
 /// distinct checkouts is an error listing them (#1110), never a silent pick.
-/// No match passes `repo` through, so each tool keeps its "unknown repo" answer.
+/// No match is the one "unknown repo" error for every tool (#1111): left to the
+/// tools, most answered an empty result or `nodes: 0`, which reads as a fact.
 pub(crate) fn resolve_repo_arg(
     repos: &HashMap<String, PathBuf>,
     repo: Option<&str>,
@@ -1177,7 +1178,7 @@ pub(crate) fn resolve_repo_arg(
     matches.sort();
     matches.dedup_by(|a, b| a.0 == b.0);
     match matches.as_slice() {
-        [] => Ok(Some(name.to_owned())),
+        [] => Err(crate::observability::UNKNOWN_REPO_ERR.to_owned()),
         [(_, key)] => Ok(Some((*key).clone())),
         many => {
             let roots: Vec<String> = many
@@ -1196,6 +1197,13 @@ pub(crate) fn resolve_repo_arg(
     }
 }
 
+/// The `tools/call` result for a `repo` that [`resolve_repo_arg`] rejected.
+pub(crate) fn repo_error_result(msg: &str) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": crate::observability::repo_error_text(msg) }]
+    })
+}
+
 fn handle_tool_call_global(
     repos: &HashMap<String, PathBuf>,
     id: serde_json::Value,
@@ -1211,7 +1219,7 @@ fn handle_tool_call_global(
     };
     let repo_arg = match resolve_repo_arg(repos, args["repo"].as_str()) {
         Ok(resolved) => resolved,
-        Err(msg) => return ok_response(id, invalid_args_result(&msg)),
+        Err(msg) => return ok_response(id, repo_error_result(&msg)),
     };
     let repo_arg = repo_arg.as_deref();
 
@@ -1737,13 +1745,46 @@ mod tests {
         assert_eq!(resolve_repo_arg(&repos, Some("demo")), Ok(Some(a.clone())));
         assert_eq!(
             resolve_repo_arg(&repos, Some("nope")),
-            Ok(Some("nope".to_string()))
+            Err(crate::observability::UNKNOWN_REPO_ERR.to_string())
         );
 
         repos.insert(b.clone(), live_db("b/demo"));
         assert_eq!(resolve_repo_arg(&repos, Some(&a)), Ok(Some(a.clone())));
         let err = resolve_repo_arg(&repos, Some("demo")).unwrap_err();
         assert!(err.contains(&a) && err.contains(&b), "got: {err}");
+    }
+
+    /// #1111: an unknown `repo` got an empty envelope from most tools,
+    /// "No symbols matching" from search_symbol and `nodes: 0` from
+    /// get_graph_stats, all of which read as facts. Every tool now gives the
+    /// "unknown repo" payload get_index_status already gave.
+    #[test]
+    fn unknown_repo_is_one_answer_for_every_global_tool() {
+        let repos = HashMap::new();
+        let expected =
+            crate::observability::repo_error_text(crate::observability::UNKNOWN_REPO_ERR);
+        for (name, args) in [
+            ("get_dependencies", serde_json::json!({ "file": "a.rs" })),
+            ("search_symbol", serde_json::json!({ "name": "x" })),
+            ("get_graph_stats", serde_json::json!({})),
+            ("get_graph_json", serde_json::json!({ "query": "x" })),
+            ("get_context", serde_json::json!({ "query": "x" })),
+            ("get_index_status", serde_json::json!({})),
+        ] {
+            let mut args = args;
+            args["repo"] = serde_json::json!("nope");
+            let resp = handle_tool_call_global(
+                &repos,
+                serde_json::json!(1),
+                serde_json::json!({ "name": name, "arguments": args }),
+            );
+            let resp: serde_json::Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(
+                resp["result"]["content"][0]["text"].as_str(),
+                Some(expected.as_str()),
+                "{name}: {resp}"
+            );
+        }
     }
 
     /// #1049: the rebuilt-binary comparator. A newer mtime or a changed length

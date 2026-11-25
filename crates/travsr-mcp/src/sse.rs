@@ -818,7 +818,7 @@ fn dispatch_tool_call(
             };
             let repo_arg = match crate::server::resolve_repo_arg(repos, args["repo"].as_str()) {
                 Ok(resolved) => resolved,
-                Err(msg) => return jsonrpc_ok(rpc_id, crate::server::invalid_args_result(&msg)),
+                Err(msg) => return jsonrpc_ok(rpc_id, crate::server::repo_error_result(&msg)),
             };
             let repo_arg = repo_arg.as_deref();
 
