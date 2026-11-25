@@ -220,7 +220,12 @@ pub fn register(repo_name: &str, db_path: &Path) -> anyhow::Result<()> {
     // prefixed key would keep *both* the old prefixed key and the new clean key
     // and show up twice in `repos`. Removing by normalized form and re-inserting
     // collapses the pair to a single clean entry on the next `init`.
-    repos.retain(|k, _| strip_verbatim_prefix(k).as_ref() != repo_name.as_str());
+    //
+    // #1110: same for a legacy key (an older build keyed by bare repo name)
+    // that points at this same graph.db, or the repo is listed twice.
+    repos.retain(|k, entry| {
+        strip_verbatim_prefix(k).as_ref() != repo_name.as_str() && entry.db_path != db_path
+    });
     repos.insert(
         repo_name,
         RepoEntry {
@@ -681,6 +686,23 @@ mod tests {
             assert_eq!(repos.len(), 1, "prefixed + clean must collapse to one");
             assert!(repos.contains_key(r"D:\proj"));
             assert!(!repos.contains_key(r"\\?\D:\proj"));
+        });
+    }
+
+    #[test]
+    fn register_migrates_a_legacy_bare_name_key_for_the_same_db() {
+        // #1110: an older build keyed `axios` by bare name; the path-keyed
+        // registration of the same graph.db must replace it, not list it twice.
+        with_temp_home(|home| {
+            let db = home.join("axios/.travsr/graph.db");
+            let other = home.join("demo/axios/.travsr/graph.db");
+            register("axios", &db).unwrap();
+            register("/elsewhere/demo/axios", &other).unwrap();
+            register("/home/u/axios", &db).unwrap();
+            let repos = all_repos().unwrap();
+            assert_eq!(repos.len(), 2, "got: {repos:?}");
+            assert_eq!(repos.get("/home/u/axios"), Some(&db));
+            assert_eq!(repos.get("/elsewhere/demo/axios"), Some(&other));
         });
     }
 
