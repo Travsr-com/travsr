@@ -232,6 +232,9 @@ pub fn run(
             "elapsed_s": elapsed.as_secs(),
             "phase_b": phase_b,
             "db_path": db_path.display().to_string(),
+            // The registry key `init_repo` writes, so a caller that used
+            // `--path` knows what to pass as `repo` later (#1133).
+            "repo": repo_root.to_string_lossy(),
             // UX-023: expose the ghost sweep in JSON too, not just the human summary.
             "ghosts_pruned": stats.ghosts_pruned,
             "ghost_prune_aborted": stats.ghost_prune_aborted,

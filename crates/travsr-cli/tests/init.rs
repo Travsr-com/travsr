@@ -888,6 +888,43 @@ fn init_json_is_one_object_and_never_reads_stdin() {
     assert_eq!(v["next"], "Ready. Nothing changed since the last run.");
 }
 
+// #1133: index a repo from another directory, and name the registry key.
+#[test]
+fn init_path_indexes_that_dir_and_reports_repo() {
+    let tmp = ts_repo();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let out = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .env("TRAVSR_DISABLE_REGISTRY", "1")
+        .env("CI", "1")
+        .env("TRAVSR_SKIP_DOWNLOAD", "1")
+        .env("TRAVSR_LANG_TOML", tmp.path().join("lang.toml"))
+        .current_dir(elsewhere.path())
+        .args(["init", "--json", "--path"])
+        .arg(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    assert_eq!(v["repo"], root.to_string_lossy().as_ref());
+    assert!(root.join(".travsr/graph.db").is_file());
+    assert!(!elsewhere.path().join(".travsr").exists());
+
+    let missing = StdCommand::new(assert_cmd::cargo::cargo_bin("travsr"))
+        .current_dir(elsewhere.path())
+        .args(["init", "--path"])
+        .arg(elsewhere.path().join("missing"))
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot index --path"));
+}
+
 /// Stops the repo's daemon when dropped, so a failed assert never leaks one.
 struct StopDaemon<'a>(&'a std::path::Path);
 impl Drop for StopDaemon<'_> {

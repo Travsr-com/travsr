@@ -303,6 +303,7 @@ In global mode, tools that accept a `file` or `symbol` argument also accept an o
 ```
 travsr init                          Index the repo, install git hook, register globally
 travsr init --no-connect             Index the repo without wiring detected AI tools to Travsr
+travsr init --path <dir> --json      Index another directory; the summary's `repo` is its registry key
 travsr connect                       Detect installed AI coding tools and wire each to the Travsr MCP server
 travsr connect --print               Show what connect would write, without touching the filesystem
 travsr connect --remove              Undo a previous connect run
