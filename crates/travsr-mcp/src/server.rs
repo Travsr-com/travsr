@@ -1865,7 +1865,9 @@ mod tests {
         store.set_meta("last_commit", "abc1234").unwrap();
         drop(store);
         let note = index_source_note(&db).unwrap();
-        let root = tmp.path().to_string_lossy();
+        // The root goes through the same redaction as every logged path, so a
+        // temp dir under the home directory (Windows CI) reads as `~\...`.
+        let root = crate::sanitize::sanitize_log_value(&tmp.path().to_string_lossy(), 512);
         assert!(note.contains(&format!("answered from {root} at commit abc1234")));
     }
 
