@@ -764,7 +764,7 @@ pub fn ask_query_with_filter(
             let is_exact = matches!(
                 strongest_source.get(&n.id),
                 Some(crate::seed::SeedSource::Exact)
-            );
+            ) && crate::seed::names_a_query_term(&n, &seed_set.terms);
             let score = crate::seed::display_score(
                 n.id,
                 score_map.get(&n.id).copied().unwrap_or(0.0),

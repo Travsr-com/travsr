@@ -9243,7 +9243,7 @@ fn get_context_body(
         let is_exact = matches!(
             seed_source_map.get(&id),
             Some(crate::seed::SeedSource::Exact)
-        );
+        ) && crate::seed::names_a_query_term(n, &seed_set.terms);
         // #479: test classification overrides seed-provenance bucketing.
         let ms = if test_node_ids.contains(&id) {
             crate::seed::MatchSource::Tests
