@@ -773,6 +773,24 @@ async fn rpc_handler(
     StatusCode::OK.into_response()
 }
 
+/// The global tools SSE serves, and so advertises in `tools/list` (#1134).
+/// RFC-007 makes SSE a transport shim over the same tools. Left out:
+/// `repos_list` and `get_daemon_logs` read the host's own registry and logs,
+/// not the tenant's, and the registry-mutating tools are stdio only.
+const SSE_TOOLS: &[&str] = &[
+    "get_dependencies",
+    "get_callers",
+    "find_references",
+    "find_pattern",
+    "get_blast_radius",
+    "get_lang_status",
+    "search_symbol",
+    "get_repo_map",
+    "get_execution_path",
+    "get_context",
+    "get_snippets",
+];
+
 /// Dispatch a JSON-RPC 2.0 tool call and return the response string.
 ///
 /// Mirrors the dispatch logic from server.rs global mode without touching that file.
@@ -800,6 +818,13 @@ fn dispatch_tool_call(
                 "instructions": crate::INSTRUCTIONS
             }),
         ),
+        "tools/list" => {
+            let mut list = crate::server::tools_list_global();
+            if let Some(tools) = list["tools"].as_array_mut() {
+                tools.retain(|t| t["name"].as_str().is_some_and(|n| SSE_TOOLS.contains(&n)));
+            }
+            jsonrpc_ok(rpc_id, list)
+        }
         "tools/call" => {
             let tool_name = match params["name"].as_str() {
                 Some(n) => n,
@@ -858,6 +883,39 @@ fn dispatch_tool_call(
                     args["exact"].as_bool().unwrap_or(false),
                 ),
                 "get_repo_map" => tools::get_repo_map_global(repos, repo_arg),
+                "find_references" => tools::find_references_global(
+                    repos,
+                    args["symbol"].as_str().unwrap_or(""),
+                    args["path"].as_str().filter(|s| !s.is_empty()),
+                    repo_arg,
+                ),
+                "find_pattern" => tools::find_pattern_global(
+                    repos,
+                    args["pattern"].as_str().unwrap_or(""),
+                    args["scope"].as_str().filter(|s| !s.is_empty()),
+                    repo_arg,
+                    args["fixed"].as_bool().unwrap_or(false),
+                    args["context"].as_u64().unwrap_or(0) as u32,
+                ),
+                "get_context" => tools::get_context_global(
+                    repos,
+                    args["query"].as_str().unwrap_or(""),
+                    args["token_budget"].as_u64().unwrap_or(4096) as usize,
+                    repo_arg,
+                    args["include_snippets"].as_bool().unwrap_or(false),
+                    args["snippet_budget"].as_u64().map(|v| v as usize),
+                ),
+                "get_snippets" => tools::get_snippets_global(
+                    repos,
+                    args["symbols"].as_str().unwrap_or(""),
+                    args["token_budget"]
+                        .as_u64()
+                        .unwrap_or(tools::SNIPPET_DEFAULT_BUDGET as u64)
+                        as usize,
+                    repo_arg,
+                    tools::SnippetMode::from_arg(args["mode"].as_str().unwrap_or("auto")),
+                    args["path"].as_str().filter(|s| !s.is_empty()),
+                ),
                 // TODO(RFC-008 / #197): replace OpenFilter with per-session RbacFilter
                 // once token-scoped RBAC is implemented for the SSE path.
                 "get_execution_path" => tools::get_execution_path_global(
@@ -1046,5 +1104,41 @@ mod tests {
         );
         drop(guard_b);
         assert!(map.is_empty());
+    }
+
+    /// #1134: SSE answered `tools/list` with "method not found" and served 7
+    /// tools. It now lists exactly `SSE_TOOLS`, and every listed tool reaches
+    /// its handler instead of "unknown tool".
+    #[test]
+    fn tools_list_matches_the_tools_sse_dispatches() {
+        let repos = HashMap::new();
+        let list: serde_json::Value = serde_json::from_str(&dispatch_tool_call(
+            &json!({ "jsonrpc": "2.0", "id": "1", "method": "tools/list" }),
+            "1",
+            &repos,
+        ))
+        .unwrap();
+        let mut listed: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .expect("tools/list must return a tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        listed.sort_unstable();
+        let mut want = SSE_TOOLS.to_vec();
+        want.sort_unstable();
+        assert_eq!(listed, want);
+
+        for name in SSE_TOOLS {
+            let resp = dispatch_tool_call(
+                &json!({
+                    "jsonrpc": "2.0", "id": "2", "method": "tools/call",
+                    "params": { "name": name, "arguments": {} }
+                }),
+                "2",
+                &repos,
+            );
+            assert!(!resp.contains("unknown tool"), "{name}: {resp}");
+        }
     }
 }
