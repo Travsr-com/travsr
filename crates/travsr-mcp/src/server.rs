@@ -1149,6 +1149,53 @@ fn handle_request_global(req: RpcRequest) -> Option<String> {
     Some(resp)
 }
 
+/// Map the `repo` argument to the registry key every `*_global` tool looks up
+/// by exact match (#1117). Accepts the key itself, the verbatim-stripped key,
+/// or the basename `repos_list` prints, like `registry::unregister_resolving`.
+/// Only live entries count, and entries sharing one graph.db (a legacy
+/// bare-name key next to its path key) count once. A name matching several
+/// distinct checkouts is an error listing them (#1110), never a silent pick.
+/// No match passes `repo` through, so each tool keeps its "unknown repo" answer.
+pub(crate) fn resolve_repo_arg(
+    repos: &HashMap<String, PathBuf>,
+    repo: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(name) = repo else {
+        return Ok(None);
+    };
+    let mut matches: Vec<(&PathBuf, &String)> = repos
+        .iter()
+        .filter(|(k, db)| {
+            (k.as_str() == name
+                || registry::strip_verbatim_prefix(k) == name
+                || registry::display_name(k) == name)
+                && db.exists()
+        })
+        .map(|(k, db)| (db, k))
+        .collect();
+    // Sorted so the dedup keeps the path key ('/' sorts before letters).
+    matches.sort();
+    matches.dedup_by(|a, b| a.0 == b.0);
+    match matches.as_slice() {
+        [] => Ok(Some(name.to_owned())),
+        [(_, key)] => Ok(Some((*key).clone())),
+        many => {
+            let roots: Vec<String> = many
+                .iter()
+                .map(|(db, _)| {
+                    let root = db.parent().and_then(std::path::Path::parent).unwrap_or(db);
+                    registry::strip_verbatim_prefix(&root.to_string_lossy()).into_owned()
+                })
+                .collect();
+            Err(format!(
+                "ambiguous repo '{name}': {} registered repos match, pass one of these paths as `repo`: {}",
+                roots.len(),
+                roots.join(", ")
+            ))
+        }
+    }
+}
+
 fn handle_tool_call_global(
     repos: &HashMap<String, PathBuf>,
     id: serde_json::Value,
@@ -1162,7 +1209,11 @@ fn handle_tool_call_global(
         Ok(args) => args,
         Err(msg) => return ok_response(id, invalid_args_result(&msg)),
     };
-    let repo_arg = args["repo"].as_str();
+    let repo_arg = match resolve_repo_arg(repos, args["repo"].as_str()) {
+        Ok(resolved) => resolved,
+        Err(msg) => return ok_response(id, invalid_args_result(&msg)),
+    };
+    let repo_arg = repo_arg.as_deref();
 
     // `repo` is what makes a shared global log readable: one process serves
     // every registered repo, so without it a line cannot be attributed. Carried
@@ -1660,6 +1711,40 @@ fn handle_prompts_get(id: serde_json::Value, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1117 / #1110: the basename `repos_list` prints resolves to the registry
+    /// key; a legacy bare-name key on the same db is not a second repo; a name
+    /// shared by distinct checkouts is an error listing both roots.
+    #[test]
+    fn resolve_repo_arg_accepts_basename_and_reports_ambiguity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live_db = |rel: &str| {
+            let db = tmp.path().join(rel).join(".travsr/graph.db");
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            std::fs::write(&db, b"x").unwrap();
+            db
+        };
+        let a = tmp.path().join("a/demo").to_string_lossy().into_owned();
+        let b = tmp.path().join("b/demo").to_string_lossy().into_owned();
+        let one = tmp.path().join("solo").to_string_lossy().into_owned();
+        let mut repos = HashMap::new();
+        repos.insert(a.clone(), live_db("a/demo"));
+        repos.insert("demo".to_string(), live_db("a/demo"));
+        repos.insert(one.clone(), live_db("solo"));
+
+        assert_eq!(resolve_repo_arg(&repos, None), Ok(None));
+        assert_eq!(resolve_repo_arg(&repos, Some("solo")), Ok(Some(one)));
+        assert_eq!(resolve_repo_arg(&repos, Some("demo")), Ok(Some(a.clone())));
+        assert_eq!(
+            resolve_repo_arg(&repos, Some("nope")),
+            Ok(Some("nope".to_string()))
+        );
+
+        repos.insert(b.clone(), live_db("b/demo"));
+        assert_eq!(resolve_repo_arg(&repos, Some(&a)), Ok(Some(a.clone())));
+        let err = resolve_repo_arg(&repos, Some("demo")).unwrap_err();
+        assert!(err.contains(&a) && err.contains(&b), "got: {err}");
+    }
 
     /// #1049: the rebuilt-binary comparator. A newer mtime or a changed length
     /// is "rebuilt"; an unchanged file, or an older on-disk mtime (clock skew)
