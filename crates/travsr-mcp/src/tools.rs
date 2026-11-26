@@ -9243,10 +9243,15 @@ fn get_context_body(
         let is_exact = matches!(
             seed_source_map.get(&id),
             Some(crate::seed::SeedSource::Exact)
-        );
+        ) && crate::seed::names_a_query_term(n, &seed_set.terms);
         // #479: test classification overrides seed-provenance bucketing.
         let ms = if test_node_ids.contains(&id) {
             crate::seed::MatchSource::Tests
+        } else if !is_exact && crate::seed::is_member_of_named_type(n, &seed_set.terms) {
+            // #1114: a member of the named type leads the related section,
+            // ordered by score among members (display scores are at most 1).
+            let score = display_score_map.get(&id).copied().unwrap_or(0.0);
+            return (crate::seed::MatchSource::Semantic, 1.0 + score);
         } else {
             crate::seed::match_source(primary_seed_ids.contains(&id), is_exact)
         };

@@ -738,6 +738,43 @@ pub(crate) fn is_named_by(n: &CoreNode, name: &str) -> bool {
         && travsr_core::ident::leaf_of(&n.vname.signature) == name
 }
 
+/// #1114: whether an exact-anchored node is shown as an exact match. When the
+/// query names a symbol by a compound identifier (`ModelCallRecord`), a node
+/// anchored only by a plain query word that is one segment of its name
+/// (`fields` in `ModelCallFields.cost`) is not one: it must contain a compound
+/// query token, or have a whole identifier equal to a query token. A query
+/// with no compound token keeps every anchor exact, since a segment match is
+/// then all the lexical evidence a conceptual query has.
+pub(crate) fn names_a_query_term(n: &CoreNode, terms: &[ResolvedTerm]) -> bool {
+    let compound = |t: &ResolvedTerm| travsr_core::ident::segments(&t.token).len() >= 2;
+    if !terms.iter().any(compound) {
+        return true;
+    }
+    let sig = &n.vname.signature;
+    terms.iter().any(|t| {
+        (compound(t) && travsr_core::ident::contains_token(&t.token, sig))
+            || sig
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|ident| t.token.eq_ignore_ascii_case(ident))
+    })
+}
+
+/// #1114: whether `n` is a member (`field:T.x`, `variant:T.X`, `method:T.m`) of
+/// a type the query names by a compound identifier as typed (`ModelCallRecord`).
+/// Such members lead the related section, so "what fields does T have" lists
+/// T's fields together instead of scattering them below unrelated symbols.
+pub(crate) fn is_member_of_named_type(n: &CoreNode, terms: &[ResolvedTerm]) -> bool {
+    let sig = &n.vname.signature;
+    let body = sig.split_once(':').map_or(sig.as_str(), |(_, r)| r);
+    let Some((owner, _)) = body.rsplit_once('.') else {
+        return false;
+    };
+    let owner = owner.rsplit('.').next().unwrap_or(owner);
+    terms
+        .iter()
+        .any(|t| t.token == owner && travsr_core::ident::segments(&t.token).len() >= 2)
+}
+
 /// Precedence of a [`SeedSource`] when a node is reached by several seeds. Exact
 /// (literal-name / FTS) is the most trustworthy, then embedding-KNN, then
 /// fuzzy-lexical. The strongest source decides both the node's displayed
@@ -3944,6 +3981,64 @@ mod tests {
             top_node: node,
             anchors_emitted: 0,
         }
+    }
+
+    /// #1114: a member is owned by the type the query names by a compound
+    /// identifier; a type named by a plain word does not pull in members.
+    #[test]
+    fn is_member_of_named_type_matches_the_owner_only() {
+        let terms = [
+            rt("fields", 16, 0.69, None),
+            rt("ModelCallRecord", 101, 0.5, None),
+        ];
+        let n = |sig: &str| anchor_node("field", sig, 1, 1);
+        assert!(is_member_of_named_type(
+            &n("field:ModelCallRecord.model"),
+            &terms
+        ));
+        assert!(is_member_of_named_type(
+            &n("method:a.ModelCallRecord.new"),
+            &terms
+        ));
+        assert!(!is_member_of_named_type(
+            &n("field:ModelCallFields.cost"),
+            &terms
+        ));
+        assert!(!is_member_of_named_type(
+            &n("struct:ModelCallRecord"),
+            &terms
+        ));
+        let plain = [rt("record", 9, 0.7, None)];
+        assert!(!is_member_of_named_type(&n("field:record.model"), &plain));
+    }
+
+    /// #1114: `what fields does ModelCallRecord have` must not show
+    /// `ModelCallFields.cost` as an exact match; with no compound token in the
+    /// query, a segment match stays exact.
+    #[test]
+    fn names_a_query_term_drops_segment_matches_only_beside_a_named_symbol() {
+        let terms = [
+            rt("fields", 16, 0.69, None),
+            rt("ModelCallRecord", 101, 0.5, None),
+        ];
+        let n = |sig: &str| anchor_node("field", sig, 1, 1);
+        assert!(!names_a_query_term(
+            &n("field:ModelCallFields.cost"),
+            &terms
+        ));
+        assert!(names_a_query_term(&n("struct:ModelCallRecord"), &terms));
+        assert!(names_a_query_term(
+            &n("use:kestrel_types::ModelCallRecord"),
+            &terms
+        ));
+        assert!(names_a_query_term(
+            &n("field:ModelCallRecord.model"),
+            &terms
+        ));
+        assert!(names_a_query_term(&n("struct:Fields"), &terms));
+        let plain = [rt("fields", 16, 0.69, None), rt("cost", 9, 0.7, None)];
+        assert!(names_a_query_term(&n("field:ModelCallFields.cost"), &plain));
+        assert!(names_a_query_term(&n("interface:ModelCallFields"), &plain));
     }
 
     #[test]
