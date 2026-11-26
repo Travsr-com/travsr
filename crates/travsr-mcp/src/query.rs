@@ -775,12 +775,17 @@ pub fn ask_query_with_filter(
             );
             // #991: sort key, see the sort below.
             let named = crate::seed::is_named_by(&n, query);
+            // #1114: a member of the named type leads the related section.
+            let member =
+                !named && !is_exact && crate::seed::is_member_of_named_type(&n, &seed_set.terms);
             let order = if named {
                 (0, 0.0)
+            } else if member {
+                (2, score)
             } else if is_primary {
-                (if is_exact { 1 } else { 2 }, score)
+                (if is_exact { 1 } else { 3 }, score)
             } else {
-                (3, 0.0)
+                (4, 0.0)
             };
             let signature = display_label(&n).into_owned();
             let row = AskRow {
@@ -792,6 +797,9 @@ pub fn ask_query_with_filter(
                     }
                     if test_node_ids.contains(&n.id) {
                         return crate::seed::MatchSource::Tests.label().to_string();
+                    }
+                    if member {
+                        return crate::seed::MatchSource::Semantic.label().to_string();
                     }
                     crate::seed::match_source(is_primary, is_exact)
                         .label()
@@ -809,7 +817,8 @@ pub fn ask_query_with_filter(
     // a graph hub or a weakly matched seed outranks the seed the query is about.
     // Order instead: a node whose own name is the whole query (a bare-identifier
     // lookup, where the cross-encoder scores a type and its own impl/methods/
-    // imports alike), then exact seeds, then semantic seeds, each seed group by
+    // imports alike), then exact seeds, then members of a type the query names
+    // (#1114), then semantic seeds, each seed group by
     // displayed score (the rerank score when the seed was reranked), then
     // non-seeds. Other test nodes order by their seed provenance; only their label
     // is "tests". The sort is stable, so ties and non-seeds keep knapsack order.
@@ -1999,6 +2008,56 @@ mod tests {
             .find(|r| r.signature == "struct:Breaker")
             .expect("the type is returned");
         assert_eq!(ty_row.match_source.as_deref(), Some("exact"));
+    }
+
+    /// #1114: "what fields does T have" lists T's fields together, right after
+    /// above an unrelated seed that shares a query word, none left as context.
+    #[test]
+    fn ask_ranks_the_named_types_members_together() {
+        let _guard = crate::rerank::RERANK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("TRAVSR_NO_RERANK", "1");
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let ty = node("struct:ModelCallRecord", "struct", "src/event.rs");
+        for f in ["provider", "tokens_in", "cost"] {
+            let field = node(
+                &format!("field:ModelCallRecord.{f}"),
+                "field",
+                "src/event.rs",
+            );
+            store.put_node(&field).unwrap();
+            store
+                .put_edge(&Edge::new(ty.id, field.id, EdgeKind::DefinesBinding))
+                .unwrap();
+        }
+        store.put_node(&ty).unwrap();
+        store
+            .put_node(&node("fn:merge_fields", "function", "src/merge.rs"))
+            .unwrap();
+        let payload = ask_query(&store, "what fields does ModelCallRecord have", None).unwrap();
+        std::env::remove_var("TRAVSR_NO_RERANK");
+        let rows: Vec<_> = payload
+            .rows
+            .iter()
+            .map(|r| (r.signature.as_str(), r.match_source.as_deref()))
+            .collect();
+        let unrelated = rows
+            .iter()
+            .position(|(s, _)| *s == "fn:merge_fields")
+            .expect("the unrelated seed is returned");
+        let fields: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, _))| s.starts_with("field:ModelCallRecord."))
+            .collect();
+        assert_eq!(fields.len(), 3, "{rows:?}");
+        assert!(
+            fields
+                .iter()
+                .all(|(i, (_, l))| *i < unrelated && *l != Some("relevant")),
+            "{rows:?}"
+        );
     }
 
     /// Only the definition the query names is promoted: not a constant that

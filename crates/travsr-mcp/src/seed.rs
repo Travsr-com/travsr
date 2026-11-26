@@ -759,6 +759,22 @@ pub(crate) fn names_a_query_term(n: &CoreNode, terms: &[ResolvedTerm]) -> bool {
     })
 }
 
+/// #1114: whether `n` is a member (`field:T.x`, `variant:T.X`, `method:T.m`) of
+/// a type the query names by a compound identifier as typed (`ModelCallRecord`).
+/// Such members lead the related section, so "what fields does T have" lists
+/// T's fields together instead of scattering them below unrelated symbols.
+pub(crate) fn is_member_of_named_type(n: &CoreNode, terms: &[ResolvedTerm]) -> bool {
+    let sig = &n.vname.signature;
+    let body = sig.split_once(':').map_or(sig.as_str(), |(_, r)| r);
+    let Some((owner, _)) = body.rsplit_once('.') else {
+        return false;
+    };
+    let owner = owner.rsplit('.').next().unwrap_or(owner);
+    terms
+        .iter()
+        .any(|t| t.token == owner && travsr_core::ident::segments(&t.token).len() >= 2)
+}
+
 /// Precedence of a [`SeedSource`] when a node is reached by several seeds. Exact
 /// (literal-name / FTS) is the most trustworthy, then embedding-KNN, then
 /// fuzzy-lexical. The strongest source decides both the node's displayed
@@ -3965,6 +3981,35 @@ mod tests {
             top_node: node,
             anchors_emitted: 0,
         }
+    }
+
+    /// #1114: a member is owned by the type the query names by a compound
+    /// identifier; a type named by a plain word does not pull in members.
+    #[test]
+    fn is_member_of_named_type_matches_the_owner_only() {
+        let terms = [
+            rt("fields", 16, 0.69, None),
+            rt("ModelCallRecord", 101, 0.5, None),
+        ];
+        let n = |sig: &str| anchor_node("field", sig, 1, 1);
+        assert!(is_member_of_named_type(
+            &n("field:ModelCallRecord.model"),
+            &terms
+        ));
+        assert!(is_member_of_named_type(
+            &n("method:a.ModelCallRecord.new"),
+            &terms
+        ));
+        assert!(!is_member_of_named_type(
+            &n("field:ModelCallFields.cost"),
+            &terms
+        ));
+        assert!(!is_member_of_named_type(
+            &n("struct:ModelCallRecord"),
+            &terms
+        ));
+        let plain = [rt("record", 9, 0.7, None)];
+        assert!(!is_member_of_named_type(&n("field:record.model"), &plain));
     }
 
     /// #1114: `what fields does ModelCallRecord have` must not show
