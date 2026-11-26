@@ -10975,7 +10975,9 @@ pub fn get_graph_json_global(
 
     let candidates: Vec<(&str, &PathBuf)> = match repo {
         Some(name) => {
-            if let Err(reason) = validate_mcp_arg(name) {
+            // #1145: registry keys are absolute repo roots, which
+            // `validate_mcp_arg` rejects. Same validator as `collect_global`.
+            if let Err(reason) = crate::sanitize::validate_mcp_repo_key_arg(name) {
                 tracing::warn!("get_graph_json_global rejected invalid repo arg: {reason}");
                 return "{}".to_string();
             }
@@ -14741,6 +14743,44 @@ mod tests {
             raw.len(),
             budget
         );
+    }
+    /// #1145: every registry key is an absolute repo root. Naming one in `repo`
+    /// must answer that repo's subgraph, not `{}`.
+    #[test]
+    fn global_subgraph_accepts_absolute_repo_key() {
+        use travsr_core::{Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        {
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            let n = Node::new(
+                VName::new("", "", "src/money.rs", "rust", "struct:Money"),
+                "struct",
+            );
+            store.put_node(&n).unwrap();
+        }
+        let key = dir.path().to_string_lossy().to_string();
+        let repos: HashMap<String, PathBuf> = HashMap::from([(key.clone(), db)]);
+
+        let raw = get_graph_json_global(
+            &repos,
+            Some(&key),
+            &GraphJsonParams {
+                query: "Money",
+                direction: "both",
+                depth: 1,
+                kind_filter: "",
+                provenance: "",
+                token_budget: 0,
+                mode: "",
+                path_prefix: "",
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let nodes = v["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no nodes: {raw}"));
+        assert!(!nodes.is_empty(), "absolute repo key must answer: {raw}");
     }
 
     #[test]
