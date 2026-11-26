@@ -60,6 +60,20 @@ fn print_leg(name: &str, leg: Option<&ExplainLeg>) {
     }
 }
 
+/// #1147: the `exact` leg looks up the whole query as one name, while a seed's
+/// `source exact` means a single query token named it. For a sentence query the
+/// two disagree, so say which one the row measures when they do.
+fn exact_leg_note(report: &ExplainReport) -> Option<&'static str> {
+    let exact_seed = [&report.live, &report.fts_only]
+        .iter()
+        .any(|d| d.source == Some("exact"));
+    let leg_missed = report.legs.as_ref().is_some_and(|l| l.exact.is_none());
+    (exact_seed && leg_missed).then_some(
+        "the exact leg looks up the whole query as one name; \
+         `source exact` below means a query token named it (see query tokens)",
+    )
+}
+
 fn print_disposition(label: &str, d: &ExplainDisposition) {
     println!("  {label}:");
     println!("    confidence:  {}", d.confidence);
@@ -188,6 +202,9 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
         print_leg("trigram", legs.trigram.as_ref());
         print_leg("l2a", legs.l2a.as_ref());
         print_leg("embed", legs.embed.as_ref());
+        if let Some(note) = exact_leg_note(&report) {
+            println!("      note: {note}");
+        }
     }
 
     println!("\ndisposition:");
@@ -200,6 +217,7 @@ pub fn run(query_str: &str, symbol: &str, format: OutputFormat) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use travsr_mcp::query::{ExplainLegMatches, ExplainThresholds};
 
     fn token(token: &str, freq: usize, resolved: bool, anchors: usize) -> ExplainToken {
         ExplainToken {
@@ -234,5 +252,61 @@ mod tests {
     #[test]
     fn an_unresolved_token_has_no_note() {
         assert_eq!(anchor_note(&token("FooNode", 1, false, 0)), None);
+    }
+
+    fn report(source: Option<&'static str>, exact: Option<ExplainLeg>) -> ExplainReport {
+        let d = ExplainDisposition {
+            in_seed_set: source.is_some(),
+            seed_rank: source.map(|_| 0),
+            weight: None,
+            source,
+            rerank_score: None,
+            confidence: "none",
+            n_resolved: 0,
+            coverage: 0.0,
+            coverage_ok: false,
+            exact_anchor_present: false,
+            max_rerank_score: None,
+            anchor_rescued: false,
+        };
+        ExplainReport {
+            query: "how is a RunId created".to_string(),
+            symbol: "struct:RunId".to_string(),
+            node_found: true,
+            target_signature: None,
+            target_path: None,
+            tokens: Vec::new(),
+            thresholds: ExplainThresholds {
+                idf_coverage_min: 0.0,
+                anchor_emit_cut: 0.0,
+                bm25_strong_floor: 0.0,
+                scope_strong_floor: 0.0,
+            },
+            legs: Some(ExplainLegMatches {
+                exact,
+                ..Default::default()
+            }),
+            is_noise: false,
+            oracle_cosine: None,
+            live: d.clone(),
+            fts_only: d,
+        }
+    }
+
+    /// #1147: an exact-sourced seed the whole-query exact leg missed.
+    #[test]
+    fn an_exact_seed_the_exact_leg_missed_has_a_note() {
+        assert!(exact_leg_note(&report(Some("exact"), None)).is_some());
+    }
+
+    #[test]
+    fn no_note_when_the_exact_leg_matched_or_the_seed_is_not_exact() {
+        let hit = ExplainLeg {
+            rank: 0,
+            raw_score: 1.0,
+        };
+        assert_eq!(exact_leg_note(&report(Some("exact"), Some(hit))), None);
+        assert_eq!(exact_leg_note(&report(Some("lexical"), None)), None);
+        assert_eq!(exact_leg_note(&report(None, None)), None);
     }
 }
