@@ -2246,6 +2246,17 @@ pub fn find_references_structured(
             if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
                 out.note = Some(incomplete_caveat(&target.vname.language));
             }
+            let recorded: Vec<(String, u32)> = out
+                .references
+                .iter()
+                .map(|s| (s.path.clone(), s.line))
+                .collect();
+            if let Some(note) = cfg_gated_uses_note(store, &target, &recorded) {
+                out.note = Some(match out.note.take() {
+                    Some(n) => format!("{n}\n{note}"),
+                    None => note,
+                });
+            }
         }
         _ => {
             // Resolved, but no exact occurrence sites. This IS a real count, so
@@ -2386,6 +2397,8 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
         Ok(sites) if !sites.is_empty() => {
             let total = sites.len();
             let shown = total.min(MAX_REFERENCE_SITES);
+            let recorded: Vec<(String, u32)> =
+                sites.iter().map(|s| (s.path.clone(), s.line)).collect();
             let mut lines = Vec::with_capacity(shown + 2);
             lines.push(header);
             lines.push(format!("{total} reference(s):"));
@@ -2401,6 +2414,9 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             if phase_b_lang_incomplete(store, &target.vname.language).is_some() {
                 lines.push(incomplete_caveat(&target.vname.language));
             }
+            if let Some(note) = cfg_gated_uses_note(store, target, &recorded) {
+                lines.push(note);
+            }
             lines.join("\n")
         }
         Ok(_) => {
@@ -2414,6 +2430,101 @@ fn references_body_for_target(store: &SqliteStore, target: &CoreNode) -> String 
             reference_fallback_from_edges(store, target, &header)
         }
     }
+}
+
+/// #1146: rust-analyzer emits nothing for code disabled on the machine that
+/// built the index (a `#[cfg(windows)]` test indexed on macOS), and Rust use
+/// sites come only from it, so uses there are missing rather than absent. Name
+/// the text matches inside a cfg-gated item that no recorded site covers, so a
+/// short count is not read as complete. `None` when there are none.
+fn cfg_gated_uses_note(
+    store: &SqliteStore,
+    target: &CoreNode,
+    recorded: &[(String, u32)],
+) -> Option<String> {
+    const MAX_LISTED: usize = 20;
+    if target.vname.language != "rust" {
+        return None;
+    }
+    let root = resolve_repo_root(store)?;
+    let name = simple_name(&target.vname.signature);
+    if name.is_empty() {
+        return None;
+    }
+    let GrepOutcome::Matches(body) =
+        run_git_grep(store, &root, &name, &["*.rs".to_string()], true, 0, false)
+    else {
+        return None;
+    };
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut files: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hits = Vec::new();
+    for line in body.lines() {
+        let mut parts = line.splitn(4, ':');
+        let (Some(path), Some(Ok(ln)), Some(Ok(col)), Some(text)) = (
+            parts.next(),
+            parts.next().map(str::parse::<u32>),
+            parts.next().map(str::parse::<usize>),
+            parts.next(),
+        ) else {
+            continue;
+        };
+        // Whole word only: `find_references_raw` is not a use of `find_references`.
+        let start = col.saturating_sub(1);
+        let before = text.get(..start).and_then(|t| t.chars().next_back());
+        let after = text
+            .get(start + name.len()..)
+            .and_then(|t| t.chars().next());
+        if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+            continue;
+        }
+        // A mention in a comment is not a use.
+        if text.get(..start).is_some_and(|t| t.contains("//")) {
+            continue;
+        }
+        let is_def = path == target.vname.path && Some(ln) == target.line;
+        if is_def || recorded.iter().any(|(p, l)| p == path && *l == ln) {
+            continue;
+        }
+        let Ok(Some(id)) = store.enclosing_definition_at(&target.vname.corpus, path, ln) else {
+            continue;
+        };
+        let Ok(Some(item)) = store.get_node(id) else {
+            continue;
+        };
+        // The skeleton parse is the authority but re-parses the whole file, so
+        // run it only when an attribute line right above the item is a cfg.
+        let lines = files.entry(path.to_string()).or_insert_with(|| {
+            std::fs::read_to_string(root.join(path))
+                .map(|s| s.lines().map(str::to_string).collect())
+                .unwrap_or_default()
+        });
+        let above = item.line.map_or(0, |l| l.saturating_sub(1) as usize);
+        let cfg_above = lines
+            .get(..above.min(lines.len()))
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .map(|l| l.trim_start())
+            .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+            .any(|l| l.starts_with("#[cfg("));
+        if !cfg_above {
+            continue;
+        }
+        if let Some(gate) = skeleton_for_node_inner(&item, &root).and_then(|s| s.cfg) {
+            hits.push(format!("{path}:{ln} (in code behind `{gate}`)"));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    let total = hits.len();
+    hits.truncate(MAX_LISTED);
+    Some(format!(
+        "[note: {total} more possible use(s) by text match, not counted above: calls are \
+         traced only in code enabled on the machine that built the index. {}]",
+        hits.join(", ")
+    ))
 }
 
 /// Structural fallback: enumerate caller definitions of `target` via `RefCall`
@@ -2584,6 +2695,11 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                      definition is behind `{gate}`, and calls are traced only in code \
                      enabled on the machine that built the index. Use `find_pattern` \
                      for a text search."
+                );
+            }
+            if let Some(note) = cfg_gated_uses_note(store, target, &[]) {
+                return format!(
+                    "{header}\n0 recorded reference(s), not a definitive zero.\n{note}"
                 );
             }
         }
@@ -21780,6 +21896,107 @@ mod snippet_tests {
         assert!(
             out.contains("not a definitive zero") && out.contains("#[cfg(windows)]"),
             "a cfg-gated definition must not earn the definitive zero: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_names_uses_in_cfg_gated_code_it_did_not_count() {
+        // #1146 part 2: an ACTIVE const used in an `assert!` inside a
+        // `#[cfg(windows)]` test. rust-analyzer on macOS records the active use
+        // only, so the count must not read as complete.
+        use std::process::Command;
+        use travsr_core::{Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = "const MARK: &str = \"m\";\n\
+                   fn active() -> bool {\n    \"x\".contains(MARK)\n}\n\
+                   #[cfg(windows)]\n#[test]\nfn win() {\n    assert!(\"x\".contains(MARK));\n    let _ = MARKS;\n    // MARK\n}\n";
+        std::fs::write(root.join("src/lib.rs"), src).unwrap();
+        git(&["add", "-A"]);
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let node = |sig: &str, kind: &str, line: u32, end: u32| {
+            Node::new(VName::new("", "", "src/lib.rs", "rust", sig), kind)
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let mark = node("const:MARK", "constant", 1, 1);
+        let active = node("fn:active", "function", 2, 4);
+        let win = node("fn:win", "function", 7, 11);
+        for n in [&mark, &active, &win] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .record_edge_sites(&[(active.id, mark.id, 3, None)])
+            .unwrap();
+        store
+            .set_meta("repo_root", &root.to_string_lossy())
+            .unwrap();
+
+        if !root.join(".git").exists() {
+            return; // git unavailable in this sandbox
+        }
+        let out = find_references(&store, "MARK", None);
+        assert!(
+            out.contains("src/lib.rs:8 (in code behind `#[cfg(windows)]`)"),
+            "the uncounted use in cfg-gated code must be named: {out}"
+        );
+        assert!(
+            !out.contains("src/lib.rs:1 (")
+                && !out.contains("src/lib.rs:9 (")
+                && !out.contains("src/lib.rs:10 ("),
+            "the definition, a longer name (MARKS) and a comment are not uses: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_zero_is_not_definitive_when_the_only_use_is_cfg_gated() {
+        // #1146 part 2, zero case: every use sits in cfg-disabled code, so the
+        // definitive "No uses recorded" would be false.
+        use std::process::Command;
+        use travsr_core::{Node, VName};
+        let mut store = store_with_analyzed_target();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .expect("git");
+        if !root.join(".git").exists() {
+            return; // git unavailable in this sandbox
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = format!(
+            "{}fn unused() {{}}\n#[cfg(windows)]\nfn win() {{\n    unused();\n}}\n",
+            "\n".repeat(19)
+        );
+        std::fs::write(root.join("src/svc.rs"), src).unwrap();
+        let win = Node::new(
+            VName::new("", "", "src/svc.rs", "rust", "fn:win"),
+            "function",
+        )
+        .with_line(22)
+        .with_end_line(24);
+        store.put_node(&win).unwrap();
+        store
+            .set_meta("repo_root", &root.to_string_lossy())
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero")
+                && out.contains("src/svc.rs:23 (in code behind `#[cfg(windows)]`)"),
+            "a zero whose only use is cfg-gated must say so: {out}"
         );
     }
 
