@@ -433,7 +433,7 @@ pub fn parse_tsconfig_path_aliases(repo_root: &Path) -> Vec<(String, String)> {
 /// Call this after [`Indexer::parse_file_with_vname`] for `.rs` files and
 /// persist the returned edges alongside the parse output.
 pub fn link_imports_rust(nodes: &[Node], vname_path: &str, corpus: &str) -> Vec<Edge> {
-    link_rust(nodes, vname_path, corpus, None)
+    link_rust(nodes, vname_path, corpus, None, &[])
 }
 
 /// [`link_imports_rust`] with the repository on disk: the crate a file belongs
@@ -447,11 +447,82 @@ pub fn link_imports_rust_fs(
     vname_path: &str,
     corpus: &str,
     repo_root: &Path,
+    crates: &[(String, std::path::PathBuf)],
 ) -> Vec<Edge> {
-    link_rust(nodes, vname_path, corpus, Some(repo_root))
+    link_rust(nodes, vname_path, corpus, Some(repo_root), crates)
 }
 
-fn link_rust(nodes: &[Node], vname_path: &str, corpus: &str, repo: Option<&Path>) -> Vec<Edge> {
+/// The library crates of a Cargo workspace, as `(identifier, src dir)` pairs
+/// for [`link_imports_rust_fs`] (#1120): a member's `[lib] name`, else its
+/// package name with `-` read as `_`, mapped to its repo-relative `src/`.
+/// Members come from the root manifest's `[workspace] members`, as exact paths
+/// or a trailing `dir/*`; only members with a `src/lib.rs` are importable.
+/// Empty without a root `Cargo.toml`. Read once per batch, like
+/// [`parse_tsconfig_path_aliases`].
+pub fn rust_workspace_crates(repo_root: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let read = |dir: &Path| -> Option<toml::Value> {
+        let text = std::fs::read_to_string(repo_root.join(dir).join("Cargo.toml")).ok()?;
+        toml::from_str(&text).ok()
+    };
+    let Some(root) = read(Path::new("")) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<std::path::PathBuf> = vec![std::path::PathBuf::new()];
+    let members = root
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .cloned();
+    for m in members
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.as_str())
+    {
+        match m.strip_suffix("/*") {
+            Some(parent) => {
+                let Ok(entries) = std::fs::read_dir(repo_root.join(parent)) else {
+                    continue;
+                };
+                let mut subs: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| Path::new(parent).join(e.file_name()))
+                    .collect();
+                subs.sort();
+                dirs.extend(subs);
+            }
+            None => dirs.push(std::path::PathBuf::from(m)),
+        }
+    }
+    let mut out = Vec::new();
+    for dir in dirs {
+        if !repo_root.join(&dir).join("src").join("lib.rs").is_file() {
+            continue;
+        }
+        let Some(manifest) = read(&dir) else {
+            continue;
+        };
+        let name = manifest
+            .get("lib")
+            .and_then(|l| l.get("name"))
+            .or_else(|| manifest.get("package").and_then(|p| p.get("name")))
+            .and_then(|n| n.as_str());
+        if let Some(name) = name {
+            out.push((
+                name.replace('-', "_"),
+                normalize_vname_path(&dir.join("src")),
+            ));
+        }
+    }
+    out
+}
+
+fn link_rust(
+    nodes: &[Node],
+    vname_path: &str,
+    corpus: &str,
+    repo: Option<&Path>,
+    crates: &[(String, std::path::PathBuf)],
+) -> Vec<Edge> {
     let file = Path::new(vname_path);
     let Some(dir) = file.parent() else {
         return Vec::new();
@@ -461,6 +532,7 @@ fn link_rust(nodes: &[Node], vname_path: &str, corpus: &str, repo: Option<&Path>
         file,
         self_dir: rust_module_dir(file, dir, crate_root.as_deref()),
         crate_root,
+        crates,
     };
 
     let mut edges = Vec::new();
@@ -509,6 +581,8 @@ struct RustModule<'a> {
     self_dir: std::path::PathBuf,
     /// The directory `crate::` resolves against ([`crate_root_dir`]).
     crate_root: Option<std::path::PathBuf>,
+    /// The workspace's library crates ([`rust_workspace_crates`]).
+    crates: &'a [(String, std::path::PathBuf)],
 }
 
 /// Resolve a within-crate Rust `use` path to candidate repo-relative file
@@ -549,8 +623,20 @@ fn resolve_rust_use(use_path: &str, module: &RustModule<'_>) -> Vec<String> {
             None => return Vec::new(),
         }
     } else {
-        // A bare external identifier (`std::`, `serde::`): not in this repo.
-        return Vec::new();
+        // A sibling workspace crate (`kestrel_store::Store`, #1120) resolves as
+        // `crate::` inside that crate. Any other bare identifier (`std::`,
+        // `serde::`) is not in this repo.
+        let (head, rest) = use_path.split_once("::").unwrap_or((use_path, ""));
+        let Some((_, src)) = module.crates.iter().find(|(name, _)| name == head) else {
+            return Vec::new();
+        };
+        let sibling = RustModule {
+            file: module.file,
+            self_dir: src.clone(),
+            crate_root: Some(src.clone()),
+            crates: &[],
+        };
+        return resolve_rust_use(&format!("crate::{rest}"), &sibling);
     };
     if rest.is_empty() {
         return Vec::new();
