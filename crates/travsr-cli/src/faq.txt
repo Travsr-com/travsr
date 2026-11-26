@@ -215,7 +215,7 @@ $ travsr daemon logs -f --level warn --since 10m
 
 ## what is in the logs?
 > A level, a target and a message, plus a key on the ones that matter.
-- phase_b.start, phase_b.indexed, phase_b.complete
+- phase_b.start, phase_b.wait, phase_b.indexed, phase_b.complete
 - lsif.spawn, lsif.complete, kcore.updated
 - query.served, embed.text.updated, lsp.diagnostics
 - file.skipped, the one you see most when something is wrong

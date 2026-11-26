@@ -19,7 +19,7 @@
     "daemon.socket.bound": "Control socket bound", "daemon.session.stop": "Daemon stopped",
     "daemon.log_pruned": "Old log files removed", "head.drift.detected": "HEAD moved, reconciling",
     "head.reconcile.complete": "Reindexed after HEAD moved", "tree.reconcile.pruned": "Pruned deleted files",
-    "phase_b.start": "Semantic indexing started", "phase_b.indexed": "Semantic indexing complete",
+    "phase_b.start": "Semantic indexing started", "phase_b.wait": "Waiting for another repo's semantic indexing", "phase_b.indexed": "Semantic indexing complete",
     "phase_b.complete": "Semantic refresh complete", "kcore.updated": "Graph centrality updated",
     "embed.text.updated": "Embedding text updated", "embed.text.fts_backfill": "Search index backfilled",
     "store.fts_words.backfill": "Word index updated", "lsif.spawn": "Analyzer started",
@@ -29,7 +29,7 @@
   const EVENT_FAMILY = {
     "daemon.session.start": "daemon", "daemon.ready": "daemon", "daemon.socket.bound": "daemon",
     "daemon.session.stop": "daemon", "daemon.log_pruned": "daemon", "head.drift.detected": "git",
-    "head.reconcile.complete": "git", "tree.reconcile.pruned": "git", "phase_b.start": "index",
+    "head.reconcile.complete": "git", "tree.reconcile.pruned": "git", "phase_b.start": "index", "phase_b.wait": "index",
     "phase_b.indexed": "index", "phase_b.complete": "index", "kcore.updated": "index",
     "lsif.spawn": "index", "lsif.complete": "index", "embed.text.updated": "search",
     "embed.text.fts_backfill": "search", "store.fts_words.backfill": "search",

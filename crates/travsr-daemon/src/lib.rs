@@ -5859,6 +5859,36 @@ pub fn init_running(repo_root: &Path) -> bool {
         .is_ok_and(|f| fs2::FileExt::try_lock_exclusive(&f).is_err())
 }
 
+/// #1118: one background Phase B analyzer run per machine at a time.
+///
+/// Phase B is single-flight per daemon, but every worktree runs its own daemon,
+/// and each run starts an analyzer (`rust-analyzer lsif` measured at 1.5 to
+/// 2.4 GB for about 160 s on Kestrel). Three worktrees committing together ran
+/// three at once and left a 4 GB Linux VM with 3 MB free; the daemons
+/// themselves stayed under 340 MB. The returned guard holds an flock on
+/// `~/.travsr/phase-b.lock`, which the OS releases if the holder dies, so a
+/// crashed daemon never wedges the rest. `None` (no home, unwritable lock)
+/// runs unguarded, as before.
+fn machine_phase_b_lock() -> Option<std::fs::File> {
+    use fs2::FileExt as _;
+    let dir = dirs::home_dir()?.join(".travsr");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // used only as an flock handle
+        .open(dir.join("phase-b.lock"))
+        .ok()?;
+    if file.try_lock_exclusive().is_err() {
+        tracing::info!(
+            event = "phase_b.wait",
+            "another repository's semantic indexing is running; waiting for it to finish"
+        );
+        file.lock_exclusive().ok()?;
+    }
+    Some(file)
+}
+
 fn run_background_phase_b_inner(
     repo_root: &Path,
     store: &std::sync::Mutex<SqliteStore>,
@@ -5912,8 +5942,10 @@ fn run_background_phase_b_inner(
         // Background refresh: no terminal is attached, nobody renders progress.
         liveness: None,
     };
+    let machine_lock = machine_phase_b_lock();
     let (pb_nodes, pb_edges, mut pb_refs, pb_unresolved, pb_positional, pb_outcome) =
         indexer.invoke_phase_b_all(&inputs);
+    drop(machine_lock);
     classify_phase_b_calls(repo_root, &pb_nodes, &mut pb_refs);
 
     // ── Single write batch under the lock ─────────────────────────────────────
@@ -10977,6 +11009,43 @@ mod tests {
             "the old corpus must be purged, not left alongside the new one: {after:?}"
         );
         assert_eq!(after[0].0, "github.com/acme/foo");
+    }
+
+    /// #1118: a second background Phase B waits for the first to release the
+    /// machine-wide lock, then proceeds.
+    #[test]
+    fn machine_phase_b_lock_serializes_holders() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home_tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home_tmp.path());
+
+        let first = machine_phase_b_lock().expect("first holder gets the lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let second = machine_phase_b_lock();
+            let _ = tx.send(second.is_some());
+        });
+        let blocked = rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err();
+        drop(first);
+        let acquired = rx.recv_timeout(std::time::Duration::from_secs(5));
+        waiter.join().unwrap();
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(
+            blocked,
+            "second holder must wait while the first holds the lock"
+        );
+        assert_eq!(
+            acquired,
+            Ok(true),
+            "second holder proceeds once it is released"
+        );
     }
 
     #[test]

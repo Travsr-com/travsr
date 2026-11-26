@@ -26,7 +26,8 @@
 //! daemon.session.stop      daemon.log_pruned
 //! head.drift.detected      tree.reconcile.pruned
 //! head.reconcile.complete  phase_b.start         phase_b.indexed
-//! phase_b.complete         kcore.updated         embed.text.updated
+//! phase_b.complete         phase_b.wait          kcore.updated
+//! embed.text.updated
 //! embed.text.fts_backfill  store.fts_words.backfill
 //! lsif.spawn               lsif.complete         fuzz_target.missing
 //! sidecar.version.checked  sidecar.version.below_floor
