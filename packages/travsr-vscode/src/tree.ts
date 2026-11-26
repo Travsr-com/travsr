@@ -167,13 +167,19 @@ export class TravsrTreeDataProvider
       const raw = await this.mcp.callTool("get_dependencies", { file });
       const lines = stripEnvelope(raw).split("\n").map((l) => l.trim()).filter(Boolean);
       return lines.map((line) => {
-        // Format: "import:./mcp", "import:@scope/pkg", "type-import:./bar"
-        const m = /^([^:]+):(.+)$/.exec(line);
+        // Format: "import:./mcp", "import:@scope/pkg", "type-import:./bar",
+        // optionally followed by " → <repo path>[, <repo path>]" naming the
+        // indexed file(s) the import resolves to (#1120).
+        const [spec, served] = line.split(" → ");
+        const m = /^([^:]+):(.+)$/.exec(spec);
         const kind = m?.[1] ?? "import";
-        const dep = (m?.[2] ?? line).trim();
-        const filePath = dep.startsWith(".")
-          ? this.resolveLocalDep(file, dep)
-          : undefined;
+        const dep = (m?.[2] ?? spec).trim();
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const filePath = served && wsRoot
+          ? path.join(wsRoot, served.split(", ")[0])
+          : dep.startsWith(".")
+            ? this.resolveLocalDep(file, dep)
+            : undefined;
         return new EntryNode(dep, kind, filePath);
       });
     } catch {
