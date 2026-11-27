@@ -533,6 +533,10 @@ fn link_rust(
         self_dir: rust_module_dir(file, dir, crate_root.as_deref()),
         crate_root,
         crates,
+        child_mods: nodes
+            .iter()
+            .filter_map(|n| n.vname.signature.strip_prefix("filemod:"))
+            .collect(),
     };
 
     let mut edges = Vec::new();
@@ -583,6 +587,8 @@ struct RustModule<'a> {
     crate_root: Option<std::path::PathBuf>,
     /// The workspace's library crates ([`rust_workspace_crates`]).
     crates: &'a [(String, std::path::PathBuf)],
+    /// The modules this file declares with `mod foo;`.
+    child_mods: Vec<&'a str>,
 }
 
 /// Resolve a within-crate Rust `use` path to candidate repo-relative file
@@ -624,9 +630,13 @@ fn resolve_rust_use(use_path: &str, module: &RustModule<'_>) -> Vec<String> {
         }
     } else {
         // A sibling workspace crate (`kestrel_store::Store`, #1120) resolves as
-        // `crate::` inside that crate. Any other bare identifier (`std::`,
-        // `serde::`) is not in this repo.
+        // `crate::` inside that crate, and a module this file declares
+        // (`mod ffi; use ffi::X;`, Rust 2018) as `self::`. Any other bare
+        // identifier (`std::`, `serde::`) is not in this repo.
         let (head, rest) = use_path.split_once("::").unwrap_or((use_path, ""));
+        if !rest.is_empty() && module.child_mods.contains(&head) {
+            return resolve_rust_use(&format!("self::{use_path}"), module);
+        }
         let Some((_, src)) = module.crates.iter().find(|(name, _)| name == head) else {
             return Vec::new();
         };
@@ -635,6 +645,7 @@ fn resolve_rust_use(use_path: &str, module: &RustModule<'_>) -> Vec<String> {
             self_dir: src.clone(),
             crate_root: Some(src.clone()),
             crates: &[],
+            child_mods: Vec::new(),
         };
         return resolve_rust_use(&format!("crate::{rest}"), &sibling);
     };

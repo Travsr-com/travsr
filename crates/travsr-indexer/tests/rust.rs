@@ -430,6 +430,29 @@ fn a_main_rs_in_a_subdirectory_is_its_own_crate_root() {
 
 /// Review of #1132: with one segment after `super::` / `crate::`, the item
 /// lives in the starting module, whose file was never linked.
+/// #1120 follow-up: Rust 2018 lets a file name its own child module without
+/// `self::` (`mod ffi; use ffi::inner::X;`). A bare head that is no declared
+/// module (`serde::`) still links nowhere, even with a same-named file.
+#[test]
+fn a_bare_path_through_a_declared_child_module_resolves() {
+    let got = resolved_targets(
+        "mod ffi;\nuse ffi::inner::Marker;\nuse serde::Serialize;\n",
+        "crates/idx/src/lib.rs",
+        &[
+            "crates/idx/src/ffi/inner.rs",
+            "crates/idx/src/ffi/inner/mod.rs",
+            "crates/idx/src/serde.rs",
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            "crates/idx/src/ffi/inner.rs".to_string(),
+            "crates/idx/src/ffi/inner/mod.rs".to_string()
+        ]
+    );
+}
+
 #[test]
 fn a_single_segment_path_names_the_enclosing_module() {
     let got = resolved_targets(
