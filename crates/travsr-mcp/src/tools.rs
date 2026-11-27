@@ -10998,6 +10998,9 @@ pub fn get_graph_json_global(
     // #617: union of per-repo degraded-state signals, deduped.
     let mut all_signals: Vec<serde_json::Value> = Vec::new();
     let mut seen_signals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // #1145: `coverage` describes one repo, so it is kept only when exactly
+    // one repo answers (always, with `repo` set), as in single-repo mode.
+    let mut coverages: Vec<serde_json::Value> = Vec::new();
 
     for (_repo_name, db_path) in candidates {
         if !db_path.exists() {
@@ -11022,6 +11025,9 @@ pub fn get_graph_json_global(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                if parsed["nodes"].as_array().is_some_and(|n| !n.is_empty()) {
+                    coverages.push(parsed["coverage"].clone());
+                }
                 for node in parsed["nodes"].as_array().into_iter().flatten() {
                     let id = node["id"].as_str().unwrap_or("").to_string();
                     if !id.is_empty() && seen_node_ids.insert(id) {
@@ -11053,6 +11059,9 @@ pub fn get_graph_json_global(
     });
     if !all_signals.is_empty() {
         out["signals"] = serde_json::Value::Array(all_signals);
+    }
+    if let [coverage] = coverages.as_slice() {
+        out["coverage"] = coverage.clone();
     }
     match serde_json::to_string(&out) {
         Ok(s) => s,
@@ -14684,6 +14693,49 @@ mod tests {
             raw.len(),
             budget
         );
+    }
+
+    /// #1145: the global merge dropped `coverage`. One answering repo keeps
+    /// it; two repos have no single coverage, so it stays out.
+    #[test]
+    fn global_graph_json_keeps_coverage_from_the_one_answering_repo() {
+        use travsr_core::{Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let repo_db = |name: &str, sig: &str| {
+            let db = dir.path().join(format!("{name}.db"));
+            let mut store = travsr_store::SqliteStore::open(&db).unwrap();
+            let n = Node::new(VName::new("", "", "src/lib.rs", "rust", sig), "struct");
+            store.put_node(&n).unwrap();
+            (name.to_string(), db)
+        };
+        let repos: HashMap<String, PathBuf> =
+            HashMap::from([repo_db("a", "struct:Money"), repo_db("b", "struct:Other")]);
+        let call = |repos: &HashMap<String, PathBuf>| {
+            let raw = get_graph_json_global(
+                repos,
+                None,
+                &GraphJsonParams {
+                    query: "Money",
+                    direction: "both",
+                    depth: 1,
+                    kind_filter: "",
+                    provenance: "",
+                    token_budget: 0,
+                    mode: "",
+                    path_prefix: "",
+                },
+            );
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap()
+        };
+
+        let one = call(&repos);
+        assert_eq!(one["coverage"]["language"], "rust", "{one}");
+
+        let both: HashMap<String, PathBuf> =
+            HashMap::from([repo_db("a", "struct:Money"), repo_db("c", "struct:Money")]);
+        let two = call(&both);
+        assert!(!two["nodes"].as_array().unwrap().is_empty(), "{two}");
+        assert!(two.get("coverage").is_none(), "{two}");
     }
 
     #[test]
