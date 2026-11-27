@@ -2447,13 +2447,6 @@ pub(crate) fn build_seed_set(
         let mut alias_freq: Option<usize> = None;
         let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) = if has_direct {
             (direct_nodes, token.clone(), false)
-        } else if let Some(fix) = corrections.get(token) {
-            let fixed_nodes = store.search_nodes_by_name(fix).unwrap_or_default();
-            if fixed_nodes.iter().any(|n| boundary(fix, n)) {
-                (fixed_nodes, fix.clone(), true)
-            } else {
-                (direct_nodes, token.clone(), false)
-            }
         } else {
             // A bare name that exists only as an `as` alias (`Node as CoreNode`)
             // anchors its original, as `find_references` resolves it. Parsers
@@ -2471,13 +2464,26 @@ pub(crate) fn build_seed_set(
             } else {
                 Vec::new()
             };
+            // Tried before the typo correction (#1154): an alias one edit from
+            // its original (`skeleton_for_node_inner`) is not a typo, and the
+            // correction would measure it by the original's frequency.
             match aliased.first() {
                 Some(orig) => {
                     let name = travsr_core::ident::leaf_of(&orig.vname.signature).to_string();
                     alias_freq = Some(aliased.len());
                     (aliased, name, false)
                 }
-                None => (direct_nodes, token.clone(), false),
+                None => match corrections.get(token) {
+                    Some(fix) => {
+                        let fixed_nodes = store.search_nodes_by_name(fix).unwrap_or_default();
+                        if fixed_nodes.iter().any(|n| boundary(fix, n)) {
+                            (fixed_nodes, fix.clone(), true)
+                        } else {
+                            (direct_nodes, token.clone(), false)
+                        }
+                    }
+                    None => (direct_nodes, token.clone(), false),
+                },
             }
         };
 
@@ -6202,6 +6208,78 @@ mod tests {
             seed_set.terms
         );
         assert!(seed_set.seeds.iter().any(|s| s.node == ty.id));
+        assert_ne!(
+            seed_set.confidence,
+            Confidence::None,
+            "{:?}",
+            seed_set.terms
+        );
+    }
+
+    /// #1154: `ask skeleton_for_node_inner` abstained. The alias is one edit
+    /// from its original, so the typo correction claimed it first and measured
+    /// it by the original's frequency (generic), and the alias lookup never ran.
+    #[test]
+    fn build_seed_set_prefers_an_import_alias_over_a_typo_correction() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(repo.path().join("travsr-mcp/src")).unwrap();
+        std::fs::write(
+            repo.path().join("travsr-mcp/src/tools.rs"),
+            "use travsr_analysis::skeleton::skeleton_for_node as skeleton_for_node_inner;\n",
+        )
+        .unwrap();
+        git(&["add", "."]);
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+
+        let path = "travsr-analysis/src/skeleton.rs";
+        let def = Node::new(
+            VName::new("corpus", "", path, "rust", "fn:skeleton_for_node"),
+            "function",
+        );
+        store.put_node(&def).unwrap();
+        // Each segment of the original is common, as in travsr (freq 180), so
+        // measured by it the alias read as generic. No helper is a closer typo
+        // match than the original, so the correction is unique and fires.
+        for i in 0..400 {
+            for seg in ["skeleton", "for", "node"] {
+                let sig = format!("fn:{seg}_part_{i}");
+                store
+                    .put_node(&Node::new(
+                        VName::new("corpus", "", "other/src/lib.rs", "rust", &sig),
+                        "function",
+                    ))
+                    .unwrap();
+            }
+        }
+
+        let seed_set = build_seed_set(
+            &store,
+            "skeleton_for_node_inner",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            seed_set.terms[0].top_node,
+            Some(def.id),
+            "{:?}",
+            seed_set.terms
+        );
         assert_ne!(
             seed_set.confidence,
             Confidence::None,
