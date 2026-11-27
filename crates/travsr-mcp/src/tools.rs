@@ -1790,18 +1790,60 @@ pub(crate) fn resolve_alias(
     // Aliasing usually exists to avoid a clash with a local name, so a
     // same-named definition elsewhere is the wrong answer unless the import
     // names where it lives (`use std::process::Command as StdCommand` is not
-    // this repo's `Command`).
+    // this repo's `Command`). An import of a crate that only re-exports the
+    // name is followed one `pub use` hop to where it lives.
     let mut nodes: Vec<CoreNode> = originals
         .iter()
         .flat_map(|(o, import)| {
-            resolve_symbol_nodes(store, o, path)
+            let (home, other): (Vec<CoreNode>, Vec<CoreNode>) =
+                resolve_symbol_nodes(store, o, path)
+                    .into_iter()
+                    .partition(|n| import_names_home(import, &n.vname.path));
+            if !home.is_empty() || other.is_empty() {
+                return home;
+            }
+            let reexports = reexport_lines(store, &repo_root, o, import);
+            other
                 .into_iter()
-                .filter(|n| import_names_home(import, &n.vname.path))
+                .filter(|n| {
+                    reexports
+                        .iter()
+                        .any(|l| import_names_home(l, &n.vname.path))
+                })
+                .collect()
         })
         .collect();
     nodes.sort_by_key(|n| n.id.0);
     nodes.dedup_by_key(|n| n.id);
     nodes
+}
+
+/// The `pub use` lines naming `name` in the files `import` names: for
+/// `use travsr_indexer::{FfiMarker as RichFfi}`, travsr-indexer's
+/// `pub use travsr_analysis::ffi::{FfiMarker, FfiMarkerKind};`.
+fn reexport_lines(
+    store: &SqliteStore,
+    repo_root: &std::path::Path,
+    name: &str,
+    import: &str,
+) -> Vec<String> {
+    let GrepOutcome::Matches(body) = run_git_grep(store, repo_root, name, &[], true, 0, false)
+    else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|hit| {
+            let mut parts = hit.splitn(4, ':');
+            let (Some(path), Some(_), Some(_), Some(text)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return None;
+            };
+            let text = text.trim_start();
+            (text.starts_with("pub use ") && import_names_home(import, path))
+                .then(|| text.to_string())
+        })
+        .collect()
 }
 
 /// The identifiers `line` renames to `alias` (`orig as alias`), in order.
@@ -12581,6 +12623,59 @@ mod tests {
         assert!(!import_list_opener(&["const handlers = [", "  other as Handler,"]).is_some());
         assert!(!import_list_opener(&["let x = f(", "    y,"]).is_some());
         assert!(!import_list_opener(&[]).is_some());
+    }
+
+    /// #1156: `use travsr_indexer::{FfiMarker as RichFfi}` was "not found":
+    /// travsr_indexer only re-exports `FfiMarker` from travsr-analysis, so the
+    /// import named no folder of the definition. One `pub use` hop reaches it;
+    /// a same-named definition the re-export does not point at stays out.
+    #[test]
+    fn an_alias_of_a_reexport_resolves_through_the_pub_use() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let files = [
+            (
+                "travsr-plugin-host/src/convert.rs",
+                "use travsr_indexer::{FfiMarker as RichFfi, ParseOutput};\n",
+            ),
+            (
+                "travsr-indexer/src/ffi.rs",
+                "pub use travsr_analysis::ffi::{FfiMarker, FfiMarkerKind};\n",
+            ),
+        ];
+        for (path, text) in files {
+            let full = repo.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, text).unwrap();
+        }
+        for args in [&["init", "-q"][..], &["add", "."][..]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap();
+        }
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+        let def = |path: &str| {
+            Node::new(
+                VName::new("corpus", "", path, "rust", "struct:FfiMarker"),
+                "struct",
+            )
+        };
+        let home = def("travsr-analysis/src/ffi.rs");
+        let rival = def("travsr-plugin-protocol/src/ffi_marker.rs");
+        store.put_node(&home).unwrap();
+        store.put_node(&rival).unwrap();
+
+        let ids: Vec<_> = resolve_alias(&store, "RichFfi", None)
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(ids, vec![home.id]);
     }
 
     #[test]
