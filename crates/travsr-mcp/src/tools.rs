@@ -2571,6 +2571,22 @@ fn reference_fallback_from_edges(store: &SqliteStore, target: &CoreNode, header:
                  Use `find_pattern` for a text search."
             );
         }
+        // #1146: rust-analyzer traces only code enabled for the machine that
+        // built the index, so a `#[cfg(windows)]` item indexed on macOS has no
+        // recorded uses however many it has. Same soften shape as Dart above.
+        if lang == "rust" {
+            let gate = resolve_repo_root(store)
+                .and_then(|root| skeleton_for_node_inner(target, &root))
+                .and_then(|s| s.cfg);
+            if let Some(gate) = gate {
+                return format!(
+                    "{header}\n0 recorded reference(s), not a definitive zero: this \
+                     definition is behind `{gate}`, and calls are traced only in code \
+                     enabled on the machine that built the index. Use `find_pattern` \
+                     for a text search."
+                );
+            }
+        }
         // Analysis for this language ran to completion and this symbol has
         // neither occurrence rows nor ref/call edges: a genuine zero.
         //
@@ -21743,6 +21759,27 @@ mod snippet_tests {
         assert!(
             !out.contains("not a definitive zero"),
             "must not hedge on a complete run: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_softens_zero_for_a_cfg_gated_rust_definition() {
+        // #1146: rust-analyzer traces only code enabled on the indexing
+        // machine, so a `#[cfg(windows)]` item indexed on macOS has no recorded
+        // uses even when it has several. The zero must say so.
+        let mut store = store_with_analyzed_target();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let src = format!("{}#[cfg(windows)]\nfn unused() {{}}\n", "\n".repeat(18));
+        std::fs::write(dir.path().join("src/svc.rs"), src).unwrap();
+        store
+            .set_meta("repo_root", &dir.path().to_string_lossy())
+            .unwrap();
+
+        let out = find_references(&store, "unused", None);
+        assert!(
+            out.contains("not a definitive zero") && out.contains("#[cfg(windows)]"),
+            "a cfg-gated definition must not earn the definitive zero: {out}"
         );
     }
 
