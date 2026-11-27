@@ -1,4 +1,5 @@
 import * as assert from "assert";
+import * as path from "path";
 import * as vscode from "vscode";
 import { TravsrTreeDataProvider } from "../../tree";
 
@@ -116,6 +117,21 @@ suite("VSCODE-204: TravsrTreeDataProvider, Dependencies section", () => {
     const [entry] = await provider.getChildren(depsSection);
     assert.ok(entry.command !== undefined, "local dep must have a command");
     assert.strictEqual(entry.command!.command, "vscode.open");
+  });
+
+  test("a dep the index resolved to a file opens that file (#1120)", async () => {
+    const provider = new TravsrTreeDataProvider(
+      makeMcp({ get_dependencies: "use:kestrel_store::Store → crates/kestrel-store/src/lib.rs\n" }),
+      makeContext()
+    );
+    setFile(provider, "crates/kestrel-core/src/lib.rs");
+    const [depsSection] = await provider.getChildren(undefined);
+    const [entry] = await provider.getChildren(depsSection);
+    assert.strictEqual(entry.label, "kestrel_store::Store");
+    assert.strictEqual(entry.description, "use");
+    assert.ok(entry.command !== undefined, "resolved dep must have a command");
+    const uri = entry.command!.arguments?.[0] as { fsPath: string };
+    assert.ok(uri.fsPath.endsWith(path.join("crates", "kestrel-store", "src", "lib.rs")), uri.fsPath);
   });
 
   test("external dep (vscode, node module) has no open-file command", async () => {

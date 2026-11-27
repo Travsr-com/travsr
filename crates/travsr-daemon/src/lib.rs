@@ -22,7 +22,7 @@ use travsr_analysis::skeleton::{embed_texts_for_file, EmbedRichness};
 use travsr_core::{canonical_corpus, canonical_corpus_local, Language, SIGNATURE_FORMAT_VERSION};
 use travsr_indexer::{
     hash_bytes, link_imports_aliased, link_imports_go, link_imports_python_fs,
-    link_imports_rust_fs, parse_tsconfig_path_aliases, FfiMarker,
+    link_imports_rust_fs, parse_tsconfig_path_aliases, rust_workspace_crates, FfiMarker,
 };
 use travsr_plugin_host::PluginIndexer;
 use travsr_retrieval::compute_kcore;
@@ -422,6 +422,8 @@ fn index_paths_parallel(
                 // tsconfig `paths` aliases (e.g. @/* -> src/*) for TS/JS import
                 // resolution; read once per shard, empty for repos without one.
                 let ts_aliases = parse_tsconfig_path_aliases(&repo);
+                // #1120: sibling workspace crates for Rust `use` resolution.
+                let rust_crates = rust_workspace_crates(&repo);
                 for abs_path in shard {
                     let vname_path = abs_path
                         .strip_prefix(&repo)
@@ -483,7 +485,7 @@ fn index_paths_parallel(
                             link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
                         }
                         Some(Language::Rust) => {
-                            link_imports_rust_fs(&out.nodes, &vname_path, &corpus, &repo)
+                            link_imports_rust_fs(&out.nodes, &vname_path, &corpus, &repo, &rust_crates)
                         }
                         Some(Language::Python) => {
                             link_imports_python_fs(&out.nodes, &vname_path, &corpus, &repo)
@@ -6393,6 +6395,8 @@ pub fn reindex_files_reporting(
     // tsconfig `paths` aliases (e.g. @/* -> src/*) for TS/JS import resolution;
     // read once per batch, empty for repos without one.
     let ts_aliases = parse_tsconfig_path_aliases(repo_root);
+    // #1120: sibling workspace crates for Rust `use` resolution.
+    let rust_crates = rust_workspace_crates(repo_root);
 
     for abs_path in paths {
         let vname_path = abs_path
@@ -6466,7 +6470,7 @@ pub fn reindex_files_reporting(
                 link_imports_aliased(&out.nodes, &vname_path, &corpus, &ts_aliases)
             }
             Some(Language::Rust) => {
-                link_imports_rust_fs(&out.nodes, &vname_path, &corpus, repo_root)
+                link_imports_rust_fs(&out.nodes, &vname_path, &corpus, repo_root, &rust_crates)
             }
             Some(Language::Python) => {
                 link_imports_python_fs(&out.nodes, &vname_path, &corpus, repo_root)

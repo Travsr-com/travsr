@@ -2486,8 +2486,10 @@ export function registerShowDependencies(client: McpClient): vscode.Disposable {
     );
 
     const toEntry = (spec: string): import("./commands").DepEntry => {
-      const clean = spec.replace(/^\s*↳\s*/, "").trim();
-      const resolved = resolveDepSpec(clean, sourceAbsPath);
+      // " → <repo path>[, ...]" names the indexed file the import resolves
+      // to (#1120); without it, fall back to resolving a relative specifier.
+      const [clean, served] = spec.replace(/^\s*↳\s*/, "").trim().split(" → ");
+      const resolved = served ? served.split(", ")[0] : resolveDepSpec(clean, sourceAbsPath);
       const colon = clean.indexOf(":");
       const display = colon >= 0 ? clean.slice(colon + 1) : clean;
       return { display, path: resolved };

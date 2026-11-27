@@ -51,13 +51,17 @@ pub mod noise;
 ///       variants for any untouched file (`find_references ReindexCommit` found
 ///       nothing, #1053) with nothing to tell it apart from a file that truly
 ///       has none. Bumping forces the full re-parse that back-fills them.
-///   5 - current: Rust `use` paths now resolve `super::`, `self::` and
+///   5 - Rust `use` paths now resolve `super::`, `self::` and
 ///       `crate::` and module directories (#1130), so Phase A emits Rust
 ///       import edges an older database lacks. Linking runs only for files the
 ///       incremental reindex re-parses, so a database built before #1130 keeps
 ///       no Rust import links for any untouched file (a plain `travsr init`
 ///       after upgrading still showed none). Bumping forces the full re-parse
 ///       that links them.
+///   6 - current: a Rust `use` of a sibling workspace crate
+///       (`use kestrel_store::Store`) now links to that crate's files (#1120).
+///       Same shape as 5: the edges are written only when a file is
+///       re-parsed, so a database built at 5 keeps none for untouched files.
 ///
 /// The constant does not invalidate anything by itself. It is a marker some code
 /// paths compare against, and only those paths act on a bump:
@@ -78,7 +82,7 @@ pub mod noise;
 /// schema version only, so queries keep answering from the old-format graph: it
 /// is stale, not corrupt, and the write-path refusals above are what stop the
 /// two formats from ever mixing.
-pub const SIGNATURE_FORMAT_VERSION: u8 = 5;
+pub const SIGNATURE_FORMAT_VERSION: u8 = 6;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 

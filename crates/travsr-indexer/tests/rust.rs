@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use travsr_core::EdgeKind;
-use travsr_indexer::{link_imports_rust, link_imports_rust_fs, Indexer};
+use travsr_indexer::{link_imports_rust, link_imports_rust_fs, rust_workspace_crates, Indexer};
 
 fn fixture_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust/simple.rs")
@@ -508,7 +508,8 @@ fn resolved_targets_fs(
     let out = Indexer::new()
         .parse_file_with_vname(&snippet, vname_path)
         .unwrap();
-    let edges = link_imports_rust_fs(&out.nodes, vname_path, "c", repo.path());
+    let crates = rust_workspace_crates(repo.path());
+    let edges = link_imports_rust_fs(&out.nodes, vname_path, "c", repo.path(), &crates);
     candidates
         .iter()
         .filter(|c| {
@@ -871,4 +872,80 @@ fn smoke_index_travsr_core_lib() {
         "expected > 3 edges from travsr-core/src/lib.rs, got {}",
         out.edges.len()
     );
+}
+
+/// #1120: a `use` of a sibling workspace crate links to that crate's files,
+/// found from the root manifest's members (a `dir/*` glob and an exact path,
+/// a `[lib] name` overriding the package name). A binary-only member and an
+/// external crate link nowhere.
+#[test]
+fn a_sibling_workspace_crate_use_links_to_its_files() {
+    let repo = tempfile::tempdir().unwrap();
+    let write = |f: &str, text: &str| {
+        let p = repo.path().join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\", \"tools/gen\"]\n",
+    );
+    write(
+        "crates/kestrel-store/Cargo.toml",
+        "[package]\nname = \"kestrel-store\"\n",
+    );
+    write("crates/kestrel-store/src/lib.rs", "");
+    write("crates/kestrel-store/src/db.rs", "");
+    write(
+        "crates/kestrel-cli/Cargo.toml",
+        "[package]\nname = \"kestrel-cli\"\n",
+    );
+    write("crates/kestrel-cli/src/main.rs", "");
+    write(
+        "tools/gen/Cargo.toml",
+        "[package]\nname = \"gen\"\n[lib]\nname = \"codegen\"\n",
+    );
+    write("tools/gen/src/lib.rs", "");
+
+    let crates = rust_workspace_crates(repo.path());
+    let names: Vec<(&str, String)> = crates
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.to_string_lossy().replace('\\', "/")))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("kestrel_store", "crates/kestrel-store/src".to_string()),
+            ("codegen", "tools/gen/src".to_string()),
+        ]
+    );
+
+    let vname_path = "crates/kestrel-core/src/lib.rs";
+    let snippet = repo.path().join("snippet.rs");
+    std::fs::write(
+        &snippet,
+        "use kestrel_store::Store;\nuse kestrel_store::db::open;\nuse codegen::emit;\n\
+         use kestrel_cli::run;\nuse serde::Serialize;\n",
+    )
+    .unwrap();
+    let out = Indexer::new()
+        .parse_file_with_vname(&snippet, vname_path)
+        .unwrap();
+    let edges = link_imports_rust_fs(&out.nodes, vname_path, "c", repo.path(), &crates);
+    let links = |target: &str| {
+        let id = travsr_core::VName::new("c", "", target, "rust", "file").id();
+        edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::ResolvesTo && e.dst == id)
+    };
+    for t in [
+        "crates/kestrel-store/src/lib.rs",
+        "crates/kestrel-store/src/db.rs",
+        "tools/gen/src/lib.rs",
+    ] {
+        assert!(links(t), "{t} not linked: {edges:?}");
+    }
+    assert!(!links("crates/kestrel-cli/src/main.rs"));
+    let none = link_imports_rust_fs(&out.nodes, vname_path, "c", repo.path(), &[]);
+    assert!(none.is_empty(), "{none:?}");
 }

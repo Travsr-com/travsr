@@ -173,18 +173,23 @@
         // Every dependency line is a `kind:specifier`; a line with spaces and
         // no such prefix is the tool talking ("no file matched ..."), so it
         // is shown as a note rather than listed as a dependency.
-        const isSpec = (l) => /^\s*(↳\s*)?[\w-]+:\S/.test(l) && !/\s\S+\s/.test(l.trim());
+        // A `kind:specifier` may be followed by " → <repo path>[, ...]", the
+        // indexed file it resolves to (#1120).
+        const specOf = (l) => l.split(" → ")[0];
+        const isSpec = (l) => /^\s*(↳\s*)?[\w-]+:\S/.test(l) && !/\s\S+\s/.test(specOf(l).trim());
         const notes = lines.filter((l) => !isSpec(l));
         lines = lines.filter(isSpec);
         const direct = lines.filter((l) => !l.startsWith(" ") && !l.includes("↳"));
         const transitive = lines.filter((l) => l.startsWith(" ") || l.includes("↳"));
-        // The extension resolves `./x` specifiers against the file system to
-        // make them clickable; the page cannot see the file system, so every
-        // entry is shown as the extension shows an unresolved one.
-        const li = (spec) => {
-          const clean = spec.replace(/^\s*↳\s*/, "").trim();
+        // The page cannot see the file system, so only an entry the index
+        // resolved to a file shows that file; the rest are shown as the
+        // extension shows an unresolved one.
+        const li = (line) => {
+          const [clean, served] = line.replace(/^\s*↳\s*/, "").trim().split(" → ");
           const colon = clean.indexOf(":");
-          return '<li class="dep-ext" title="' + esc(clean) + '">' + esc(colon >= 0 ? clean.slice(colon + 1) : clean) + "</li>";
+          const name = esc(colon >= 0 ? clean.slice(colon + 1) : clean);
+          if (!served) return '<li class="dep-ext" title="' + esc(clean) + '">' + name + "</li>";
+          return '<li title="' + esc(clean) + '">' + name + ' <span class="sub">' + esc(served) + "</span></li>";
         };
         out.innerHTML = '<h3 style="margin:0 0 12px">Dependencies of <code>' + esc(target) + "</code> " +
           '<a class="link-btn" href="' + esc(ui.withRepo("/graph", { file: target })) + '">show in graph</a></h3>' +

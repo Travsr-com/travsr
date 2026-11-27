@@ -68,11 +68,42 @@ fn dependency_arg_hint(store: &SqliteStore, file: &str) -> Option<String> {
     }
 }
 
+/// #1120: the indexed files an import resolves to, as a row suffix
+/// (` → crates/x/src/lib.rs`, several joined by `, `; empty when none, as for
+/// an external crate) and their ids. Candidates the indexer emitted for files
+/// that do not exist have no node, so they drop out here. Not `->`: the MCP
+/// sanitizer escapes `>`.
+fn resolved_files(store: &SqliteStore, import: NodeId) -> (String, Vec<NodeId>) {
+    let targets: Vec<NodeId> = store
+        .iter_edges_from(import)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.kind.as_str() == "resolves-to")
+        .map(|e| e.dst)
+        .collect();
+    let files: Vec<CoreNode> = store
+        .get_nodes(&targets)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.kind == "file")
+        .collect();
+    if files.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let paths: Vec<&str> = files.iter().map(|n| n.vname.path.as_str()).collect();
+    (
+        format!(" → {}", paths.join(", ")),
+        files.iter().map(|n| n.id).collect(),
+    )
+}
+
 /// Transitive variant of `get_dependencies`: BFS over `depends` edges from the
 /// seed file node, up to `depth` hops. Results are in BFS order — direct
 /// dependencies first (no prefix), then each deeper hop indented with `  ↳ `
 /// per level so the UI can render the tree depth. Deduplicated by node id, so a
-/// diamond import graph lists each module once.
+/// diamond import graph lists each module once. An import's row names the files
+/// it resolves to ([`resolved_files`]), and the next hop continues from those
+/// files' own imports (#1120).
 ///
 /// `depth` is caller-clamped (server dispatch clamps to 1..=10); a runaway graph
 /// still terminates because every node is visited at most once.
@@ -128,8 +159,14 @@ fn get_dependencies_transitive_raw(store: &SqliteStore, file: &str, depth: u32) 
         let prefix = "  ↳ ".repeat(hop as usize); // hop 0 = direct → no prefix
         for dst_id in new_dsts {
             if let Some(dst_node) = node_map.get(&dst_id) {
-                lines.push(format!("{prefix}{}", display_label(dst_node)));
+                let (suffix, files) = resolved_files(store, dst_id);
+                lines.push(format!("{prefix}{}{suffix}", display_label(dst_node)));
                 queue.push_back((dst_id, hop + 1));
+                for f in files {
+                    if visited.insert(f) {
+                        queue.push_back((f, hop + 1));
+                    }
+                }
             }
         }
     }
@@ -193,7 +230,11 @@ fn get_dependencies_raw(store: &SqliteStore, file: &str) -> String {
         .collect();
     let mut lines: Vec<String> = ids
         .iter()
-        .filter_map(|id| node_map.get(id).map(|n| display_label(n).into_owned()))
+        .filter_map(|id| {
+            node_map
+                .get(id)
+                .map(|n| format!("{}{}", display_label(n), resolved_files(store, *id).0))
+        })
         .collect();
     if total_deps > DEFAULT_DEPS_TOP_K {
         lines.push(format!(
@@ -13970,6 +14011,39 @@ mod tests {
         let trans = get_dependencies(&store, "a.ts", true, 3);
         assert!(trans.contains("b.ts"), "b.ts missing: {trans}");
         assert!(trans.contains("c.ts"), "transitive c.ts missing: {trans}");
+    }
+
+    /// #1120: an import row names the file it resolves to, and the transitive
+    /// tree continues from that file's own imports. An import with no indexed
+    /// target (an external crate) keeps a bare row.
+    #[test]
+    fn get_dependencies_names_and_follows_the_resolved_file() {
+        use travsr_core::{EdgeKind, Node, VName};
+        let file = |path: &str| Node::new(VName::new("", "", path, "rust", "file"), "file");
+        let import =
+            |path: &str, sig: &str| Node::new(VName::new("", "", path, "rust", sig), "import");
+        let a = file("a/src/lib.rs");
+        let b = file("b/src/lib.rs");
+        let use_b = import("a/src/lib.rs", "use:b::Store");
+        let use_serde = import("b/src/lib.rs", "use:serde::Serialize");
+        let store = make_store(
+            &[a.clone(), b.clone(), use_b.clone(), use_serde.clone()],
+            &[
+                (a.id, use_b.id, EdgeKind::Depends),
+                (use_b.id, b.id, EdgeKind::ResolvesTo),
+                (b.id, use_serde.id, EdgeKind::Depends),
+            ],
+        );
+        let direct = get_dependencies(&store, "a/src/lib.rs", false, 3);
+        assert!(direct.contains("use:b::Store → b/src/lib.rs"), "{direct}");
+        let trans = get_dependencies(&store, "a/src/lib.rs", true, 3);
+        assert!(trans.contains("use:b::Store → b/src/lib.rs"), "{trans}");
+        assert!(
+            trans
+                .lines()
+                .any(|l| l.trim_start().trim_start_matches("↳ ").trim() == "use:serde::Serialize"),
+            "{trans}"
+        );
     }
 
     /// A transitive tree is capped at 500 rows in BFS order and says so: the
