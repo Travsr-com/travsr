@@ -81,8 +81,10 @@ pub fn run(symbol: &str, path: Option<String>, format: OutputFormat) -> anyhow::
             // rendered body: an empty body can be a drift note (`with_head_note`)
             // or a validation-reject string, and a genuine not-found can carry a
             // note — so `body.is_empty()` is not a reliable signal.
+            // Resolution only: the sites (and, for Rust, a repo-wide text scan)
+            // are read once, by `find_references` below.
             let structured =
-                travsr_mcp::find_references_structured(&store, symbol, path.as_deref());
+                travsr_mcp::find_references_resolution(&store, symbol, path.as_deref());
             if structured.status == "not_found" && structured.candidates.is_empty() {
                 // Resolver saw no definition (or rejected the argument). Its own
                 // note is the definitive not-found line or an invalid-argument

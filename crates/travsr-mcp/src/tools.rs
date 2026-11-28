@@ -2154,84 +2154,10 @@ pub fn find_references_structured(
     symbol: &str,
     path: Option<&str>,
 ) -> StructuredReferences {
-    let mut out = StructuredReferences {
-        symbol: symbol.to_string(),
-        path: path.map(str::to_string),
-        status: "not_found",
-        resolved_to: None,
-        candidates: Vec::new(),
-        references: Vec::new(),
-        total: None,
-        truncated: false,
-        note: None,
-    };
-
-    // SEC-002: validate every argument before any store query, as the text path does.
-    if validate_mcp_arg(symbol).is_err() || path.is_some_and(|p| validate_mcp_arg(p).is_err()) {
-        out.note = Some("invalid symbol or path argument".to_string());
+    let (mut out, target) = references_resolution(store, symbol, path);
+    let Some(target) = target else {
         return out;
-    }
-    if phase_b_pending(store) {
-        out.status = "pending";
-        out.note = Some(
-            "Calls are still being traced for this commit, so results are not final \
-             yet. Run `travsr init` to finish now."
-                .to_string(),
-        );
-        return out;
-    }
-
-    let target = match resolve_reference_targets(store, symbol, path) {
-        RefTarget::Unique(n) => n,
-        // One method family reached by its selector head: report every arity as
-        // a candidate and the union of their occurrence sites, rather than a
-        // "pick one" the caller cannot act on.
-        RefTarget::Family(nodes) => {
-            out.status = "resolved";
-            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
-            out.resolved_to = nodes.first().map(ResolvedSymbol::from_node);
-            let sites = family_reference_sites(store, &nodes);
-            let total = sites.len();
-            out.total = Some(total);
-            out.truncated = total > MAX_REFERENCE_SITES;
-            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
-            return out;
-        }
-        RefTarget::Ambiguous(nodes) => {
-            out.status = "ambiguous";
-            out.note = Some(format!(
-                "'{symbol}' is ambiguous, {} definitions. Re-run with a `path` hint to pick one.",
-                nodes.len()
-            ));
-            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
-            return out;
-        }
-        RefTarget::None => {
-            // A `path` hint that filtered out every definition is not a definitive
-            // not-found: re-resolve without it and, if the symbol lives elsewhere,
-            // report those as candidates rather than a bare miss.
-            if let Some(hint) = path {
-                let elsewhere = match resolve_reference_targets(store, symbol, None) {
-                    RefTarget::Unique(n) => vec![n],
-                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => nodes,
-                    RefTarget::None => Vec::new(),
-                };
-                if !elsewhere.is_empty() {
-                    out.note = Some(format!(
-                        "Symbol '{symbol}' was not found under path '{hint}', but is \
-                         defined elsewhere (see candidates)."
-                    ));
-                    out.candidates = elsewhere.iter().map(ResolvedSymbol::from_node).collect();
-                    return out;
-                }
-            }
-            out.note = Some(format!("Symbol '{symbol}' was not found."));
-            return out;
-        }
     };
-
-    out.status = "resolved";
-    out.resolved_to = Some(ResolvedSymbol::from_node(&target));
 
     match store.reference_sites(target.id) {
         Ok(sites) if !sites.is_empty() => {
@@ -2272,6 +2198,106 @@ pub fn find_references_structured(
         }
     }
     out
+}
+
+/// How `symbol` resolves, without reading its sites: everything
+/// [`find_references_structured`] decides first. For a caller that needs only
+/// the outcome (the CLI's not-found check), because reading a Rust symbol's
+/// sites includes a repo-wide text scan (#1146).
+pub fn find_references_resolution(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> StructuredReferences {
+    references_resolution(store, symbol, path).0
+}
+
+/// [`find_references_resolution`], plus the target to read sites for when
+/// `symbol` resolves to exactly one definition.
+fn references_resolution(
+    store: &SqliteStore,
+    symbol: &str,
+    path: Option<&str>,
+) -> (StructuredReferences, Option<CoreNode>) {
+    let mut out = StructuredReferences {
+        symbol: symbol.to_string(),
+        path: path.map(str::to_string),
+        status: "not_found",
+        resolved_to: None,
+        candidates: Vec::new(),
+        references: Vec::new(),
+        total: None,
+        truncated: false,
+        note: None,
+    };
+
+    // SEC-002: validate every argument before any store query, as the text path does.
+    if validate_mcp_arg(symbol).is_err() || path.is_some_and(|p| validate_mcp_arg(p).is_err()) {
+        out.note = Some("invalid symbol or path argument".to_string());
+        return (out, None);
+    }
+    if phase_b_pending(store) {
+        out.status = "pending";
+        out.note = Some(
+            "Calls are still being traced for this commit, so results are not final \
+             yet. Run `travsr init` to finish now."
+                .to_string(),
+        );
+        return (out, None);
+    }
+
+    let target = match resolve_reference_targets(store, symbol, path) {
+        RefTarget::Unique(n) => n,
+        // One method family reached by its selector head: report every arity as
+        // a candidate and the union of their occurrence sites, rather than a
+        // "pick one" the caller cannot act on.
+        RefTarget::Family(nodes) => {
+            out.status = "resolved";
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            out.resolved_to = nodes.first().map(ResolvedSymbol::from_node);
+            let sites = family_reference_sites(store, &nodes);
+            let total = sites.len();
+            out.total = Some(total);
+            out.truncated = total > MAX_REFERENCE_SITES;
+            out.references = sites.into_iter().take(MAX_REFERENCE_SITES).collect();
+            return (out, None);
+        }
+        RefTarget::Ambiguous(nodes) => {
+            out.status = "ambiguous";
+            out.note = Some(format!(
+                "'{symbol}' is ambiguous, {} definitions. Re-run with a `path` hint to pick one.",
+                nodes.len()
+            ));
+            out.candidates = nodes.iter().map(ResolvedSymbol::from_node).collect();
+            return (out, None);
+        }
+        RefTarget::None => {
+            // A `path` hint that filtered out every definition is not a definitive
+            // not-found: re-resolve without it and, if the symbol lives elsewhere,
+            // report those as candidates rather than a bare miss.
+            if let Some(hint) = path {
+                let elsewhere = match resolve_reference_targets(store, symbol, None) {
+                    RefTarget::Unique(n) => vec![n],
+                    RefTarget::Ambiguous(nodes) | RefTarget::Family(nodes) => nodes,
+                    RefTarget::None => Vec::new(),
+                };
+                if !elsewhere.is_empty() {
+                    out.note = Some(format!(
+                        "Symbol '{symbol}' was not found under path '{hint}', but is \
+                         defined elsewhere (see candidates)."
+                    ));
+                    out.candidates = elsewhere.iter().map(ResolvedSymbol::from_node).collect();
+                    return (out, None);
+                }
+            }
+            out.note = Some(format!("Symbol '{symbol}' was not found."));
+            return (out, None);
+        }
+    };
+
+    out.status = "resolved";
+    out.resolved_to = Some(ResolvedSymbol::from_node(&target));
+    (out, Some(target))
 }
 
 /// Raw (unsanitized) variant, shared by the global aggregator.
