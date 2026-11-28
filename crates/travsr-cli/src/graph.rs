@@ -207,10 +207,10 @@ pub fn run(
             // *not* the re-runnable token. Append the exact signature whenever it
             // differs from the label so there is always a copy-pasteable query.
             if n.signature == n.label {
-                eprintln!("  {} ({}) \u{2014} {}{}", n.label, n.kind, n.path, loc);
+                eprintln!("  {} ({}) @ {}{}", n.label, n.kind, n.path, loc);
             } else {
                 eprintln!(
-                    "  {} ({}) \u{2014} {}{}   [re-run: {}]",
+                    "  {} ({}) @ {}{}   [re-run: {}]",
                     n.label, n.kind, n.path, loc, n.signature
                 );
             }

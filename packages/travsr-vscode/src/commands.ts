@@ -169,7 +169,7 @@ export function parseExecutionPath(raw: string): GraphData {
   // PROTOCOL, not prose: `get_callers` and friends print
   // `<sig> (<kind>) — <path>` and this splits on that exact
   // separator, so a punctuation sweep that reaches it breaks it.
-  const lineRe = /^(?:\[[^\]]+\]\s*)?(.+?)\s+\((\w+)\)\s+—\s+(.+)$/;
+  const lineRe = /^(?:\[[^\]]+\]\s*)?(.+?)\s+\((\w+)\)\s+[@\u2014]\s+(.+)$/;
   const nodes: GraphNode[] = [];
   for (const line of inner.split("\n")) {
     const t = line.trim();

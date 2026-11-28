@@ -3,12 +3,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 
 // PROTOCOL, not prose: this exact line is written into the user's git hooks and
-// matched later to recognise travsr's own. Rewording it orphans every hook
-// already installed, which is why it is spelled as an escape and left alone by
-// punctuation sweeps.
-const TRAVSR_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
+// matched later to recognise travsr's own.
+const TRAVSR_MARKER_SH: &str = "# installed by travsr - do not edit this line";
 #[cfg(windows)]
-const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
+const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr - do not edit this line";
+// #1116: the marker hooks installed before it, still recognised so a re-run of
+// `travsr init` rewrites them in place instead of chaining them as foreign.
+// New hooks carry it as a second line too: an older travsr binary matches only
+// this one, and would otherwise back up and chain a new hook as foreign.
+const LEGACY_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
+#[cfg(windows)]
+const LEGACY_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
 
 /// Hooks Travsr installs, and the git event each one covers.
 ///
@@ -69,16 +74,16 @@ fn branch_checkout_guard_sh(hook: &str) -> &'static str {
 
 fn hook_body(hook: &str, bin: &str) -> String {
     // PROTOCOL, not prose: the marker line must equal `TRAVSR_MARKER_SH`
-    // byte-for-byte so `install_one` recognises a travsr-installed hook. This is
-    // a raw string, so the em-dash cannot be spelled `\u{2014}`; it is the same
-    // character and must not be swept to other punctuation.
+    // byte-for-byte so `install_one` recognises a travsr-installed hook.
     format!(
         r#"#!/bin/sh
-# installed by travsr — do not edit this line
+# installed by travsr - do not edit this line
+{legacy}
 {guard}_travsr={exe}
 [ -x "$_travsr" ] || _travsr="travsr"
 exec "$_travsr" hook-run --from-hook --event {hook}
 "#,
+        legacy = LEGACY_MARKER_SH,
         guard = branch_checkout_guard_sh(hook),
         exe = sh_quote(bin),
     )
@@ -86,10 +91,11 @@ exec "$_travsr" hook-run --from-hook --event {hook}
 
 fn chain_hook_body(hook: &str, bin: &str) -> String {
     // PROTOCOL, not prose: see `hook_body`. The marker line must equal
-    // `TRAVSR_MARKER_SH` byte-for-byte; the em-dash must not be swept.
+    // `TRAVSR_MARKER_SH` byte-for-byte.
     format!(
         r#"#!/bin/sh
-# installed by travsr — do not edit this line
+# installed by travsr - do not edit this line
+{legacy}
 # chains the pre-existing hook that was renamed to {hook}.travsr-pre.bak
 _dir="$(cd "$(dirname "$0")" && pwd)"
 if [ -x "$_dir/{hook}.travsr-pre.bak" ]; then
@@ -99,6 +105,7 @@ fi
 [ -x "$_travsr" ] || _travsr="travsr"
 exec "$_travsr" hook-run --from-hook --event {hook}
 "#,
+        legacy = LEGACY_MARKER_SH,
         guard = branch_checkout_guard_sh(hook),
         exe = sh_quote(bin),
     )
@@ -118,7 +125,8 @@ fn branch_checkout_guard_cmd(hook: &str) -> &'static str {
 #[cfg(windows)]
 fn cmd_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        "@echo off\r\n@rem installed by travsr - do not edit this line\r\n{legacy}\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        legacy = LEGACY_MARKER_CMD,
         guard = branch_checkout_guard_cmd(hook),
         exe = cmd_quote(bin),
     )
@@ -128,7 +136,8 @@ fn cmd_hook_body(hook: &str, bin: &str) -> String {
 #[cfg(windows)]
 fn cmd_chain_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr \u{2014} do not edit this line\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        "@echo off\r\n@rem installed by travsr - do not edit this line\r\n{legacy}\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        legacy = LEGACY_MARKER_CMD,
         guard = branch_checkout_guard_cmd(hook),
         exe = cmd_quote(bin),
     )
@@ -208,7 +217,7 @@ fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
     let script = if hook_path.exists() {
         let existing = std::fs::read_to_string(&hook_path)
             .with_context(|| format!("reading existing {hook} hook"))?;
-        if existing.contains(TRAVSR_MARKER_SH) {
+        if existing.contains(TRAVSR_MARKER_SH) || existing.contains(LEGACY_MARKER_SH) {
             hook_body(hook, bin)
         } else if bak_path.exists() {
             // L6: a backup already exists — the user may have manually restored their
@@ -242,7 +251,7 @@ fn install_one(hooks_dir: &Path, hook: &str, bin: &str) -> anyhow::Result<()> {
         let cmd_script = if cmd_hook_path.exists() {
             let existing = std::fs::read_to_string(&cmd_hook_path)
                 .with_context(|| format!("reading existing {hook}.cmd hook"))?;
-            if existing.contains(TRAVSR_MARKER_CMD) {
+            if existing.contains(TRAVSR_MARKER_CMD) || existing.contains(LEGACY_MARKER_CMD) {
                 cmd_hook_body(hook, bin)
             } else if cmd_bak_path.exists() {
                 // L6 (#507): same guard as the POSIX branch above. The user may
@@ -547,6 +556,29 @@ mod tests {
 
         let cmd = std::fs::read_to_string(hooks.join("post-commit.cmd")).unwrap();
         assert!(cmd.contains(TRAVSR_MARKER_CMD));
+    }
+
+    /// #1116: a hook carrying the pre-#1116 em-dash marker is still ours, so a
+    /// re-install rewrites it in place with the new marker, with no backup and
+    /// no chain. The legacy marker stays as a second line, so an older binary
+    /// re-running `init` also recognises the new hook as its own.
+    #[test]
+    fn legacy_marker_hook_is_upgraded_in_place() {
+        let tmp = make_fake_repo();
+        let hooks = tmp.path().join(".git/hooks");
+        std::fs::write(
+            hooks.join("post-commit"),
+            format!("#!/bin/sh\n{LEGACY_MARKER_SH}\nexec travsr hook-run --from-hook\n"),
+        )
+        .unwrap();
+
+        install_hook(tmp.path()).unwrap();
+
+        assert!(!hooks.join("post-commit.travsr-pre.bak").exists());
+        let body = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
+        assert!(body.contains(TRAVSR_MARKER_SH));
+        assert!(body.contains(LEGACY_MARKER_SH));
+        assert!(!body.contains("travsr-pre.bak"));
     }
 
     #[cfg(unix)]

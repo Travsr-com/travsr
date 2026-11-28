@@ -9,6 +9,7 @@ All notable changes to Travsr are documented here.
 ### Upgrading
 
 - **Building from source needs Rust 1.89 (was 1.88).** rusqlite 0.41, which bundles the SQLite that fixes RUSTSEC-2026-0459, declares 1.89; every rusqlite release with the fix does. Prebuilt binaries and npm installs are unaffected.
+- **Update the VS Code extension together with the binary (#1116).** Result rows now separate kind from path with ` @ ` instead of an em-dash (`fn:run (function) @ src/a.rs:1`). The new extension reads both forms, but an extension from before this release reads only the em-dash form, so with a new binary its context, snippet, caller and hover views come up empty until it is updated. Git hooks are unaffected: new hooks carry the old marker line as well, so an older `travsr` binary still recognises them as its own.
 
 ### Added
 

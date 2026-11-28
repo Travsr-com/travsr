@@ -16,7 +16,7 @@
   let refreshView = null;
 
   // `[edge] label (kind) — path:line ~`, the caller row shape.
-  const ROW = /^(?:\[([a-z-]+)\]\s*)?(.+?)\s+\(([^()]+)\)\s+—\s+(.+?)(?::(\d+))?(\s+~)?$/;
+  const ROW = /^(?:\[([a-z-]+)\]\s*)?(.+?)\s+\(([^()]+)\)\s+[@\u2014]\s+(.+?)(?::(\d+))?(\s+~)?$/;
 
   function setQuery(key, value) {
     const u = new URL(location.href);

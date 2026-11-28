@@ -18,15 +18,15 @@ import {
 const STRONG_FIXTURE = `[index commit: abc1234f, embeddings: on]
 [retrieval: embed | coverage 3/3 | confidence: strong ]
 
-PaymentService (class) — src/payment/service.ts:42 [package: @acme/billing] [via: seed] [score: 0.95]
+PaymentService (class) @ src/payment/service.ts:42 [package: @acme/billing] [via: seed] [score: 0.95]
 ───
 class PaymentService {
   constructor(private readonly repo: PaymentRepo) {}
 }
 
-processPayment (function) — src/payment/service.ts:58 [via: caller] [score: 0.72]
+processPayment (function) @ src/payment/service.ts:58 [via: caller] [score: 0.72]
 
-IPaymentRepo (interface) — src/payment/repo.ts:10 [package: @acme/billing] [via: dependency] [score: 0.61]
+IPaymentRepo (interface) @ src/payment/repo.ts:10 [package: @acme/billing] [via: dependency] [score: 0.61]
 
 [3 nodes, 1 with snippets, ~180 metadata-tokens + ~60 snippet-tokens (2000 budget)]
 `;
@@ -41,7 +41,7 @@ const ABSTAIN_FIXTURE = `[index commit: def5678a, embeddings: off]
 const DEGRADED_FIXTURE = `[index commit: abc1234f, embeddings: off]
 [retrieval: fts | coverage 2/3 | confidence: moderate ]
 
-foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
+foo (function) @ src/foo.ts:10 [via: seed] [score: 0.80]
 
 [1 nodes, 0 with snippets, ~40 metadata-tokens + ~0 snippet-tokens (2000 budget)]
 [note: semantic search disabled; run \`travsr embed init\` for better results]
@@ -51,7 +51,7 @@ foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
 const NO_LINE_FIXTURE = `[index commit: aaabbb11, embeddings: on]
 [retrieval: embed | coverage 1/1 | confidence: strong ]
 
-bar (function) — src/bar.ts [via: seed] [score: 0.90]
+bar (function) @ src/bar.ts [via: seed] [score: 0.90]
 
 [1 nodes, 0 with snippets, ~30 metadata-tokens + ~0 snippet-tokens (2000 budget)]
 `;
@@ -60,8 +60,8 @@ bar (function) — src/bar.ts [via: seed] [score: 0.90]
 const SIMPLE_FOOTER_FIXTURE = `[index commit: 36acbbcb753, embeddings: off]
 [retrieval: exact+lexical | coverage 1/1 | confidence: strong ]
 
-fn:isSyncPodWorthy (function) — pkg/kubelet/kubelet.go:3462 [via: seed] [score: 0.03]
-method:Kubelet.syncPodNow (method) — pkg/kubelet/kubelet.go:3545 [via: seed] [score: 0.03]
+fn:isSyncPodWorthy (function) @ pkg/kubelet/kubelet.go:3462 [via: seed] [score: 0.03]
+method:Kubelet.syncPodNow (method) @ pkg/kubelet/kubelet.go:3545 [via: seed] [score: 0.03]
 
 [24 nodes, ~748 tokens]
 `;
@@ -70,7 +70,7 @@ method:Kubelet.syncPodNow (method) — pkg/kubelet/kubelet.go:3545 [via: seed] [
 const INIT_NEEDED_FIXTURE = `[index commit: 36acbbcb753, embeddings: off]
 [retrieval: exact+lexical | coverage 1/1 | confidence: strong ]
 
-fn:isSyncPodWorthy (function) — pkg/kubelet/kubelet.go:3462 [via: seed] [score: 0.03]
+fn:isSyncPodWorthy (function) @ pkg/kubelet/kubelet.go:3462 [via: seed] [score: 0.03]
 
 [2 nodes, ~42 tokens; run \`travsr init\` to enable inline snippets]
 `;
@@ -79,7 +79,7 @@ fn:isSyncPodWorthy (function) — pkg/kubelet/kubelet.go:3462 [via: seed] [score
 const EMBED_PROGRESS_FIXTURE = `[index commit: abc1234f, embeddings: off]
 [retrieval: fts | coverage 2/3 | confidence: moderate ]
 
-foo (function) — src/foo.ts:10 [via: seed] [score: 0.80]
+foo (function) @ src/foo.ts:10 [via: seed] [score: 0.80]
 
 [1 nodes, 0 with snippets, ~40 metadata-tokens + ~0 snippet-tokens (2000 budget)]
 [note: embedding in progress; run \`travsr embed status\` to check; results improve as index builds]
@@ -93,15 +93,15 @@ const GROUPED_FIXTURE = `[index commit: 36acbbcb753, embeddings: on]
 [retrieval: exact+semantic | coverage 4/6 | confidence: strong ]
 
 ## exact, literal symbol / FTS match (not reranked)
-fn:knapsack (function) — crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.98]
-fn:solve (function) — crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
+fn:knapsack (function) @ crates/travsr-retrieval/src/knapsack.rs:53 [score: 0.98]
+fn:solve (function) @ crates/travsr-retrieval/src/knapsack.rs:71 [score: 0.90]
 ## semantic, cross-encoder ranked
-fn:token_budget (function) — crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
+fn:token_budget (function) @ crates/travsr-retrieval/src/budget.rs:12 [score: 0.55]
 ## tests, test entry points & fixtures
-fn:token_budget_keeps_prefix (function) — crates/travsr-retrieval/src/knapsack.rs:210 [score: 0.40]
+fn:token_budget_keeps_prefix (function) @ crates/travsr-retrieval/src/knapsack.rs:210 [score: 0.40]
 ## relevant, graph-adjacent context
-fn:seeded_store (function) — crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
-method:SqliteStore.open (method) — crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
+fn:seeded_store (function) @ crates/travsr-mcp/src/query.rs:682 [via: dependency of fn:token_budget] [score: 0.00]
+method:SqliteStore.open (method) @ crates/travsr-store/src/lib.rs:744 [via: caller of fn:knapsack] [score: 0.00]
 
 [6 nodes, ~150 tokens]
 `;
@@ -271,13 +271,13 @@ suite("context/parse: parseContextResult", () => {
 // ── parseSnippetsResult ───────────────────────────────────────────────────────
 
 // Note: syncPodNow body has an internal blank line — the parser must NOT split here.
-const SNIPPETS_FIXTURE = `fn:isSyncPodWorthy (function) — pkg/kubelet/kubelet.go [package: ]
+const SNIPPETS_FIXTURE = `fn:isSyncPodWorthy (function) @ pkg/kubelet/kubelet.go [package: ]
 ───
 func isSyncPodWorthy(pod *v1.Pod) bool {
 \treturn pod.Spec.ActiveDeadlineSeconds != nil
 }
 
-method:Kubelet.syncPodNow (method) — pkg/kubelet/kubelet.go [package: ]
+method:Kubelet.syncPodNow (method) @ pkg/kubelet/kubelet.go [package: ]
 ───
 func (kl *Kubelet) syncPodNow(ctx context.Context, pod *v1.Pod) {
 \tkl.probeManager.UpdatePodStartupReadinessIfNeeded(pod)
@@ -315,7 +315,7 @@ suite("context/parse: parseSnippetsResult", () => {
   // Regression: skeleton bodies open with "[skeleton: …]" and code lines can
   // start with "[" — the body collector must not treat those as the footer.
   test("keeps a skeleton body that opens with [skeleton: …]", () => {
-    const fixture = `fn:kind_boost (function) — crates/travsr-mcp/src/tools.rs [package: ]
+    const fixture = `fn:kind_boost (function) @ crates/travsr-mcp/src/tools.rs [package: ]
 ───
 [skeleton: function]
 pub(crate) fn kind_boost(kind: &str, language: &str) -> f32
@@ -333,7 +333,7 @@ pub(crate) fn kind_boost(kind: &str, language: &str) -> f32
   });
 
   test("keeps a code line that starts with [ (array literal)", () => {
-    const fixture = `fn:makeList (function) — a.ts [package: ]
+    const fixture = `fn:makeList (function) @ a.ts [package: ]
 ───
 function makeList() {
   return [
@@ -346,5 +346,25 @@ function makeList() {
     const m = parseSnippetsResult(fixture);
     const body = m.get("fn:makeList") ?? "";
     assert.ok(body.includes("1, 2, 3"), "array body must survive a line starting with [");
+  });
+});
+
+// #1116: rows used to separate kind from path with an em-dash. Rows from an
+// older travsr build must still parse, and identically.
+suite("context/parse: legacy em-dash separator", () => {
+  const legacy = (s: string) => s.replace(/\) @ /g, ") \u2014 ");
+
+  test("parseContextResult reads em-dash rows like @ rows", () => {
+    assert.deepStrictEqual(
+      parseContextResult(legacy(STRONG_FIXTURE)),
+      parseContextResult(STRONG_FIXTURE),
+    );
+  });
+
+  test("parseSnippetsResult reads em-dash headers like @ headers", () => {
+    assert.deepStrictEqual(
+      [...parseSnippetsResult(legacy(SNIPPETS_FIXTURE))],
+      [...parseSnippetsResult(SNIPPETS_FIXTURE)],
+    );
   });
 });

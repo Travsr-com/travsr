@@ -189,7 +189,7 @@ suite("VSCODE-204: TravsrTreeDataProvider, Callers section", () => {
     const provider = new TravsrTreeDataProvider(
       makeMcp({
         get_callers:
-          "[call] fn:bar (function) — src/bar.ts\n[structural] class:Foo (class) — src/foo.ts\n",
+          "[call] fn:bar (function) @ src/bar.ts\n[structural] class:Foo (class) @ src/foo.ts\n",
       }),
       makeContext()
     );
@@ -214,7 +214,7 @@ suite("VSCODE-204: TravsrTreeDataProvider, Callers section", () => {
 
   test("caller entries with a file path have open-file command", async () => {
     const provider = new TravsrTreeDataProvider(
-      makeMcp({ get_callers: "[call] fn:bar (function) — src/bar.ts\n" }),
+      makeMcp({ get_callers: "[call] fn:bar (function) @ src/bar.ts\n" }),
       makeContext()
     );
     setSymbol(provider, "foo");
@@ -227,7 +227,7 @@ suite("VSCODE-204: TravsrTreeDataProvider, Callers section", () => {
   test("caller cache is reused on second getChildren call", async () => {
     let callCount = 0;
     const mcp: import("../../mcp").McpClient = {
-      callTool: async () => { callCount++; return "[call] fn:x (function) — src/x.ts\n"; },
+      callTool: async () => { callCount++; return "[call] fn:x (function) @ src/x.ts\n"; },
       isConnected: () => true,
       dispose: () => undefined,
     };

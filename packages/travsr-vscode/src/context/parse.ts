@@ -8,7 +8,7 @@
  *   [index commit: {sha}, embeddings: {on|off}]
  *   [retrieval: {tier} | coverage {n}/{m} | confidence: {label} ]
  *   <blank>
- *   {sig} ({kind}) — {path}[:{line}][ [package: {pkg}]] [via: {role}][ [score: {N.NN}]]
+ *   {sig} ({kind}) @ {path}[:{line}][ [package: {pkg}]] [via: {role}][ [score: {N.NN}]]
  *     optional indented snippet lines…
  *   <blank>
  *   [{N} nodes, {M} with snippets, ~{X} metadata-tokens + ~{Y} snippet-tokens ({budget} budget)]
@@ -106,11 +106,25 @@ function parseHeader(line1: string, line2: string): ContextHeader | null {
  * Parse a non-indented node line.
  *
  * Format (tools.rs format_node_line):
- *   {sig} ({kind}) — {path}[:{line}][ [package: {pkg}]] [via: {role}][ [score: {N.NN}]]
+ *   {sig} ({kind}) @ {path}[:{line}][ [package: {pkg}]] [via: {role}][ [score: {N.NN}]]
  *
  * Parsing strategy: strip optional trailing bracketed tags from right-to-left,
  * then split sig+kind from path on the em-dash separator.
  */
+/**
+ * Where a node-header row splits into `<sig> (<kind>)` and `<path>`.
+ * PROTOCOL, not prose: rows print `" @ "` (#1116); rows from older travsr
+ * builds used `" \u2014 "`, which is still accepted. Whichever comes first wins.
+ */
+function rowSeparator(line: string): { index: number; length: number } | null {
+  let best: { index: number; length: number } | null = null;
+  for (const sep of [" @ ", " \u2014 "]) {
+    const index = line.indexOf(sep);
+    if (index >= 0 && (best === null || index < best.index)) best = { index, length: sep.length };
+  }
+  return best;
+}
+
 function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
   let rest = raw.trim();
 
@@ -131,17 +145,13 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
   const pkgM = /\s+\[package:\s*([^\]]+)\]$/.exec(rest);
   if (pkgM) { pkg = pkgM[1].trim(); rest = rest.slice(0, -pkgM[0].length); }
 
-  // Split on em-dash separator: '{sig} ({kind}) — {path}[:{line}]'
-  // The em-dash character is U+2014.
-  // PROTOCOL, not prose: the node-header wire format. `get_context` and
-  // friends print `<sig> (<kind>) — <path>` and this splits on that exact
-  // separator, so a punctuation sweep that reaches it breaks the round trip
-  // (see ff1436ee). The Rust side spells it `\u{2014}` with the same note.
-  const dashIdx = rest.indexOf(" — ");
-  if (dashIdx < 0) return null;
+  // Split on the row separator: '{sig} ({kind}) @ {path}[:{line}]'
+  // PROTOCOL, not prose: the node-header wire format (see `rowSeparator`).
+  const sepAt = rowSeparator(rest);
+  if (!sepAt) return null;
 
-  const leftPart = rest.slice(0, dashIdx);
-  const rightPart = rest.slice(dashIdx + 3); // skip ' — '
+  const leftPart = rest.slice(0, sepAt.index);
+  const rightPart = rest.slice(sepAt.index + sepAt.length);
 
   // Extract kind from left part: last ' (word)' — greedy match for sig
   const kindM = /^(.+)\s+\((\w+)\)$/.exec(leftPart.trim());
@@ -164,11 +174,11 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
  * Parse `get_snippets` output into a sig→snippet map.
  *
  * Output format (tools.rs get_snippets_body):
- *   {sig} ({kind}) — {path} [package: {pkg}]
+ *   {sig} ({kind}) @ {path} [package: {pkg}]
  *   ───
  *   code lines…
  *
- *   {sig2} ({kind2}) — {path2} [package: {pkg2}]
+ *   {sig2} ({kind2}) @ {path2} [package: {pkg2}]
  *   ───
  *   code lines…
  *
@@ -181,11 +191,8 @@ function parseNodeLine(raw: string): Omit<ContextNode, "snippet"> | null {
 function looksLikeSnippetHeader(line: string): boolean {
   if (!line || line.startsWith(" ") || line.startsWith("\t")) return false;
   if (line.trim().startsWith("[") || line.trim() === "───") return false;
-  // PROTOCOL, not prose: the node-header wire format. `get_context` and
-  // friends print `<sig> (<kind>) — <path>` and this splits on that exact
-  // separator, so a punctuation sweep that reaches it breaks the round trip
-  // (see ff1436ee). The Rust side spells it `\u{2014}` with the same note.
-  return line.includes(" — ") && /\s+\(\w+\)/.test(line);
+  // PROTOCOL, not prose: the node-header wire format (see `rowSeparator`).
+  return rowSeparator(line) !== null && /\s+\(\w+\)/.test(line);
 }
 
 /** True only for the trailing summary footer "[N symbols, …]". Must NOT match a
@@ -210,14 +217,11 @@ export function parseSnippetsResult(text: string): Map<string, string> {
 
     if (!looksLikeSnippetHeader(line)) { i++; continue; }
 
-    // Parse header: "{sig} ({kind}) — {path} [package: {pkg}]"
-    // PROTOCOL, not prose: the node-header wire format. `get_context` and
-    // friends print `<sig> (<kind>) — <path>` and this splits on that exact
-    // separator, so a punctuation sweep that reaches it breaks the round trip
-    // (see ff1436ee). The Rust side spells it `\u{2014}` with the same note.
-    const dashIdx = trimmed.indexOf(" — ");
-    if (dashIdx < 0) { i++; continue; }
-    const kindM = /^(.+)\s+\(\w+\)$/.exec(trimmed.slice(0, dashIdx).trim());
+    // Parse header: "{sig} ({kind}) @ {path} [package: {pkg}]"
+    // PROTOCOL, not prose: the node-header wire format (see `rowSeparator`).
+    const sepAt = rowSeparator(trimmed);
+    if (!sepAt) { i++; continue; }
+    const kindM = /^(.+)\s+\(\w+\)$/.exec(trimmed.slice(0, sepAt.index).trim());
     if (!kindM) { i++; continue; }
     const sig = kindM[1].trim();
     i++;
