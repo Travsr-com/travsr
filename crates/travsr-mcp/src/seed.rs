@@ -2451,8 +2451,12 @@ pub(crate) fn build_seed_set(
         let names_a_symbol = direct_nodes
             .iter()
             .any(|n| travsr_core::ident::leaf_of(&n.vname.signature).eq_ignore_ascii_case(token));
+        // The lookup is a repo-wide git grep, so with name matches in hand it
+        // runs only for a compound identifier (`stdio_tools_list`), the shape
+        // an alias takes. A plain word (`sanitize`) keeps its name matches.
+        let compound = travsr_core::ident::segments(token).len() >= 2;
         let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) =
-            if has_direct && (names_a_symbol || n_content != 1) {
+            if has_direct && (names_a_symbol || n_content != 1 || !compound) {
                 (direct_nodes, token.clone(), false)
             } else {
                 // A bare name that exists only as an `as` alias (`Node as CoreNode`)
@@ -6356,6 +6360,51 @@ mod tests {
         assert_eq!(
             seed_set.terms[0].top_node,
             Some(def.id),
+            "{:?}",
+            seed_set.terms
+        );
+    }
+
+    /// #1156 review: a plain word with name matches does not pay for the alias
+    /// git grep, so `use x::flush as sanitize` does not displace
+    /// `fn:sanitize_row` for `ask sanitize`.
+    #[test]
+    fn build_seed_set_keeps_name_matches_for_a_plain_word() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("lib.rs"), "use x::flush as sanitize;\n").unwrap();
+        for args in [&["init", "-q"][..], &["add", "."][..]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap();
+        }
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+        let node = |path: &str, sig: &str| {
+            Node::new(VName::new("corpus", "", path, "rust", sig), "function")
+        };
+        let flush = node("x/src/lib.rs", "fn:flush");
+        let longer = node("row/src/lib.rs", "fn:sanitize_row");
+        store.put_node(&flush).unwrap();
+        store.put_node(&longer).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "sanitize",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert_ne!(
+            seed_set.terms[0].top_node,
+            Some(flush.id),
             "{:?}",
             seed_set.terms
         );
