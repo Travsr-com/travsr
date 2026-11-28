@@ -58,10 +58,13 @@ pub mod noise;
 ///       no Rust import links for any untouched file (a plain `travsr init`
 ///       after upgrading still showed none). Bumping forces the full re-parse
 ///       that links them.
-///   6 - current: a Rust `use` of a sibling workspace crate
+///   6 - a Rust `use` of a sibling workspace crate
 ///       (`use kestrel_store::Store`) now links to that crate's files (#1120).
 ///       Same shape as 5: the edges are written only when a file is
 ///       re-parsed, so a database built at 5 keeps none for untouched files.
+///   7 - current: a bare Rust `use` of a child module the file declares
+///       (`mod ffi; pub use ffi::FfiMarker;`) now links to that module's
+///       files (#1120). Same shape as 5 and 6.
 ///
 /// The constant does not invalidate anything by itself. It is a marker some code
 /// paths compare against, and only those paths act on a bump:
@@ -82,7 +85,7 @@ pub mod noise;
 /// schema version only, so queries keep answering from the old-format graph: it
 /// is stale, not corrupt, and the write-path refusals above are what stop the
 /// two formats from ever mixing.
-pub const SIGNATURE_FORMAT_VERSION: u8 = 6;
+pub const SIGNATURE_FORMAT_VERSION: u8 = 7;
 
 // ── Corpus derivation (ARCH-102) ─────────────────────────────────────────────
 

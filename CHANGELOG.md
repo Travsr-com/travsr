@@ -9,7 +9,7 @@ All notable changes to Travsr are documented here.
 ### Upgrading
 
 - **Building from source needs Rust 1.89 (was 1.88).** rusqlite 0.41, which bundles the SQLite that fixes RUSTSEC-2026-0459, declares 1.89; every rusqlite release with the fix does. Prebuilt binaries and npm installs are unaffected.
-- **Run `travsr init` once in each repository (index format v4 to v6, #1130, #1120).** Rust `use` paths now link to the files they name, including a sibling workspace crate's (`use kestrel_store::Store` to `crates/kestrel-store/src/lib.rs`), and the edges are written only when a file is re-parsed, so an existing index would keep no Rust import links for any file left unchanged. Until `travsr init` rebuilds it, the watcher and the commit hook skip reindexing that index, queries keep answering from the old graph, and `travsr status` warns that the index was built with an older format and asks for `travsr init`.
+- **Run `travsr init` once in each repository (index format v4 to v7, #1130, #1120).** Rust `use` paths now link to the files they name, including a sibling workspace crate's (`use kestrel_store::Store` to `crates/kestrel-store/src/lib.rs`) and a child module the file declares (`mod ffi; use ffi::X;`), and the edges are written only when a file is re-parsed, so an existing index would keep no Rust import links for any file left unchanged. Until `travsr init` rebuilds it, the watcher and the commit hook skip reindexing that index, queries keep answering from the old graph, and `travsr status` warns that the index was built with an older format and asks for `travsr init`.
 
 ### Added
 
