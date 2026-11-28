@@ -9,6 +9,8 @@ const TRAVSR_MARKER_SH: &str = "# installed by travsr - do not edit this line";
 const TRAVSR_MARKER_CMD: &str = "@rem installed by travsr - do not edit this line";
 // #1116: the marker hooks installed before it, still recognised so a re-run of
 // `travsr init` rewrites them in place instead of chaining them as foreign.
+// New hooks carry it as a second line too: an older travsr binary matches only
+// this one, and would otherwise back up and chain a new hook as foreign.
 const LEGACY_MARKER_SH: &str = "# installed by travsr \u{2014} do not edit this line";
 #[cfg(windows)]
 const LEGACY_MARKER_CMD: &str = "@rem installed by travsr \u{2014} do not edit this line";
@@ -76,10 +78,12 @@ fn hook_body(hook: &str, bin: &str) -> String {
     format!(
         r#"#!/bin/sh
 # installed by travsr - do not edit this line
+{legacy}
 {guard}_travsr={exe}
 [ -x "$_travsr" ] || _travsr="travsr"
 exec "$_travsr" hook-run --from-hook --event {hook}
 "#,
+        legacy = LEGACY_MARKER_SH,
         guard = branch_checkout_guard_sh(hook),
         exe = sh_quote(bin),
     )
@@ -91,6 +95,7 @@ fn chain_hook_body(hook: &str, bin: &str) -> String {
     format!(
         r#"#!/bin/sh
 # installed by travsr - do not edit this line
+{legacy}
 # chains the pre-existing hook that was renamed to {hook}.travsr-pre.bak
 _dir="$(cd "$(dirname "$0")" && pwd)"
 if [ -x "$_dir/{hook}.travsr-pre.bak" ]; then
@@ -100,6 +105,7 @@ fi
 [ -x "$_travsr" ] || _travsr="travsr"
 exec "$_travsr" hook-run --from-hook --event {hook}
 "#,
+        legacy = LEGACY_MARKER_SH,
         guard = branch_checkout_guard_sh(hook),
         exe = sh_quote(bin),
     )
@@ -119,7 +125,8 @@ fn branch_checkout_guard_cmd(hook: &str) -> &'static str {
 #[cfg(windows)]
 fn cmd_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr - do not edit this line\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        "@echo off\r\n@rem installed by travsr - do not edit this line\r\n{legacy}\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        legacy = LEGACY_MARKER_CMD,
         guard = branch_checkout_guard_cmd(hook),
         exe = cmd_quote(bin),
     )
@@ -129,7 +136,8 @@ fn cmd_hook_body(hook: &str, bin: &str) -> String {
 #[cfg(windows)]
 fn cmd_chain_hook_body(hook: &str, bin: &str) -> String {
     format!(
-        "@echo off\r\n@rem installed by travsr - do not edit this line\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        "@echo off\r\n@rem installed by travsr - do not edit this line\r\n{legacy}\r\n@if exist \"%~dp0{hook}.travsr-pre.bak.cmd\" call \"%~dp0{hook}.travsr-pre.bak.cmd\" %*\r\n{guard}{exe} hook-run --from-hook --event {hook}\r\n",
+        legacy = LEGACY_MARKER_CMD,
         guard = branch_checkout_guard_cmd(hook),
         exe = cmd_quote(bin),
     )
@@ -552,7 +560,8 @@ mod tests {
 
     /// #1116: a hook carrying the pre-#1116 em-dash marker is still ours, so a
     /// re-install rewrites it in place with the new marker, with no backup and
-    /// no chain.
+    /// no chain. The legacy marker stays as a second line, so an older binary
+    /// re-running `init` also recognises the new hook as its own.
     #[test]
     fn legacy_marker_hook_is_upgraded_in_place() {
         let tmp = make_fake_repo();
@@ -568,7 +577,7 @@ mod tests {
         assert!(!hooks.join("post-commit.travsr-pre.bak").exists());
         let body = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
         assert!(body.contains(TRAVSR_MARKER_SH));
-        assert!(!body.contains(LEGACY_MARKER_SH));
+        assert!(body.contains(LEGACY_MARKER_SH));
         assert!(!body.contains("travsr-pre.bak"));
     }
 

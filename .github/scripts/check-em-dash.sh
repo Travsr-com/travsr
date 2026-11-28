@@ -23,7 +23,8 @@
 #     rows now print `" @ "`, but the parsers still accept the old form from
 #     older builds;
 #   - the pre-#1116 git-hook marker `installed by travsr \u{2014} do not edit`,
-#     still recognised so existing installs are upgraded in place;
+#     still recognised so existing installs are upgraded in place, and still
+#     written as a second marker line so older binaries recognise new hooks;
 #   - single-glyph placeholders for an empty cell / unset value (`"\u{2014}"`);
 #   - the em-dash guard assertions in observability.rs, which name the character.
 #
