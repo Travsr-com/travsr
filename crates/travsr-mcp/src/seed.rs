@@ -2445,47 +2445,59 @@ pub(crate) fn build_seed_set(
         // always emitted as an anchor below, the cross-encoder reranker is the
         // precision backstop. Only fires on the exact-miss cold branch.
         let mut alias_freq: Option<usize> = None;
-        let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) = if has_direct {
-            (direct_nodes, token.clone(), false)
-        } else {
-            // A bare name that exists only as an `as` alias (`Node as CoreNode`)
-            // anchors its original, as `find_references` resolves it. Parsers
-            // index the original name, so nothing else can ground it. Only for a
-            // single-token query: the lookup is a git grep. The impl/import of
-            // the original share its name but are not it (#991). The alias names
-            // only these definitions, so that count is its frequency: measured by
-            // the original (`Node`, ~700 symbols) it read as generic and abstained,
-            // and the cross-encoder cannot rate a name the definition never spells.
-            let aliased: Vec<CoreNode> = if n_content == 1 {
-                crate::tools::resolve_alias(store, token, None)
-                    .into_iter()
-                    .filter(|n| n.kind != "impl" && n.kind != "import")
-                    .collect()
+        // #1156: a name match that only contains the alias
+        // (`stdio_tools_list_contains_synonym_tools` for `stdio_tools_list`)
+        // is not a symbol of that name, so the alias is still tried.
+        let names_a_symbol = direct_nodes
+            .iter()
+            .any(|n| travsr_core::ident::leaf_of(&n.vname.signature).eq_ignore_ascii_case(token));
+        // The lookup is a repo-wide git grep, so with name matches in hand it
+        // runs only for a compound identifier (`stdio_tools_list`), the shape
+        // an alias takes. A plain word (`sanitize`) keeps its name matches.
+        let compound = travsr_core::ident::segments(token).len() >= 2;
+        let (exact_nodes, resolve_token, corrected): (Vec<CoreNode>, String, bool) =
+            if has_direct && (names_a_symbol || n_content != 1 || !compound) {
+                (direct_nodes, token.clone(), false)
             } else {
-                Vec::new()
-            };
-            // Tried before the typo correction (#1154): an alias one edit from
-            // its original (`skeleton_for_node_inner`) is not a typo, and the
-            // correction would measure it by the original's frequency.
-            match aliased.first() {
-                Some(orig) => {
-                    let name = travsr_core::ident::leaf_of(&orig.vname.signature).to_string();
-                    alias_freq = Some(aliased.len());
-                    (aliased, name, false)
-                }
-                None => match corrections.get(token) {
-                    Some(fix) => {
-                        let fixed_nodes = store.search_nodes_by_name(fix).unwrap_or_default();
-                        if fixed_nodes.iter().any(|n| boundary(fix, n)) {
-                            (fixed_nodes, fix.clone(), true)
-                        } else {
-                            (direct_nodes, token.clone(), false)
-                        }
+                // A bare name that exists only as an `as` alias (`Node as CoreNode`)
+                // anchors its original, as `find_references` resolves it. Parsers
+                // index the original name, so nothing else can ground it. Only for a
+                // single-token query: the lookup is a git grep. The impl/import of
+                // the original share its name but are not it (#991). The alias names
+                // only these definitions, so that count is its frequency: measured by
+                // the original (`Node`, ~700 symbols) it read as generic and abstained,
+                // and the cross-encoder cannot rate a name the definition never spells.
+                let aliased: Vec<CoreNode> = if n_content == 1 {
+                    crate::tools::resolve_alias(store, token, None)
+                        .into_iter()
+                        .filter(|n| n.kind != "impl" && n.kind != "import")
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // Tried before the typo correction (#1154): an alias one edit from
+                // its original (`skeleton_for_node_inner`) is not a typo, and the
+                // correction would measure it by the original's frequency.
+                match aliased.first() {
+                    Some(orig) => {
+                        let name = travsr_core::ident::leaf_of(&orig.vname.signature).to_string();
+                        alias_freq = Some(aliased.len());
+                        (aliased, name, false)
                     }
-                    None => (direct_nodes, token.clone(), false),
-                },
-            }
-        };
+                    None if has_direct => (direct_nodes, token.clone(), false),
+                    None => match corrections.get(token) {
+                        Some(fix) => {
+                            let fixed_nodes = store.search_nodes_by_name(fix).unwrap_or_default();
+                            if fixed_nodes.iter().any(|n| boundary(fix, n)) {
+                                (fixed_nodes, fix.clone(), true)
+                            } else {
+                                (direct_nodes, token.clone(), false)
+                            }
+                        }
+                        None => (direct_nodes, token.clone(), false),
+                    },
+                }
+            };
 
         // #478: absent from the vocabulary (unknown token, or < 3 bytes so
         // never indexed) is treated as maximally generic, matching the
@@ -6283,6 +6295,116 @@ mod tests {
         assert_ne!(
             seed_set.confidence,
             Confidence::None,
+            "{:?}",
+            seed_set.terms
+        );
+    }
+
+    /// #1156: `ask stdio_tools_list` never tried the alias: a test named
+    /// `stdio_tools_list_contains_synonym_tools` contains the token, which
+    /// counted as a name match although no symbol is named `stdio_tools_list`.
+    #[test]
+    fn build_seed_set_tries_an_alias_when_only_a_longer_name_contains_it() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        for args in [&["init", "-q"][..], &["add", "."][..]] {
+            std::fs::create_dir_all(repo.path().join("travsr-mcp/src")).unwrap();
+            std::fs::write(
+                repo.path().join("travsr-mcp/src/lib.rs"),
+                "pub use server::{tools_list as stdio_tools_list, tools_list_global};\n",
+            )
+            .unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap();
+        }
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+        let def = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "travsr-mcp/src/server.rs",
+                "rust",
+                "fn:tools_list",
+            ),
+            "function",
+        );
+        let longer = Node::new(
+            VName::new(
+                "corpus",
+                "",
+                "travsr-mcp/tests/conformance.rs",
+                "rust",
+                "fn:stdio_tools_list_contains_synonym_tools",
+            ),
+            "function",
+        );
+        store.put_node(&def).unwrap();
+        store.put_node(&longer).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "stdio_tools_list",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(
+            seed_set.terms[0].top_node,
+            Some(def.id),
+            "{:?}",
+            seed_set.terms
+        );
+    }
+
+    /// #1156 review: a plain word with name matches does not pay for the alias
+    /// git grep, so `use x::flush as sanitize` does not displace
+    /// `fn:sanitize_row` for `ask sanitize`.
+    #[test]
+    fn build_seed_set_keeps_name_matches_for_a_plain_word() {
+        use travsr_core::{Node, VName};
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("lib.rs"), "use x::flush as sanitize;\n").unwrap();
+        for args in [&["init", "-q"][..], &["add", "."][..]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap();
+        }
+        store
+            .set_meta("repo_root", &repo.path().to_string_lossy())
+            .unwrap();
+        let node = |path: &str, sig: &str| {
+            Node::new(VName::new("corpus", "", path, "rust", sig), "function")
+        };
+        let flush = node("x/src/lib.rs", "fn:flush");
+        let longer = node("row/src/lib.rs", "fn:sanitize_row");
+        store.put_node(&flush).unwrap();
+        store.put_node(&longer).unwrap();
+
+        let seed_set = build_seed_set(
+            &store,
+            "sanitize",
+            &travsr_retrieval::OpenFilter,
+            vec![],
+            &HashMap::new(),
+            None,
+        );
+
+        assert_ne!(
+            seed_set.terms[0].top_node,
+            Some(flush.id),
             "{:?}",
             seed_set.terms
         );
