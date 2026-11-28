@@ -2457,7 +2457,11 @@ fn cfg_gated_uses_note(
         return None;
     };
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
-    let mut files: HashMap<String, Vec<String>> = HashMap::new();
+    // Each file's lines, and whether any of them is a cfg attribute that can
+    // gate code (`#[cfg(test)]` cannot, see `cfg_gate_above`).
+    let mut files: HashMap<String, (Vec<String>, bool)> = HashMap::new();
+    // One answer per enclosing item: a common name hits the same item often.
+    let mut gates: HashMap<NodeId, Option<String>> = HashMap::new();
     let mut hits = Vec::new();
     for line in body.lines() {
         let mut parts = line.splitn(4, ':');
@@ -2486,32 +2490,42 @@ fn cfg_gated_uses_note(
         if is_def || recorded.iter().any(|(p, l)| p == path && *l == ln) {
             continue;
         }
-        let Ok(Some(id)) = store.enclosing_definition_at(&target.vname.corpus, path, ln) else {
-            continue;
-        };
-        let Ok(Some(item)) = store.get_node(id) else {
-            continue;
-        };
-        // The skeleton parse is the authority but re-parses the whole file, so
-        // run it only when an attribute line right above the item is a cfg.
-        let lines = files.entry(path.to_string()).or_insert_with(|| {
-            std::fs::read_to_string(root.join(path))
+        // Cheap gate before any store lookup (about 1 ms each in a large
+        // file): most files have no cfg attribute that can gate code.
+        let (lines, gated) = files.entry(path.to_string()).or_insert_with(|| {
+            let lines: Vec<String> = std::fs::read_to_string(root.join(path))
                 .map(|s| s.lines().map(str::to_string).collect())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let gated = lines
+                .iter()
+                .map(|l| l.trim())
+                .any(|l| l.starts_with("#[cfg(") && l != "#[cfg(test)]");
+            (lines, gated)
         });
-        let above = item.line.map_or(0, |l| l.saturating_sub(1) as usize);
-        let cfg_above = lines
-            .get(..above.min(lines.len()))
-            .unwrap_or_default()
-            .iter()
-            .rev()
-            .map(|l| l.trim_start())
-            .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
-            .any(|l| l.starts_with("#[cfg("));
-        if !cfg_above {
+        if !*gated {
             continue;
         }
-        if let Some(gate) = skeleton_for_node_inner(&item, &root).and_then(|s| s.cfg) {
+        // The innermost definition and the innermost inline module around the
+        // hit: `#[cfg(windows)] mod win { fn f() { use } }` gates `f` through
+        // its module, which carries the attribute.
+        let corpus = &target.vname.corpus;
+        let items = [
+            store.enclosing_definition_at(corpus, path, ln),
+            store.enclosing_node_at(corpus, path, ln, &["module"]),
+        ];
+        let gate = items
+            .into_iter()
+            .filter_map(|r| r.ok().flatten())
+            .find_map(|id| {
+                gates
+                    .entry(id)
+                    .or_insert_with(|| {
+                        let item = store.get_node(id).ok().flatten()?;
+                        cfg_gate_above(&item, lines, &root)
+                    })
+                    .clone()
+            });
+        if let Some(gate) = gate {
             hits.push(format!("{path}:{ln} (in code behind `{gate}`)"));
         }
     }
@@ -2525,6 +2539,31 @@ fn cfg_gated_uses_note(
          traced only in code enabled on the machine that built the index. {}]",
         hits.join(", ")
     ))
+}
+
+/// The `#[cfg(...)]` among the attribute lines right above `item`, as written.
+/// Read from the lines, not a skeleton parse, which re-parses the whole file
+/// for every item and made a common name's scan cost hundreds of ms. The parse
+/// is kept only for an attribute that spans several lines. `#[cfg(test)]` is
+/// no gate here: rust-analyzer enables it for workspace crates, so an
+/// uncounted match in test code is another symbol's, not a missed use.
+fn cfg_gate_above(item: &CoreNode, lines: &[String], root: &std::path::Path) -> Option<String> {
+    let above = item.line.map_or(0, |l| l.saturating_sub(1) as usize);
+    let attr = lines
+        .get(..above.min(lines.len()))
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+        .find(|l| l.starts_with("#[cfg("))?;
+    if attr == "#[cfg(test)]" {
+        return None;
+    }
+    if attr.ends_with(")]") {
+        return Some(attr.to_string());
+    }
+    skeleton_for_node_inner(item, root).and_then(|s| s.cfg)
 }
 
 /// Structural fallback: enumerate caller definitions of `target` via `RefCall`
@@ -21955,6 +21994,70 @@ mod snippet_tests {
                 && !out.contains("src/lib.rs:9 (")
                 && !out.contains("src/lib.rs:10 ("),
             "the definition, a longer name (MARKS) and a comment are not uses: {out}"
+        );
+    }
+
+    #[test]
+    fn find_references_names_uses_in_a_cfg_gated_module_but_not_in_cfg_test() {
+        // #1146 review: the gate often sits on an inline module
+        // (`#[cfg(windows)] mod win`), not on the item around the use. A match
+        // in `#[cfg(test)] mod tests` is not listed: rust-analyzer traces
+        // test code, so an uncounted match there is another symbol's.
+        use std::process::Command;
+        use travsr_core::{Node, VName};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = "const MARK: &str = \"m\";\nfn active() -> bool {\n    \"x\".contains(MARK)\n}\n\
+                   #[cfg(windows)]\nmod win {\n    fn f() -> bool {\n        \"x\".contains(super::MARK)\n    }\n}\n\
+                   #[cfg(test)]\nmod tests {\n    fn g() -> bool {\n        \"x\".contains(super::MARK)\n    }\n}\n";
+        std::fs::write(root.join("src/lib.rs"), src).unwrap();
+        git(&["add", "-A"]);
+        if !root.join(".git").exists() {
+            return; // git unavailable in this sandbox
+        }
+
+        let mut store = travsr_store::SqliteStore::open_in_memory().unwrap();
+        let node = |sig: &str, kind: &str, line: u32, end: u32| {
+            Node::new(VName::new("", "", "src/lib.rs", "rust", sig), kind)
+                .with_line(line)
+                .with_end_line(end)
+        };
+        let mark = node("const:MARK", "constant", 1, 1);
+        let active = node("fn:active", "function", 2, 4);
+        for n in [
+            &mark,
+            &active,
+            &node("mod:win", "module", 6, 10),
+            &node("fn:f", "function", 7, 9),
+            &node("mod:tests", "module", 12, 16),
+            &node("fn:g", "function", 13, 15),
+        ] {
+            store.put_node(n).unwrap();
+        }
+        store
+            .record_edge_sites(&[(active.id, mark.id, 3, None)])
+            .unwrap();
+        store
+            .set_meta("repo_root", &root.to_string_lossy())
+            .unwrap();
+
+        let out = find_references(&store, "MARK", None);
+        assert!(
+            out.contains("src/lib.rs:8 (in code behind `#[cfg(windows)]`)"),
+            "a use inside a cfg-gated module must be named: {out}"
+        );
+        assert!(
+            !out.contains("src/lib.rs:14 ("),
+            "a match in #[cfg(test)] code is not a missed use: {out}"
         );
     }
 
