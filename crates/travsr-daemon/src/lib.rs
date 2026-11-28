@@ -5869,7 +5869,19 @@ pub fn init_running(repo_root: &Path) -> bool {
 /// `~/.travsr/phase-b.lock`, which the OS releases if the holder dies, so a
 /// crashed daemon never wedges the rest. `None` (no home, unwritable lock)
 /// runs unguarded, as before.
+///
+/// The wait is bounded: a holder can run several analyzers back to back, each
+/// up to its own LSIF timeout, and an unbounded wait would stall Phase B in
+/// every other repository on the machine for as long. Past
+/// [`PHASE_B_LOCK_WAIT`] this run goes ahead unguarded, as before #1118.
 fn machine_phase_b_lock() -> Option<std::fs::File> {
+    machine_phase_b_lock_within(PHASE_B_LOCK_WAIT)
+}
+
+/// Twice the default LSIF timeout (`LSIF_TIMEOUT_DEFAULT_SECS`, 300 s).
+const PHASE_B_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn machine_phase_b_lock_within(wait: std::time::Duration) -> Option<std::fs::File> {
     use fs2::FileExt as _;
     let dir = dirs::home_dir()?.join(".travsr");
     std::fs::create_dir_all(&dir).ok()?;
@@ -5884,7 +5896,19 @@ fn machine_phase_b_lock() -> Option<std::fs::File> {
             event = "phase_b.wait",
             "another repository's semantic indexing is running; waiting for it to finish"
         );
-        file.lock_exclusive().ok()?;
+        let deadline = std::time::Instant::now() + wait;
+        while file.try_lock_exclusive().is_err() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    event = "phase_b.wait",
+                    waited_s = wait.as_secs(),
+                    "another repository's semantic indexing is still running; \
+                     running this one alongside it"
+                );
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
     Some(file)
 }
@@ -11045,6 +11069,32 @@ mod tests {
             acquired,
             Ok(true),
             "second holder proceeds once it is released"
+        );
+    }
+
+    /// #1118 review: the wait is bounded. A holder that outlasts it does not
+    /// stall the waiter, which goes ahead unguarded.
+    #[test]
+    fn machine_phase_b_lock_gives_up_after_the_wait() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home_tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home_tmp.path());
+
+        let first = machine_phase_b_lock().expect("first holder gets the lock");
+        let start = std::time::Instant::now();
+        let second = machine_phase_b_lock_within(std::time::Duration::from_millis(300));
+        let waited = start.elapsed();
+        drop(first);
+
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(second.is_none(), "a timed-out wait runs unguarded");
+        assert!(
+            waited >= std::time::Duration::from_millis(300),
+            "it waited first: {waited:?}"
         );
     }
 
