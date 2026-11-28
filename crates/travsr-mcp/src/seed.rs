@@ -1601,6 +1601,15 @@ fn contentless_query_confidence(
 /// alone let a `coverage=0.000` query be rescued. Requiring `coverage_ok`
 /// (`n_resolved >= 1`) means `get map handle` abstains while W1/W2
 /// (`coverage` 0.5–1.0) still rescue.
+/// Whether signature `member` is a member of the symbol `owner` names
+/// (`variant:StoreError.Sqlite` of `enum:StoreError`), kind prefixes ignored.
+fn is_member_of(member: &str, owner: &str) -> bool {
+    let leaf = |s: &str| s.split_once(':').map_or(s, |(_, rest)| rest).to_string();
+    leaf(member)
+        .split_once('.')
+        .is_some_and(|(o, _)| o == leaf(owner))
+}
+
 fn anchor_rescued_confidence(
     base: Confidence,
     g1_bypass: bool,
@@ -2369,6 +2378,10 @@ pub(crate) fn build_seed_set(
     // of the anchor cap (a type behind its own impl/methods). A node here that
     // still seeds through another leg is classified Exact, not Lexical.
     let mut named_ids: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    // #1115: the subset of `named_ids` named by a compound identifier as typed
+    // (`RunId`, `run_id`: two or more segments). Plain words never qualify.
+    let mut compound_named_ids: std::collections::HashSet<NodeId> =
+        std::collections::HashSet::new();
 
     // Boundary predicate reused for both the direct token and a #709 correction:
     // a token counts as resolved only when it appears as a whole word segment (or
@@ -2671,16 +2684,19 @@ pub(crate) fn build_seed_set(
                 specific_token_anchor_ids.insert(node.id);
             }
         }
-        named_ids.extend(
-            anchor_pool
-                .iter()
-                .filter(|n| {
-                    is_named_by(n, &resolve_token)
-                        && !is_anchor_noise(n)
-                        && filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))
-                })
-                .map(|n| n.id),
-        );
+        let named: Vec<NodeId> = anchor_pool
+            .iter()
+            .filter(|n| {
+                is_named_by(n, &resolve_token)
+                    && !is_anchor_noise(n)
+                    && filter.allow(n.id, n.id, Some(n.vname.corpus.as_str()))
+            })
+            .map(|n| n.id)
+            .collect();
+        if travsr_core::ident::segments(&resolve_token).len() >= 2 {
+            compound_named_ids.extend(named.iter().copied());
+        }
+        named_ids.extend(named);
 
         // #540: the measured count, after every drop the loop applies.
         terms[term_idx].anchors_emitted = added_for_this_token;
@@ -3293,6 +3309,48 @@ pub(crate) fn build_seed_set(
     let coverage_ok =
         n_resolved >= 1 || (max_rerank_score.is_none() && terms.len() == 1 && terms[0].resolved);
     let base_confidence = confidence;
+    // #1115: the cross-encoder does not get a veto over a query that names a
+    // symbol by its exact compound identifier. `how is a RunId created` anchors
+    // `struct:RunId` at seed rank 1, yet scored 0.073 against the 0.15 floor
+    // and abstained. The floor exists for salad (#462 WS4), whose plain words
+    // (`drop`, `delete`) can name a symbol but are never compound identifiers.
+    // Every other gate (`coverage_ok`, the exact anchor, g1) still applies, and
+    // the cross-encoder's own top pick must be the named symbol or one of its
+    // members (`StoreError.Sqlite`): salad naming a real type (`drop the
+    // EventKind database`) has the model prefer another candidate
+    // (`ClaudeCodeAdapter.user`), and keeps the floor.
+    let top_pick = seeds
+        .iter()
+        .find(|s| s.rerank_score.is_some() && s.rerank_score == max_rerank_score)
+        .map(|s| s.node);
+    let names_anchor_exactly = top_pick.is_some_and(|top| {
+        let named: Vec<NodeId> = compound_named_ids
+            .iter()
+            .copied()
+            .filter(|id| early_exact_ids.contains(id))
+            .collect();
+        if named.contains(&top) {
+            return true;
+        }
+        let mut ids = named;
+        ids.push(top);
+        let nodes = store.get_nodes(&ids).unwrap_or_default();
+        let Some(top_sig) = nodes
+            .iter()
+            .find(|n| n.id == top)
+            .map(|n| &n.vname.signature)
+        else {
+            return false;
+        };
+        nodes
+            .iter()
+            .any(|n| n.id != top && is_member_of(top_sig, &n.vname.signature))
+    });
+    let recall_floor = if names_anchor_exactly {
+        f32::NEG_INFINITY
+    } else {
+        rerank_recall_floor()
+    };
     let confidence = if anchor_rescue_enabled() {
         anchor_rescued_confidence(
             base_confidence,
@@ -3300,7 +3358,7 @@ pub(crate) fn build_seed_set(
             max_rerank_score,
             exact_anchor_present,
             coverage_ok,
-            rerank_recall_floor(),
+            recall_floor,
         )
     } else {
         base_confidence
@@ -6136,6 +6194,24 @@ mod tests {
             "the exact `class:UI` match must seed and not be starved by \
              substring-noise methods; seeds present: {seed_ids:?}"
         );
+    }
+
+    /// #1115: the reranker's top pick may be a member of the named type
+    /// (`when is a StoreError returned` scored `StoreError.Sqlite` highest),
+    /// never a different type that only shares a word.
+    #[test]
+    fn a_member_of_the_named_type_counts_as_naming_it() {
+        assert!(is_member_of("variant:StoreError.Sqlite", "enum:StoreError"));
+        assert!(is_member_of("field:AgentSpec.role", "struct:AgentSpec"));
+        assert!(!is_member_of(
+            "method:ClaudeCodeAdapter.user",
+            "enum:EventKind"
+        ));
+        assert!(!is_member_of("struct:StoreError", "enum:StoreError"));
+        assert!(!is_member_of(
+            "variant:StoreErrorKind.Io",
+            "enum:StoreError"
+        ));
     }
 
     /// `ask CoreNode` abstained: `CoreNode` exists only as `Node as CoreNode`,
